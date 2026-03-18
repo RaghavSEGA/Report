@@ -388,3 +388,96 @@ if "KPI" in df.columns:
         st.info("No KPI options available.")
 else:
     st.info("No KPI column found.")
+
+# ---- AI CHATBOT ----
+st.markdown('<div class="section-label">AI Analyst</div>', unsafe_allow_html=True)
+
+if "kpi_chat_history" not in st.session_state:
+    st.session_state.kpi_chat_history = []
+
+def build_kpi_context(df, actuals_cols, p45_col, p60_col):
+    lines = [
+        "You are an expert KPI analyst. Answer questions about this KPI report data concisely and accurately.",
+        f"DATASET OVERVIEW:",
+        f"- Total rows: {len(df):,}",
+        f"- Columns: {', '.join(df.columns.tolist())}",
+    ]
+    if "KPI" in df.columns:
+        lines.append(f"- KPI types: {', '.join(sorted(df['KPI'].dropna().unique()))}")
+    if "Title" in df.columns:
+        lines.append(f"- Titles: {', '.join(sorted(df['Title'].dropna().unique()))}")
+    if "Beat" in df.columns:
+        lines.append(f"- Beats: {', '.join(sorted(df['Beat'].dropna().unique()))}")
+    if p45_col:
+        lines.append(f"- 45th percentile column: {p45_col}")
+    if p60_col:
+        lines.append(f"- 60th percentile column: {p60_col}")
+    if actuals_cols:
+        lines.append(f"- Actuals columns: {', '.join(actuals_cols)}")
+        for col in actuals_cols:
+            nums = df[col].apply(lambda v: float(str(v).replace(',','').replace('%','')) if pd.notna(v) else float('nan'))
+            lines.append(f"  {col}: min={nums.min():.2f}, max={nums.max():.2f}, mean={nums.mean():.2f}, count={nums.notna().sum()}")
+    lines.append("\nSAMPLE DATA (first 30 rows):")
+    lines.append(df.head(30).to_string())
+    lines.append("\nAnswer based only on available data. Keep answers to 2-5 sentences unless detail is needed.")
+    return "\n".join(lines)
+
+# Render chat history
+chat_html = '<div class="chat-container">'
+if not st.session_state.kpi_chat_history:
+    chat_html += '<div class="chat-thinking">Ask me anything about this KPI data — performance vs benchmarks, which titles are above/below target, trends across beats, and more.</div>'
+for msg in st.session_state.kpi_chat_history:
+    if msg['role'] == 'user':
+        chat_html += f'<div class="chat-msg-user"><div class="chat-bubble-user">{msg["content"]}</div></div>'
+    else:
+        content = msg['content'].replace('\n', '<br>')
+        chat_html += f'<div class="chat-msg-ai"><div class="chat-bubble-ai">{content}</div></div>'
+chat_html += '</div>'
+st.markdown(chat_html, unsafe_allow_html=True)
+
+st.markdown("""
+<style>
+.chat-container { background: #0f172a; border: 1px solid #1e293b; border-radius: 10px; padding: 1rem 1.25rem; margin-bottom: 1rem; max-height: 420px; overflow-y: auto; }
+.chat-msg-user { display: flex; justify-content: flex-end; margin-bottom: .75rem; }
+.chat-msg-ai { display: flex; justify-content: flex-start; margin-bottom: .75rem; }
+.chat-bubble-user { background: #1d4ed8; color: #fff; border-radius: 14px 14px 2px 14px; padding: .55rem .9rem; font-size: .82rem; max-width: 75%; line-height: 1.5; }
+.chat-bubble-ai { background: #1e293b; color: #e2e8f0; border-radius: 14px 14px 14px 2px; padding: .55rem .9rem; font-size: .82rem; max-width: 85%; line-height: 1.5; border: 1px solid #334155; }
+.chat-thinking { color: #475569; font-style: italic; font-size: .78rem; }
+</style>
+""", unsafe_allow_html=True)
+
+input_col, btn_col, clear_col = st.columns([6, 1, 1])
+with input_col:
+    user_input = st.text_input("", placeholder="e.g. Which titles are above target? How does Beat 1 compare to Beat 2?", label_visibility="collapsed", key="kpi_chat_input")
+with btn_col:
+    send = st.button("Ask", use_container_width=True, type="primary")
+with clear_col:
+    if st.button("Clear", use_container_width=True):
+        st.session_state.kpi_chat_history = []
+        st.rerun()
+
+if send and user_input.strip():
+    st.session_state.kpi_chat_history.append({"role": "user", "content": user_input.strip()})
+    ctx = build_kpi_context(df, actuals_cols, p45_col, p60_col)
+    messages = [{"role": "user" if m["role"] == "user" else "assistant", "content": m["content"]}
+                for m in st.session_state.kpi_chat_history[:-1]]
+    messages.append({"role": "user", "content": f"{ctx}\n\nUSER QUESTION: {user_input.strip()}"})
+    try:
+        import requests
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"Content-Type": "application/json", "x-api-key": st.secrets["ANTHROPIC_API_KEY"], "anthropic-version": "2023-06-01"},
+            json={
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 1000,
+                "system": "You are a concise, accurate KPI analyst. Answer questions about the provided KPI data. Be direct and data-driven.",
+                "messages": messages,
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        answer = resp.json()["content"][0]["text"]
+    except Exception as e:
+        answer = f"Sorry, I couldn't reach the AI API: {e}"
+    st.session_state.kpi_chat_history.append({"role": "assistant", "content": answer})
+    st.rerun()
