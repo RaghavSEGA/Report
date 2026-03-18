@@ -192,6 +192,20 @@ direct_pct = (direct_rev / total_rev * 100) if total_rev > 0 else 0
 
 # ---- SUMMARY CARDS ----
 st.markdown('<div class="section-label">Summary</div>', unsafe_allow_html=True)
+
+# Inline date range picker
+if 'date' in df.columns and df['date'].notna().any():
+    all_min = raw['date'].pipe(pd.to_datetime).min().date()
+    all_max = raw['date'].pipe(pd.to_datetime).max().date()
+    dr_col1, dr_col2, dr_spacer = st.columns([2, 2, 5])
+    with dr_col1:
+        st.markdown('<span style="font-size:.65rem;text-transform:uppercase;letter-spacing:.1em;color:#64748b;">From</span>', unsafe_allow_html=True)
+        start_date = st.date_input("", value=df['date'].min().date(), min_value=all_min, max_value=all_max, label_visibility="collapsed", key="inline_start")
+    with dr_col2:
+        st.markdown('<span style="font-size:.65rem;text-transform:uppercase;letter-spacing:.1em;color:#64748b;">To</span>', unsafe_allow_html=True)
+        end_date = st.date_input("", value=df['date'].max().date(), min_value=all_min, max_value=all_max, label_visibility="collapsed", key="inline_end")
+    df = df[(df['date'].dt.date >= start_date) & (df['date'].dt.date <= end_date)]
+
 c1, c2, c3, c4, c5 = st.columns(5)
 
 with c1:
@@ -316,9 +330,13 @@ with ch6:
     ))
     fig6.update_layout(
         height=300, title=dict(text="Top 10 Countries by Revenue", font=dict(size=13, color='#94a3b8')),
-        showlegend=False, **PLOT_LAYOUT,
-        yaxis=dict(autorange='reversed', tickfont=dict(size=10, color='#94a3b8')),
-        xaxis=dict(tickprefix='$', tickfont=dict(size=10, color='#64748b')),
+        showlegend=False,
+        paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(15,23,42,.6)',
+        template='plotly_dark', margin=dict(l=0, r=0, t=30, b=0),
+        hovermode='x unified',
+        hoverlabel=dict(bgcolor='#1e293b', bordercolor='#334155', font=dict(size=12, color='#e2e8f0')),
+        yaxis=dict(autorange='reversed', tickfont=dict(size=10, color='#94a3b8'), gridcolor='rgba(255,255,255,.05)', linecolor='rgba(255,255,255,.08)'),
+        xaxis=dict(tickprefix='$', tickfont=dict(size=10, color='#64748b'), gridcolor='rgba(255,255,255,.05)', linecolor='rgba(255,255,255,.08)'),
     )
     st.plotly_chart(fig6, use_container_width=True)
 
