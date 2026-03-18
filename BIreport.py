@@ -79,9 +79,10 @@ def base_layout(height=300, title="", margin=None):
     )
 
 # Reusable axis styles
-AX = dict(gridcolor='rgba(255,255,255,.05)', linecolor='rgba(255,255,255,.08)', tickfont=dict(size=11, color='#64748b'))
-AX_MONEY = dict(**AX, tickprefix='$', showticklabels=False)
-AX_LABEL = dict(**AX, tickfont=dict(size=10, color='#94a3b8'))
+AX = dict(gridcolor="rgba(255,255,255,.05)", linecolor="rgba(255,255,255,.08)")
+AX_DEFAULT = dict(**AX, tickfont=dict(size=11, color="#64748b"))
+AX_MONEY = dict(**AX, tickprefix="$", showticklabels=False, tickfont=dict(size=11, color="#64748b"))
+AX_LABEL = dict(**AX, tickfont=dict(size=10, color="#94a3b8"))
 
 PAL = ['#60a5fa', '#34d399', '#a78bfa', '#fb923c', '#f472b6', '#facc15', '#38bdf8']
 
@@ -230,7 +231,7 @@ fig1.update_layout(
     **base_layout(height=340, title="Weekly Revenue by Game", margin=dict(l=0, r=0, t=40, b=60)),
     legend=dict(orientation='h', yanchor='top', y=-0.15, xanchor='left', x=0,
                 font=dict(size=10, color='#94a3b8'), bgcolor='rgba(0,0,0,0)'),
-    xaxis=AX,
+    xaxis=AX_DEFAULT,
     yaxis=dict(**AX, tickprefix='$'),
 )
 st.plotly_chart(fig1, width="stretch")
@@ -326,8 +327,8 @@ for i, p in enumerate(top_plats):
 fig6.update_layout(
     **base_layout(height=300, title="Weekly Units by Platform (top 5)"),
     barmode='stack',
-    xaxis=AX,
-    yaxis=AX,
+    xaxis=AX_DEFAULT,
+    yaxis=AX_DEFAULT,
 )
 st.plotly_chart(fig6, width="stretch")
 
