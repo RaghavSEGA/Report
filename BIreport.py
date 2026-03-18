@@ -241,39 +241,53 @@ with c5:
         f'<div class="kpi-card-value">{direct_pct:.1f}%</div>'
         f'<div class="kpi-card-sub">vs platform sales</div></div>', unsafe_allow_html=True)
 
-# ---- CHARTS ROW 1: Revenue over time + Platform split ----
+# ---- CHARTS ROW 1: Revenue over time (full width) ----
 st.markdown('<div class="section-label">Revenue Trends</div>', unsafe_allow_html=True)
-ch1, ch2 = st.columns([3, 2])
 
-with ch1:
-    weekly = df.groupby(['week', 'game'])['revenue'].sum().reset_index()
-    games = sorted(weekly['game'].unique())
-    fig = go.Figure()
-    for i, g in enumerate(games):
-        gd = weekly[weekly['game'] == g].sort_values('week')
-        fig.add_trace(go.Scatter(
-            x=gd['week'], y=gd['revenue'], mode='lines+markers', name=g,
-            line=dict(color=PAL[i % len(PAL)], width=2),
-            marker=dict(size=5, line=dict(width=1.5, color='#111827')),
-        ))
-    fig.update_layout(height=320, title=dict(text="Weekly Revenue by Game", font=dict(size=13, color='#94a3b8')), **PLOT_LAYOUT)
-    fig.update_layout(yaxis=dict(tickprefix='$', **PLOT_LAYOUT['yaxis']))
-    st.plotly_chart(fig, use_container_width=True)
+# Weekly revenue — lines only (no markers), truncate long game names in legend
+weekly = df.groupby(['week', 'game'])['revenue'].sum().reset_index()
+games = sorted(weekly['game'].unique())
+fig = go.Figure()
+for i, g in enumerate(games):
+    gd = weekly[weekly['game'] == g].sort_values('week')
+    short = g if len(g) <= 35 else g[:33] + '…'
+    fig.add_trace(go.Scatter(
+        x=gd['week'], y=gd['revenue'], mode='lines', name=short,
+        line=dict(color=PAL[i % len(PAL)], width=2),
+        hovertemplate=f'<b>{g}</b><br>%{{x|%b %d, %Y}}<br>${{y:,.0f}}<extra></extra>',
+    ))
+fig.update_layout(
+    height=340,
+    title=dict(text="Weekly Revenue by Game", font=dict(size=13, color='#94a3b8')),
+    **PLOT_LAYOUT,
+    yaxis=dict(tickprefix='$', **PLOT_LAYOUT['yaxis']),
+    legend=dict(
+        orientation='h', yanchor='top', y=-0.18, xanchor='left', x=0,
+        font=dict(size=10, color='#94a3b8'), bgcolor='rgba(0,0,0,0)',
+        itemwidth=30,
+    ),
+)
+st.plotly_chart(fig, use_container_width=True)
+
+# ---- CHARTS ROW 2: Platform + Region ----
+ch2, ch3 = st.columns(2)
 
 with ch2:
-    plat = df.groupby('platform')[['revenue', 'quantity']].sum().reset_index().sort_values('revenue', ascending=False)
+    plat = df.groupby('platform')['revenue'].sum().reset_index().sort_values('revenue', ascending=False).head(8)
     fig2 = go.Figure(go.Bar(
         x=plat['platform'], y=plat['revenue'],
         marker_color=PAL[:len(plat)],
         text=[fmt_currency(v) for v in plat['revenue']],
-        textposition='outside', textfont=dict(size=11, color='#94a3b8'),
+        textposition='outside', textfont=dict(size=10, color='#94a3b8'),
     ))
-    fig2.update_layout(height=320, title=dict(text="Revenue by Platform", font=dict(size=13, color='#94a3b8')), showlegend=False, **PLOT_LAYOUT)
-    fig2.update_layout(yaxis=dict(tickprefix='$', **PLOT_LAYOUT['yaxis']))
+    fig2.update_layout(
+        height=300,
+        title=dict(text="Revenue by Platform", font=dict(size=13, color='#94a3b8')),
+        showlegend=False, **PLOT_LAYOUT,
+        yaxis=dict(tickprefix='$', showticklabels=False, **PLOT_LAYOUT['yaxis']),
+        margin=dict(l=0, r=0, t=40, b=10),
+    )
     st.plotly_chart(fig2, use_container_width=True)
-
-# ---- CHARTS ROW 2: Region + Direct vs Bundle ----
-ch3, ch4 = st.columns([2, 2])
 
 with ch3:
     region = df.groupby('bp_region')['revenue'].sum().reset_index().sort_values('revenue', ascending=False)
@@ -283,64 +297,86 @@ with ch3:
         text=[fmt_currency(v) for v in region['revenue']],
         textposition='outside', textfont=dict(size=11, color='#94a3b8'),
     ))
-    fig3.update_layout(height=300, title=dict(text="Revenue by Region", font=dict(size=13, color='#94a3b8')), showlegend=False, **PLOT_LAYOUT)
-    fig3.update_layout(yaxis=dict(tickprefix='$', **PLOT_LAYOUT['yaxis']))
+    fig3.update_layout(
+        height=300,
+        title=dict(text="Revenue by Region", font=dict(size=13, color='#94a3b8')),
+        showlegend=False, **PLOT_LAYOUT,
+        yaxis=dict(tickprefix='$', showticklabels=False, **PLOT_LAYOUT['yaxis']),
+        margin=dict(l=0, r=0, t=40, b=10),
+    )
     st.plotly_chart(fig3, use_container_width=True)
 
+# ---- CHARTS ROW 3: Direct vs Platform (bar not donut) + Top countries ----
+ch4, ch5 = st.columns(2)
+
 with ch4:
-    sale_split = df.groupby('sale_type')['revenue'].sum().reset_index()
-    fig4 = go.Figure(go.Pie(
-        labels=sale_split['sale_type'], values=sale_split['revenue'],
-        marker=dict(colors=PAL[:len(sale_split)]),
-        hole=0.55,
-        textinfo='label+percent',
-        textfont=dict(size=11, color='#e2e8f0'),
-        hovertemplate='%{label}<br>$%{value:,.2f}<extra></extra>',
+    # Collapse long bundle names into top-5 + "Other", show as horizontal bar
+    sale_rev = df.groupby('sale_type')['revenue'].sum().sort_values(ascending=False).reset_index()
+    if len(sale_rev) > 5:
+        top5 = sale_rev.head(5)
+        other_val = sale_rev.iloc[5:]['revenue'].sum()
+        other_row = pd.DataFrame([{'sale_type': 'Other', 'revenue': other_val}])
+        sale_rev = pd.concat([top5, other_row], ignore_index=True)
+    # Truncate long labels
+    sale_rev['label'] = sale_rev['sale_type'].apply(lambda s: s if len(s) <= 30 else s[:28] + '…')
+    fig4 = go.Figure(go.Bar(
+        x=sale_rev['revenue'], y=sale_rev['label'],
+        orientation='h',
+        marker_color=PAL[:len(sale_rev)],
+        text=[fmt_currency(v) for v in sale_rev['revenue']],
+        textposition='outside', textfont=dict(size=10, color='#94a3b8'),
     ))
     fig4.update_layout(
         height=300,
-        title=dict(text="Direct vs Platform Sales", font=dict(size=13, color='#94a3b8')),
+        title=dict(text="Revenue by Sale Type", font=dict(size=13, color='#94a3b8')),
+        showlegend=False,
         paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(15,23,42,.6)',
-        legend=dict(font=dict(size=11, color='#94a3b8'), bgcolor='rgba(0,0,0,0)'),
-        margin=dict(l=0, r=0, t=30, b=0),
+        template='plotly_dark', margin=dict(l=0, r=60, t=40, b=10),
+        hovermode='y unified',
+        hoverlabel=dict(bgcolor='#1e293b', bordercolor='#334155', font=dict(size=12, color='#e2e8f0')),
+        yaxis=dict(autorange='reversed', tickfont=dict(size=10, color='#94a3b8'), gridcolor='rgba(255,255,255,.05)', linecolor='rgba(255,255,255,.08)'),
+        xaxis=dict(tickprefix='$', showticklabels=False, gridcolor='rgba(255,255,255,.05)', linecolor='rgba(255,255,255,.08)'),
     )
     st.plotly_chart(fig4, use_container_width=True)
 
-# ---- CHARTS ROW 3: Units over time + Top countries ----
-ch5, ch6 = st.columns([3, 2])
-
 with ch5:
-    weekly_units = df.groupby(['week', 'platform'])['quantity'].sum().reset_index()
-    plats = sorted(weekly_units['platform'].unique())
-    fig5 = go.Figure()
-    for i, p in enumerate(plats):
-        pd_ = weekly_units[weekly_units['platform'] == p].sort_values('week')
-        fig5.add_trace(go.Bar(x=pd_['week'], y=pd_['quantity'], name=p, marker_color=PAL[i % len(PAL)]))
-    fig5.update_layout(barmode='stack', height=300, title=dict(text="Weekly Units by Platform", font=dict(size=13, color='#94a3b8')), **PLOT_LAYOUT)
-    st.plotly_chart(fig5, use_container_width=True)
-
-with ch6:
     top_countries = df.groupby('country')['revenue'].sum().sort_values(ascending=False).head(10).reset_index()
-    fig6 = go.Figure(go.Bar(
+    fig5 = go.Figure(go.Bar(
         x=top_countries['revenue'], y=top_countries['country'],
         orientation='h',
         marker_color=PAL[1],
         text=[fmt_currency(v) for v in top_countries['revenue']],
         textposition='outside', textfont=dict(size=10, color='#94a3b8'),
     ))
-    fig6.update_layout(
-        height=300, title=dict(text="Top 10 Countries by Revenue", font=dict(size=13, color='#94a3b8')),
+    fig5.update_layout(
+        height=300,
+        title=dict(text="Top 10 Countries by Revenue", font=dict(size=13, color='#94a3b8')),
         showlegend=False,
         paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(15,23,42,.6)',
-        template='plotly_dark', margin=dict(l=0, r=0, t=30, b=0),
-        hovermode='x unified',
+        template='plotly_dark', margin=dict(l=0, r=60, t=40, b=10),
+        hovermode='y unified',
         hoverlabel=dict(bgcolor='#1e293b', bordercolor='#334155', font=dict(size=12, color='#e2e8f0')),
         yaxis=dict(autorange='reversed', tickfont=dict(size=10, color='#94a3b8'), gridcolor='rgba(255,255,255,.05)', linecolor='rgba(255,255,255,.08)'),
-        xaxis=dict(tickprefix='$', tickfont=dict(size=10, color='#64748b'), gridcolor='rgba(255,255,255,.05)', linecolor='rgba(255,255,255,.08)'),
+        xaxis=dict(tickprefix='$', showticklabels=False, gridcolor='rgba(255,255,255,.05)', linecolor='rgba(255,255,255,.08)'),
     )
-    st.plotly_chart(fig6, use_container_width=True)
+    st.plotly_chart(fig5, use_container_width=True)
 
-# ---- DATA TABLE ----
+# ---- CHART ROW 4: Units over time — top 5 platforms only to reduce clutter ----
+st.markdown('<div class="section-label">Unit Volume</div>', unsafe_allow_html=True)
+
+top_plats = df.groupby('platform')['quantity'].sum().sort_values(ascending=False).head(5).index.tolist()
+weekly_units = df[df['platform'].isin(top_plats)].groupby(['week', 'platform'])['quantity'].sum().reset_index()
+fig6 = go.Figure()
+for i, p in enumerate(top_plats):
+    pd_ = weekly_units[weekly_units['platform'] == p].sort_values('week')
+    fig6.add_trace(go.Bar(x=pd_['week'], y=pd_['quantity'], name=p, marker_color=PAL[i % len(PAL)]))
+fig6.update_layout(
+    barmode='stack', height=300,
+    title=dict(text="Weekly Units by Platform (top 5)", font=dict(size=13, color='#94a3b8')),
+    **PLOT_LAYOUT,
+    margin=dict(l=0, r=0, t=40, b=10),
+)
+st.plotly_chart(fig6, use_container_width=True)
 st.markdown('<div class="section-label">Data Table</div>', unsafe_allow_html=True)
 
 display_cols = ['date', 'game', 'platform', 'country', 'bp_region', 'product_type',
