@@ -66,7 +66,7 @@ def delta_html(curr, prev, label="vs prev period"):
 LEGEND_DEFAULT = dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1,
                       font=dict(size=11, color='#94a3b8'), bgcolor='rgba(0,0,0,0)')
 
-def base_layout(height=300, title="", margin=None, legend=None):
+def base_layout(height=300, title="", margin=None, legend=None, showlegend=True, hovermode="x unified"):
     return dict(
         height=height,
         title=dict(text=title, font=dict(size=13, color='#94a3b8')),
@@ -74,10 +74,10 @@ def base_layout(height=300, title="", margin=None, legend=None):
         plot_bgcolor='rgba(15,23,42,.6)',
         template='plotly_dark',
         margin=margin or dict(l=0, r=0, t=40, b=10),
-        hovermode='x unified',
+        hovermode=hovermode,
         hoverlabel=dict(bgcolor='#1e293b', bordercolor='#334155', font=dict(size=12, color='#e2e8f0')),
         legend=legend if legend is not None else LEGEND_DEFAULT,
-        showlegend=True,
+        showlegend=showlegend,
     )
 
 # Reusable axis styles
@@ -252,8 +252,7 @@ with ch2:
         textposition='outside', textfont=dict(size=10, color='#94a3b8'),
     ))
     fig2.update_layout(
-        **base_layout(height=300, title="Revenue by Platform"),
-        showlegend=False,
+        **base_layout(height=300, title="Revenue by Platform", showlegend=False),
         xaxis=AX_LABEL,
         yaxis=dict(**AX, tickprefix='$', showticklabels=False),
     )
@@ -268,8 +267,7 @@ with ch3:
         textposition='outside', textfont=dict(size=11, color='#94a3b8'),
     ))
     fig3.update_layout(
-        **base_layout(height=300, title="Revenue by Region"),
-        showlegend=False,
+        **base_layout(height=300, title="Revenue by Region", showlegend=False),
         xaxis=AX_LABEL,
         yaxis=dict(**AX, tickprefix='$', showticklabels=False),
     )
@@ -293,9 +291,7 @@ with ch4:
         textposition='outside', textfont=dict(size=10, color='#94a3b8'),
     ))
     fig4.update_layout(
-        **base_layout(height=300, title="Revenue by Sale Type", margin=dict(l=0, r=70, t=40, b=10)),
-        showlegend=False,
-        hovermode='y unified',
+        **base_layout(height=300, title="Revenue by Sale Type", margin=dict(l=0, r=70, t=40, b=10), showlegend=False, hovermode='y unified'),
         xaxis=dict(**AX, tickprefix='$', showticklabels=False),
         yaxis=dict(**AX_LABEL, autorange='reversed'),
     )
@@ -311,9 +307,7 @@ with ch5:
         textposition='outside', textfont=dict(size=10, color='#94a3b8'),
     ))
     fig5.update_layout(
-        **base_layout(height=300, title="Top 10 Countries by Revenue", margin=dict(l=0, r=70, t=40, b=10)),
-        showlegend=False,
-        hovermode='y unified',
+        **base_layout(height=300, title="Top 10 Countries by Revenue", margin=dict(l=0, r=70, t=40, b=10), showlegend=False, hovermode='y unified'),
         xaxis=dict(**AX, tickprefix='$', showticklabels=False),
         yaxis=dict(**AX_LABEL, autorange='reversed'),
     )
