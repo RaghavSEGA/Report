@@ -94,14 +94,20 @@ with st.sidebar:
     st.markdown("<div style='font-size:1rem;font-weight:700;color:#f1f5f9;margin-bottom:.25rem;'>Sales Dashboard</div>", unsafe_allow_html=True)
     st.markdown("<div style='font-size:.65rem;color:#475569;text-transform:uppercase;letter-spacing:.1em;margin-bottom:1rem;'>Revenue & Units Analytics</div>", unsafe_allow_html=True)
     st.markdown('<span class="sidebar-section">Data Source</span>', unsafe_allow_html=True)
-    uploaded_file = st.file_uploader("", type=["csv", "xlsx"], label_visibility="collapsed")
+    uploaded_file = st.file_uploader("", type=["csv", "xlsx", "gz"], label_visibility="collapsed")
     if uploaded_file is None:
-        st.info("Upload a CSV or XLSX to begin.")
+        st.info("Upload a CSV, XLSX, or CSV.GZ to begin.")
         st.stop()
 
 # ---- LOAD DATA ----
 try:
-    raw = pd.read_csv(uploaded_file) if uploaded_file.name.lower().endswith(".csv") else pd.read_excel(uploaded_file)
+    name = uploaded_file.name.lower()
+    if name.endswith(".csv.gz") or name.endswith(".gz"):
+        raw = pd.read_csv(uploaded_file, compression="gzip")
+    elif name.endswith(".csv"):
+        raw = pd.read_csv(uploaded_file)
+    else:
+        raw = pd.read_excel(uploaded_file)
 except Exception as e:
     st.sidebar.error(f"Error reading file: {e}")
     st.stop()
