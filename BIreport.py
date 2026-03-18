@@ -63,7 +63,10 @@ def delta_html(curr, prev, label="vs prev period"):
     return f'<div class="{cls}">{sign}{pct:.1f}% {label}</div>'
 
 # Base plot style — NO xaxis/yaxis here to avoid double-kwarg conflicts
-def base_layout(height=300, title="", margin=None):
+LEGEND_DEFAULT = dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1,
+                      font=dict(size=11, color='#94a3b8'), bgcolor='rgba(0,0,0,0)')
+
+def base_layout(height=300, title="", margin=None, legend=None):
     return dict(
         height=height,
         title=dict(text=title, font=dict(size=13, color='#94a3b8')),
@@ -73,8 +76,7 @@ def base_layout(height=300, title="", margin=None):
         margin=margin or dict(l=0, r=0, t=40, b=10),
         hovermode='x unified',
         hoverlabel=dict(bgcolor='#1e293b', bordercolor='#334155', font=dict(size=12, color='#e2e8f0')),
-        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1,
-                    font=dict(size=11, color='#94a3b8'), bgcolor='rgba(0,0,0,0)'),
+        legend=legend if legend is not None else LEGEND_DEFAULT,
         showlegend=True,
     )
 
@@ -228,9 +230,11 @@ for i, g in enumerate(games):
         hovertemplate=f'<b>{g}</b><br>%{{x|%b %d, %Y}}<br>$%{{y:,.0f}}<extra></extra>',
     ))
 fig1.update_layout(
-    **base_layout(height=340, title="Weekly Revenue by Game", margin=dict(l=0, r=0, t=40, b=60)),
-    legend=dict(orientation='h', yanchor='top', y=-0.15, xanchor='left', x=0,
-                font=dict(size=10, color='#94a3b8'), bgcolor='rgba(0,0,0,0)'),
+    **base_layout(
+        height=340, title="Weekly Revenue by Game", margin=dict(l=0, r=0, t=40, b=60),
+        legend=dict(orientation='h', yanchor='top', y=-0.15, xanchor='left', x=0,
+                    font=dict(size=10, color='#94a3b8'), bgcolor='rgba(0,0,0,0)'),
+    ),
     xaxis=AX_DEFAULT,
     yaxis=dict(**AX, tickprefix='$'),
 )
