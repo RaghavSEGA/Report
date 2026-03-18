@@ -233,7 +233,7 @@ fig1.update_layout(
     xaxis=AX,
     yaxis=dict(**AX, tickprefix='$'),
 )
-st.plotly_chart(fig1, use_container_width=True)
+st.plotly_chart(fig1, width="stretch")
 
 # ---- CHARTS ROW 2: Platform + Region ----
 ch2, ch3 = st.columns(2)
@@ -252,7 +252,7 @@ with ch2:
         xaxis=AX_LABEL,
         yaxis=dict(**AX, tickprefix='$', showticklabels=False),
     )
-    st.plotly_chart(fig2, use_container_width=True)
+    st.plotly_chart(fig2, width="stretch")
 
 with ch3:
     region = df.groupby('bp_region')['revenue'].sum().reset_index().sort_values('revenue', ascending=False)
@@ -268,7 +268,7 @@ with ch3:
         xaxis=AX_LABEL,
         yaxis=dict(**AX, tickprefix='$', showticklabels=False),
     )
-    st.plotly_chart(fig3, use_container_width=True)
+    st.plotly_chart(fig3, width="stretch")
 
 # ---- CHARTS ROW 3: Sale type + Top countries ----
 ch4, ch5 = st.columns(2)
@@ -294,7 +294,7 @@ with ch4:
         xaxis=dict(**AX, tickprefix='$', showticklabels=False),
         yaxis=dict(**AX_LABEL, autorange='reversed'),
     )
-    st.plotly_chart(fig4, use_container_width=True)
+    st.plotly_chart(fig4, width="stretch")
 
 with ch5:
     top_c = df.groupby('country')['revenue'].sum().sort_values(ascending=False).head(10).reset_index()
@@ -312,7 +312,7 @@ with ch5:
         xaxis=dict(**AX, tickprefix='$', showticklabels=False),
         yaxis=dict(**AX_LABEL, autorange='reversed'),
     )
-    st.plotly_chart(fig5, use_container_width=True)
+    st.plotly_chart(fig5, width="stretch")
 
 # ---- CHART ROW 4: Units by platform (top 5) ----
 st.markdown('<div class="section-label">Unit Volume</div>', unsafe_allow_html=True)
@@ -329,7 +329,7 @@ fig6.update_layout(
     xaxis=AX,
     yaxis=AX,
 )
-st.plotly_chart(fig6, use_container_width=True)
+st.plotly_chart(fig6, width="stretch")
 
 # ---- DATA TABLE ----
 st.markdown('<div class="section-label">Data Table</div>', unsafe_allow_html=True)
@@ -360,7 +360,7 @@ if 'net_revenue_usd' in table_df.columns: col_cfg['net_revenue_usd'] = st.column
 if 'quantity'       in table_df.columns: col_cfg['quantity']       = st.column_config.NumberColumn("Units", format="%d")
 if 'sale_type'      in table_df.columns: col_cfg['sale_type']      = st.column_config.TextColumn("Sale Type")
 
-st.dataframe(table_df, use_container_width=True, height=460, column_config=col_cfg, hide_index=True)
+st.dataframe(table_df, width="stretch", height=460, column_config=col_cfg, hide_index=True)
 
 # ---- AI CHATBOT ----
 st.markdown('<div class="section-label">AI Analyst</div>', unsafe_allow_html=True)
@@ -417,9 +417,9 @@ ic, bc, clc = st.columns([6, 1, 1])
 with ic:
     user_input = st.text_input("Ask the AI", placeholder="e.g. What is the WoW revenue change? Which platform drives the most units?", label_visibility="hidden", key="sales_chat_input")
 with bc:
-    send = st.button("Ask", use_container_width=True, type="primary")
+    send = st.button("Ask", width="stretch", type="primary")
 with clc:
-    if st.button("Clear", use_container_width=True):
+    if st.button("Clear", width="stretch"):
         st.session_state.sales_chat_history = []
         st.rerun()
 
