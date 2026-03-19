@@ -368,110 +368,83 @@ if "sales_chat_history" not in st.session_state:
     st.session_state.sales_chat_history = []
 
 def build_data_context(df):
-    import io
-
-    # Weekly breakdown with readable date strings
     df2 = df.copy()
     df2['week_str'] = df2['week'].dt.strftime('%Y-%m-%d')
-    weekly = df2.groupby('week_str')[['revenue', 'quantity']].sum().sort_index()
 
-    # WoW calculation
+    # WoW
+    weekly = df2.groupby('week_str')[['revenue', 'quantity']].sum().sort_index()
     weeks_sorted = sorted(weekly.index.tolist())
-    wow_text = "Only one week of data available — WoW comparison not possible."
     if len(weeks_sorted) >= 2:
         cur_w, prev_w = weeks_sorted[-1], weeks_sorted[-2]
-        cur_rev  = weekly.loc[cur_w, 'revenue']
-        prev_rev = weekly.loc[prev_w, 'revenue']
-        cur_u    = weekly.loc[cur_w, 'quantity']
-        prev_u   = weekly.loc[prev_w, 'quantity']
-        rev_chg  = (cur_rev - prev_rev) / abs(prev_rev) * 100 if prev_rev else 0
-        u_chg    = (cur_u - prev_u) / abs(prev_u) * 100 if prev_u else 0
+        cr, pr = weekly.loc[cur_w, 'revenue'], weekly.loc[prev_w, 'revenue']
+        cu, pu = weekly.loc[cur_w, 'quantity'], weekly.loc[prev_w, 'quantity']
         wow_text = (
-            f"Latest week ({cur_w}): ${cur_rev:,.2f} revenue, {int(cur_u):,} units. "
-            f"Prior week ({prev_w}): ${prev_rev:,.2f} revenue, {int(prev_u):,} units. "
-            f"WoW revenue change: {rev_chg:+.1f}%. WoW unit change: {u_chg:+.1f}%."
+            f"Latest week ({cur_w}): revenue=${cr:,.2f}, units={int(cu):,}. "
+            f"Prior week ({prev_w}): revenue=${pr:,.2f}, units={int(pu):,}. "
+            f"WoW revenue change: {(cr-pr)/abs(pr)*100:+.1f}%. "
+            f"WoW unit change: {(cu-pu)/abs(pu)*100:+.1f}%."
         )
+    else:
+        wow_text = "Only one week of data — WoW not possible."
 
-    # Per-game per-platform breakdown
-    game_plat = df2.groupby(['game', 'platform'])[['revenue', 'quantity']].sum().reset_index()
-    game_plat_str = game_plat.to_string(index=False)
+    # Pre-computed tables
+    game_plat     = df2.groupby(['game','platform'])[['revenue','quantity']].sum().reset_index().to_string(index=False)
+    game_sale     = df2.groupby(['game','sale_type'])[['revenue','quantity']].sum().reset_index().to_string(index=False)
+    game_plat_sale= df2.groupby(['game','platform','sale_type'])[['revenue','quantity']].sum().reset_index().to_string(index=False)
+    game_week     = df2.groupby(['game','week_str'])[['revenue','quantity']].sum().reset_index().to_string(index=False)
+    sale_totals   = df2.groupby('sale_type')[['revenue','quantity']].sum().reset_index().to_string(index=False)
+    top_countries = df2.groupby('country')[['revenue','quantity']].sum().sort_values('revenue',ascending=False).head(20).to_string()
+    prod_type     = df2.groupby('product_type')[['revenue','quantity']].sum().reset_index().to_string(index=False)
 
-    # Per-game per-week
-    game_week = df2.groupby(['game', 'week_str'])[['revenue', 'quantity']].sum().reset_index()
-    game_week_str = game_week.to_string(index=False)
-
-    # Sale type breakdown
-    sale_type = df2.groupby('sale_type')[['revenue', 'quantity']].sum().reset_index()
-    total_rev = df2['revenue'].sum()
-    sale_type['pct_revenue'] = (sale_type['revenue'] / total_rev * 100).round(1)
-    sale_type_str = sale_type.to_string(index=False)
-
-    # Direct vs platform pct per game
-    game_sale = df2.groupby(['game', 'sale_type'])['revenue'].sum().reset_index()
-    game_sale_str = game_sale.to_string(index=False)
-
-    # Top 20 countries
-    top_countries = df2.groupby('country')[['revenue', 'quantity']].sum().sort_values('revenue', ascending=False).head(20)
-    top_countries_str = top_countries.to_string()
-
-    # DLC attach rate
-    dlc_units  = df2[df2['product_type'].str.lower().str.contains('dlc|add-on|add_on', na=False)]['quantity'].sum() if 'product_type' in df2.columns else 0
+    dlc_units  = df2[df2['product_type'].str.lower().str.contains('dlc|add', na=False)]['quantity'].sum() if 'product_type' in df2.columns else 0
     base_units = df2[df2['product_type'].str.lower().str.contains('base|game|standard', na=False)]['quantity'].sum() if 'product_type' in df2.columns else 0
-    attach_str = f"{dlc_units/base_units*100:.1f}% ({int(dlc_units):,} DLC units / {int(base_units):,} base units)" if base_units > 0 else f"Base game units not in dataset. Total DLC/Add-on units: {int(dlc_units):,}"
+    attach_str = (f"{dlc_units/base_units*100:.1f}% ({int(dlc_units):,} DLC / {int(base_units):,} base units)"
+                  if base_units > 0 else f"No base game rows found. DLC/Add-on units: {int(dlc_units):,}")
 
-    # Product type breakdown
-    prod_type = df2.groupby('product_type')[['revenue', 'quantity']].sum().reset_index().to_string(index=False)
+    # Raw CSV (capped at 3000 rows)
+    MAX_ROWS = 3000
+    keep_cols = [c for c in ['date','game','platform','country','bp_region',
+                              'product_type','sale_type','quantity','revenue','net_revenue_usd']
+                 if c in df2.columns]
+    raw = df2[keep_cols].copy()
+    raw['date'] = raw['date'].dt.strftime('%Y-%m-%d')
+    truncated = len(raw) > MAX_ROWS
+    csv_str = raw.head(MAX_ROWS).to_csv(index=False)
+    trunc_note = f"(first {MAX_ROWS} of {len(raw):,} rows shown)" if truncated else "(full dataset)"
 
-    return f"""You are an expert sales data analyst with direct access to the full dataset below.
-You MUST answer all questions using the data provided. Never say you cannot provide a breakdown — the data is here.
-Be specific with numbers. Format currency with $ and commas.
+    overview = (
+        f"Dates: {df2['date'].min().strftime('%Y-%m-%d')} to {df2['date'].max().strftime('%Y-%m-%d')}\n"
+        f"Rows: {len(df2):,} {trunc_note}\n"
+        f"Gross revenue: {df2['revenue'].sum():,.2f} USD\n"
+        f"Net revenue: {df2['net_revenue_usd'].sum():,.2f} USD\n"
+        f"Units: {df2['quantity'].sum():,}\n"
+        f"Games: {', '.join(sorted(df2['game'].unique()))}\n"
+        f"Platforms: {', '.join(sorted(df2['platform'].unique()))}\n"
+        f"Regions: {', '.join(sorted(df2['bp_region'].unique()))}"
+    )
 
-=== DATASET OVERVIEW ===
-Date range: {df2['date'].min().strftime('%Y-%m-%d')} to {df2['date'].max().strftime('%Y-%m-%d')}
-Total transactions: {len(df2):,}
-Total units: {df2['quantity'].sum():,}
-Total gross revenue: ${df2['revenue'].sum():,.2f}
-Total net revenue: ${df2['net_revenue_usd'].sum():,.2f}
-Games: {', '.join(sorted(df2['game'].unique()))}
-Platforms: {', '.join(sorted(df2['platform'].unique()))}
-Regions: {', '.join(sorted(df2['bp_region'].unique()))}
-Product types: {', '.join(sorted(df2['product_type'].unique()))}
-
-=== WEEK-OVER-WEEK SUMMARY ===
-{wow_text}
-
-=== ALL WEEKLY REVENUE & UNITS ===
-{weekly.to_string()}
-
-=== REVENUE & UNITS BY GAME + PLATFORM ===
-{game_plat_str}
-
-=== REVENUE & UNITS BY GAME + WEEK ===
-{game_week_str}
-
-=== SALE TYPE BREAKDOWN (direct vs platform) ===
-{sale_type_str}
-
-=== REVENUE BY GAME + SALE TYPE ===
-{game_sale_str}
-
-=== TOP 20 COUNTRIES BY REVENUE ===
-{top_countries_str}
-
-=== PRODUCT TYPE BREAKDOWN ===
-{prod_type}
-
-=== DLC ATTACH RATE ===
-{attach_str}
-
-INSTRUCTIONS:
-- Answer every question using the data above. It is all available.
-- For WoW questions, use the WEEK-OVER-WEEK SUMMARY section.
-- For direct vs bundle/platform questions, use the SALE TYPE sections.
-- For per-game comparisons, use the BY GAME sections.
-- For DLC attach rate, use the DLC ATTACH RATE section.
-- Always cite specific numbers from the data.
-- Keep answers concise but complete."""
+    return (
+        "You are an expert sales data analyst with full transaction-level data.\n"
+        "NEVER say a breakdown is unavailable. All dimensions (game, platform, sale_type, country) are present.\n"
+        "Use the pre-computed tables for speed. Use the raw CSV for cross-dimensional queries.\n\n"
+        "=== OVERVIEW ===\n" + overview + "\n\n"
+        "=== WEEK-OVER-WEEK ===\n" + wow_text + "\n\n"
+        "=== WEEKLY TOTALS ===\n" + weekly.to_string() + "\n\n"
+        "=== BY GAME + PLATFORM ===\n" + game_plat + "\n\n"
+        "=== BY GAME + SALE TYPE ===\n" + game_sale + "\n\n"
+        "=== BY GAME + PLATFORM + SALE TYPE ===\n" + game_plat_sale + "\n\n"
+        "=== BY GAME + WEEK ===\n" + game_week + "\n\n"
+        "=== SALE TYPE TOTALS ===\n" + sale_totals + "\n\n"
+        "=== TOP 20 COUNTRIES ===\n" + top_countries + "\n\n"
+        "=== PRODUCT TYPE ===\n" + prod_type + "\n\n"
+        "=== DLC ATTACH RATE ===\n" + attach_str + "\n\n"
+        "=== RAW TRANSACTIONS (CSV) ===\n" + csv_str + "\n\n"
+        "COLUMN NOTES:\n"
+        "- sale_type: 'Direct Package Sale'=direct; 'Platform Sale'=storefront; other values=bundle/edition names.\n"
+        "- platform: Steam, PS5, PS4, XBSX, XB1, NSW, NSW2, epic, etc.\n"
+        "- For Steam-specific or platform-specific breakdowns, filter the raw CSV by platform.\n"
+        "- Always give exact dollar amounts and percentages."
+    )
 
 chat_html = '<div class="chat-container">'
 if not st.session_state.sales_chat_history:
