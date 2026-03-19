@@ -446,6 +446,9 @@ def build_data_context(df):
         "- Always give exact dollar amounts and percentages."
     )
 
+if "chat_thinking" not in st.session_state:
+    st.session_state.chat_thinking = False
+
 chat_html = '<div class="chat-container">'
 if not st.session_state.sales_chat_history:
     chat_html += '<div class="chat-thinking">Ask me anything about this sales data — WoW changes, platform comparisons, DLC attach rates, top countries, and more.</div>'
@@ -454,38 +457,46 @@ for msg in st.session_state.sales_chat_history:
         chat_html += f'<div class="chat-msg-user"><div class="chat-bubble-user">{msg["content"]}</div></div>'
     else:
         chat_html += f'<div class="chat-msg-ai"><div class="chat-bubble-ai">{msg["content"].replace(chr(10), "<br>")}</div></div>'
+if st.session_state.chat_thinking:
+    chat_html += '<div class="chat-msg-ai"><div class="chat-bubble-ai chat-thinking">Analysing your data...</div></div>'
 chat_html += '</div>'
 st.markdown(chat_html, unsafe_allow_html=True)
 
 ic, bc, clc = st.columns([6, 1, 1])
 with ic:
-    user_input = st.text_input("Ask the AI", placeholder="e.g. What is the WoW revenue change? Which platform drives the most units?", label_visibility="hidden", key="sales_chat_input")
+    user_input = st.text_input("Ask the AI", placeholder="e.g. What is the WoW revenue change? Which platform drives the most units?", label_visibility="hidden", key="sales_chat_input", disabled=st.session_state.chat_thinking)
 with bc:
-    send = st.button("Ask", width="stretch", type="primary")
+    send = st.button("Ask", width="stretch", type="primary", disabled=st.session_state.chat_thinking)
 with clc:
-    if st.button("Clear", width="stretch"):
+    if st.button("Clear", width="stretch", disabled=st.session_state.chat_thinking):
         st.session_state.sales_chat_history = []
         st.rerun()
 
-if send and user_input.strip():
+if send and user_input.strip() and not st.session_state.chat_thinking:
     st.session_state.sales_chat_history.append({"role": "user", "content": user_input.strip()})
+    st.session_state.chat_thinking = True
+    st.rerun()
+
+if st.session_state.chat_thinking and st.session_state.sales_chat_history and st.session_state.sales_chat_history[-1]["role"] == "user":
     ctx      = build_data_context(df)
     messages = [{"role": "user" if m["role"] == "user" else "assistant", "content": m["content"]}
                 for m in st.session_state.sales_chat_history[:-1]]
-    messages.append({"role": "user", "content": f"{ctx}\n\nUSER QUESTION: {user_input.strip()}"})
-    try:
-        import requests
-        resp = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={"Content-Type": "application/json", "x-api-key": st.secrets["ANTHROPIC_API_KEY"], "anthropic-version": "2023-06-01"},
-            json={"model": "claude-sonnet-4-20250514", "max_tokens": 1000,
-                  "system": "You are a concise, accurate sales data analyst. Be direct and data-driven.",
-                  "messages": messages},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        answer = resp.json()["content"][0]["text"]
-    except Exception as e:
-        answer = f"Sorry, I couldn't reach the AI API: {e}"
+    messages.append({"role": "user", "content": f"{ctx}\n\nUSER QUESTION: {st.session_state.sales_chat_history[-1]['content']}"})
+    with st.spinner("Analysing your data..."):
+        try:
+            import requests
+            resp = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={"Content-Type": "application/json", "x-api-key": st.secrets["ANTHROPIC_API_KEY"], "anthropic-version": "2023-06-01"},
+                json={"model": "claude-sonnet-4-20250514", "max_tokens": 1000,
+                      "system": "You are a concise, accurate sales data analyst. Be direct and data-driven.",
+                      "messages": messages},
+                timeout=60,
+            )
+            resp.raise_for_status()
+            answer = resp.json()["content"][0]["text"]
+        except Exception as e:
+            answer = f"Sorry, I couldn't reach the AI API: {e}"
+    st.session_state.chat_thinking = False
     st.session_state.sales_chat_history.append({"role": "assistant", "content": answer})
     st.rerun()
