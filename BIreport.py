@@ -368,38 +368,110 @@ if "sales_chat_history" not in st.session_state:
     st.session_state.sales_chat_history = []
 
 def build_data_context(df):
-    weekly       = df.groupby('week')[['revenue', 'quantity']].sum()
-    by_game      = df.groupby('game')[['revenue', 'quantity']].sum().to_dict()
-    by_platform  = df.groupby('platform')[['revenue', 'quantity']].sum().to_dict()
-    by_region    = df.groupby('bp_region')['revenue'].sum().to_dict()
-    by_sale_type = df.groupby('sale_type')['revenue'].sum().to_dict()
-    top_countries = df.groupby('country')['revenue'].sum().sort_values(ascending=False).head(15).to_dict()
-    dlc_units    = df[df['product_type'].str.lower().str.contains('dlc|add', na=False)]['quantity'].sum() if 'product_type' in df.columns else 0
-    base_units   = df[df['product_type'].str.lower().str.contains('base|game|standard', na=False)]['quantity'].sum() if 'product_type' in df.columns else 0
-    attach_str   = f"{dlc_units/base_units*100:.1f}%" if base_units > 0 else "N/A (no base game data)"
+    import io
 
-    return f"""You are an expert sales data analyst. Answer questions about this sales dataset concisely and accurately.
+    # Weekly breakdown with readable date strings
+    df2 = df.copy()
+    df2['week_str'] = df2['week'].dt.strftime('%Y-%m-%d')
+    weekly = df2.groupby('week_str')[['revenue', 'quantity']].sum().sort_index()
 
-DATASET:
-- Date range: {df['date'].min().strftime('%Y-%m-%d')} to {df['date'].max().strftime('%Y-%m-%d')}
-- Transactions: {len(df):,} | Units: {df['quantity'].sum():,} | Gross revenue: ${df['revenue'].sum():,.2f} | Net revenue: ${df['net_revenue_usd'].sum():,.2f}
-- Games: {', '.join(sorted(df['game'].unique()))}
-- Platforms: {', '.join(sorted(df['platform'].unique()))}
-- Regions: {', '.join(sorted(df['bp_region'].unique()))}
+    # WoW calculation
+    weeks_sorted = sorted(weekly.index.tolist())
+    wow_text = "Only one week of data available — WoW comparison not possible."
+    if len(weeks_sorted) >= 2:
+        cur_w, prev_w = weeks_sorted[-1], weeks_sorted[-2]
+        cur_rev  = weekly.loc[cur_w, 'revenue']
+        prev_rev = weekly.loc[prev_w, 'revenue']
+        cur_u    = weekly.loc[cur_w, 'quantity']
+        prev_u   = weekly.loc[prev_w, 'quantity']
+        rev_chg  = (cur_rev - prev_rev) / abs(prev_rev) * 100 if prev_rev else 0
+        u_chg    = (cur_u - prev_u) / abs(prev_u) * 100 if prev_u else 0
+        wow_text = (
+            f"Latest week ({cur_w}): ${cur_rev:,.2f} revenue, {int(cur_u):,} units. "
+            f"Prior week ({prev_w}): ${prev_rev:,.2f} revenue, {int(prev_u):,} units. "
+            f"WoW revenue change: {rev_chg:+.1f}%. WoW unit change: {u_chg:+.1f}%."
+        )
 
-WEEKLY REVENUE & UNITS:
+    # Per-game per-platform breakdown
+    game_plat = df2.groupby(['game', 'platform'])[['revenue', 'quantity']].sum().reset_index()
+    game_plat_str = game_plat.to_string(index=False)
+
+    # Per-game per-week
+    game_week = df2.groupby(['game', 'week_str'])[['revenue', 'quantity']].sum().reset_index()
+    game_week_str = game_week.to_string(index=False)
+
+    # Sale type breakdown
+    sale_type = df2.groupby('sale_type')[['revenue', 'quantity']].sum().reset_index()
+    total_rev = df2['revenue'].sum()
+    sale_type['pct_revenue'] = (sale_type['revenue'] / total_rev * 100).round(1)
+    sale_type_str = sale_type.to_string(index=False)
+
+    # Direct vs platform pct per game
+    game_sale = df2.groupby(['game', 'sale_type'])['revenue'].sum().reset_index()
+    game_sale_str = game_sale.to_string(index=False)
+
+    # Top 20 countries
+    top_countries = df2.groupby('country')[['revenue', 'quantity']].sum().sort_values('revenue', ascending=False).head(20)
+    top_countries_str = top_countries.to_string()
+
+    # DLC attach rate
+    dlc_units  = df2[df2['product_type'].str.lower().str.contains('dlc|add-on|add_on', na=False)]['quantity'].sum() if 'product_type' in df2.columns else 0
+    base_units = df2[df2['product_type'].str.lower().str.contains('base|game|standard', na=False)]['quantity'].sum() if 'product_type' in df2.columns else 0
+    attach_str = f"{dlc_units/base_units*100:.1f}% ({int(dlc_units):,} DLC units / {int(base_units):,} base units)" if base_units > 0 else f"Base game units not in dataset. Total DLC/Add-on units: {int(dlc_units):,}"
+
+    # Product type breakdown
+    prod_type = df2.groupby('product_type')[['revenue', 'quantity']].sum().reset_index().to_string(index=False)
+
+    return f"""You are an expert sales data analyst with direct access to the full dataset below.
+You MUST answer all questions using the data provided. Never say you cannot provide a breakdown — the data is here.
+Be specific with numbers. Format currency with $ and commas.
+
+=== DATASET OVERVIEW ===
+Date range: {df2['date'].min().strftime('%Y-%m-%d')} to {df2['date'].max().strftime('%Y-%m-%d')}
+Total transactions: {len(df2):,}
+Total units: {df2['quantity'].sum():,}
+Total gross revenue: ${df2['revenue'].sum():,.2f}
+Total net revenue: ${df2['net_revenue_usd'].sum():,.2f}
+Games: {', '.join(sorted(df2['game'].unique()))}
+Platforms: {', '.join(sorted(df2['platform'].unique()))}
+Regions: {', '.join(sorted(df2['bp_region'].unique()))}
+Product types: {', '.join(sorted(df2['product_type'].unique()))}
+
+=== WEEK-OVER-WEEK SUMMARY ===
+{wow_text}
+
+=== ALL WEEKLY REVENUE & UNITS ===
 {weekly.to_string()}
 
-BY GAME revenue: {json.dumps({k: round(v,2) for k,v in by_game['revenue'].items()}, default=str)}
-BY GAME units:   {json.dumps({k: int(v) for k,v in by_game['quantity'].items()}, default=str)}
-BY PLATFORM revenue: {json.dumps({k: round(v,2) for k,v in by_platform['revenue'].items()}, default=str)}
-BY PLATFORM units:   {json.dumps({k: int(v) for k,v in by_platform['quantity'].items()}, default=str)}
-BY REGION: {json.dumps({k: round(v,2) for k,v in by_region.items()}, default=str)}
-BY SALE TYPE: {json.dumps({k: round(v,2) for k,v in by_sale_type.items()}, default=str)}
-TOP COUNTRIES: {json.dumps({k: round(v,2) for k,v in top_countries.items()}, default=str)}
-DLC ATTACH RATE: {attach_str}
+=== REVENUE & UNITS BY GAME + PLATFORM ===
+{game_plat_str}
 
-Answer based only on available data. Format numbers clearly. Keep answers to 2-5 sentences."""
+=== REVENUE & UNITS BY GAME + WEEK ===
+{game_week_str}
+
+=== SALE TYPE BREAKDOWN (direct vs platform) ===
+{sale_type_str}
+
+=== REVENUE BY GAME + SALE TYPE ===
+{game_sale_str}
+
+=== TOP 20 COUNTRIES BY REVENUE ===
+{top_countries_str}
+
+=== PRODUCT TYPE BREAKDOWN ===
+{prod_type}
+
+=== DLC ATTACH RATE ===
+{attach_str}
+
+INSTRUCTIONS:
+- Answer every question using the data above. It is all available.
+- For WoW questions, use the WEEK-OVER-WEEK SUMMARY section.
+- For direct vs bundle/platform questions, use the SALE TYPE sections.
+- For per-game comparisons, use the BY GAME sections.
+- For DLC attach rate, use the DLC ATTACH RATE section.
+- Always cite specific numbers from the data.
+- Keep answers concise but complete."""
 
 chat_html = '<div class="chat-container">'
 if not st.session_state.sales_chat_history:
