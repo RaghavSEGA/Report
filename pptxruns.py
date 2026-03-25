@@ -440,6 +440,28 @@ h1 { font-size: 2rem !important; font-weight: 700 !important; color: #f1f5f9 !im
                  margin-top: .15rem; margin-bottom: .35rem; }
 .log-entry     { border-left: 2px solid #1e3a5f; padding-left: .6rem;
                  margin-bottom: .5rem; }
+
+/* ── Active spinner entry ── */
+@keyframes spin { to { transform: rotate(360deg); } }
+.log-active {
+    border-left: 2px solid #00AADD;
+    padding-left: .6rem;
+    margin-bottom: .5rem;
+    display: flex;
+    align-items: flex-start;
+    gap: .55rem;
+}
+.log-spinner {
+    flex-shrink: 0;
+    width: 14px; height: 14px;
+    margin-top: 3px;
+    border: 2px solid rgba(0,170,221,0.25);
+    border-top-color: #00AADD;
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+    display: inline-block;
+}
+.log-active-text { flex: 1; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -1047,7 +1069,7 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
     }
 
     # ── STAGE 1 + 2: document extraction & web research in parallel ──────────
-    yield ("log", (
+    yield ("spinner", (
         "📂 <b>Stage 1 of 4 — Loading your documents</b><br>"
         "<span class='log-detail'>Reading uploaded files and extracting their text content. "
         "PDFs are parsed page-by-page; Excel/CSV sheets are converted to plain text tables; "
@@ -1056,12 +1078,13 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
     ).format(_MAX_DOC_CHARS))
 
     if web_search_en and game_title:
-        yield ("log", (
+        yield ("spinner", (
             "🔍 <b>Stage 2 of 4 — Web research running in parallel</b><br>"
             "<span class='log-detail'>While your documents are being extracted, Claude is "
-            "simultaneously searching the web for <i>{}</i>. It will gather Metacritic scores, "
-            "sales estimates, key mechanics, player reception, and post-launch data. "
-            "Running both stages at the same time saves ~30 seconds.</span>"
+            "simultaneously searching the web for <i>{}</i>. "
+            "Two focused searches run in sequence: first critical reception &amp; sales data, "
+            "then gameplay mechanics &amp; market context. "
+            "Each has a 120s timeout with one automatic retry if it times out.</span>"
         ).format(game_title))
 
     combined_docs  = "[No documents uploaded]"
@@ -1083,54 +1106,71 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
     def _web_research():
         if not (web_search_en and game_title):
             if game_title:
-                return f"[Web search disabled — relying on model training knowledge for '{game_title}']"
+                return f"[Web search disabled \u2014 relying on model training knowledge for '{game_title}']"
             return "[No reference game specified]"
-        try:
-            data = _api_post(
-                headers=headers,
-                payload={
-                    "model": model,
-                    "max_tokens": 2500,
-                    "tools": [{"type": "web_search_20250305", "name": "web_search"}],
-                    "messages": [{"role": "user", "content": (
-                        f"You are a game industry research analyst. "
-                        f"Produce a thorough competitive intelligence report on '{game_title}' "
-                        "for use in an executive presentation. Search for current information and cover:\n\n"
-                        "**IDENTITY**\n"
-                        "- Developer, publisher, release date, platforms\n"
-                        "- Genre, sub-genre, ESRB/PEGI rating, price at launch\n\n"
-                        "**CRITICAL RECEPTION**\n"
-                        "- Metacritic and OpenCritic scores (critic + user)\n"
-                        "- Key praise themes from reviews (be specific — e.g. 'combat depth', 'open world design')\n"
-                        "- Key criticism themes (e.g. 'performance issues', 'repetitive missions')\n"
-                        "- Notable review outlets and their scores if available\n\n"
-                        "**COMMERCIAL PERFORMANCE**\n"
-                        "- Launch window sales figures or estimates\n"
-                        "- Lifetime sales if available\n"
-                        "- Sales milestones or publisher statements\n"
-                        "- Chart positions (UK, US, Japan if notable)\n\n"
-                        "**GAMEPLAY & FEATURES**\n"
-                        "- Core gameplay loop and main mechanics (5-7 bullet points)\n"
-                        "- Approximate game length (main story + completionist)\n"
-                        "- Multiplayer / co-op / online features\n"
-                        "- Accessibility features\n\n"
-                        "**POST-LAUNCH & LONGEVITY**\n"
-                        "- DLC released: names, prices, reception\n"
-                        "- Major patches or updates\n"
-                        "- Player retention signals (concurrent player counts, community activity)\n\n"
-                        "**MARKET CONTEXT**\n"
-                        "- Main competitor titles in the same window\n"
-                        "- How it performed vs. previous entries in the franchise\n"
-                        "- Any notable controversy, marketing moments, or viral moments\n\n"
-                        "Be specific with numbers wherever possible. Cite sources inline."
-                    )}],
-                },
-                timeout=60,
-            )
-            blocks = data.get("content", [])
-            return "\n".join(b.get("text", "") for b in blocks if b.get("type") == "text")
-        except Exception as e:
-            return f"[Web search error: {e}]"
+
+        def _call(prompt, max_tok=1200, timeout=120, attempt=0):
+            """Single web-search call with one automatic timeout retry."""
+            try:
+                data = _api_post(
+                    headers=headers,
+                    payload={
+                        "model": model,
+                        "max_tokens": max_tok,
+                        "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+                        "messages": [{"role": "user", "content": prompt}],
+                    },
+                    timeout=timeout,
+                )
+                blocks = data.get("content", [])
+                return "\n".join(b.get("text", "") for b in blocks if b.get("type") == "text")
+            except Exception as e:
+                err = str(e).lower()
+                is_timeout = any(t in err for t in ("timed out", "timeout", "read timeout"))
+                if is_timeout and attempt == 0:
+                    return _call(prompt, max_tok=max_tok, timeout=180, attempt=1)
+                return f"[Web search error: {e}]"
+
+        # Two focused prompts instead of one large prompt.
+        # Splitting reduces the number of web searches Claude must chain per call,
+        # cutting both latency and timeout risk.
+        p1 = (
+            f"Research the video game \"{game_title}\". Concise factual report covering:\n"
+            "1. Identity: developer, publisher, release date, platforms, genre, launch price\n"
+            "2. Critical reception: Metacritic + OpenCritic scores (critic & user), "
+            "3-4 specific praise themes, 3-4 specific criticism themes, a few outlet scores\n"
+            "3. Commercial performance: launch/lifetime sales estimates, "
+            "notable chart positions or publisher statements\n"
+            "Use real numbers. Be brief."
+        )
+        p2 = (
+            f"Research the video game \"{game_title}\". Concise factual report covering:\n"
+            "1. Gameplay: core mechanics (5-6 bullets), approximate game length, "
+            "multiplayer/co-op features\n"
+            "2. Post-launch: DLC names/prices/reception, major patches\n"
+            "3. Market context: competitors in the same window, "
+            "comparison to prior franchise entries, any notable controversies\n"
+            "Use real numbers. Be brief."
+        )
+
+        # Sequential calls - safer on rate limits than parallel
+        part1 = _call(p1)
+        part2 = _call(p2)
+
+        parts, warnings = [], []
+        for label, result in [("Reception & Sales", part1), ("Gameplay & Context", part2)]:
+            if result.startswith("[Web search error"):
+                warnings.append(f"{label}: {result}")
+            else:
+                parts.append(f"=== {label} ===\n{result}")
+
+        combined = "\n\n".join(parts)
+        if warnings and not combined:
+            return "[Web search error: " + "; ".join(warnings) + "]"
+        if warnings:
+            combined += "\n\n[Note: partial errors \u2014 " + "; ".join(warnings) + "]"
+        return combined or "[No research results returned]"
+
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         fut_docs     = pool.submit(_extract_docs)
@@ -1168,7 +1208,7 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
     # Estimate input token count roughly (1 token ≈ 4 chars)
     prompt_chars = len(combined_docs) + len(research_text) + len(business_question) + 800
     est_input_tokens = prompt_chars // 4
-    yield ("log", (
+    yield ("spinner", (
         "🤖 <b>Stage 3 of 4 — Claude is writing your presentation</b><br>"
         "<span class='log-detail'>Sending ~{:,} input tokens to {}. Claude will read all your "
         "document content, cross-reference the research on <i>{}</i>, interpret your business "
@@ -1261,7 +1301,7 @@ Rules:
             if slides_so_far > slides_announced:
                 for _ in range(slides_so_far - slides_announced):
                     slides_announced += 1
-                    yield ("log", (
+                    yield ("spinner", (
                         f"  ✏️ Writing slide {slides_announced} of {slide_count}…"
                     ))
 
@@ -1269,7 +1309,7 @@ Rules:
             if char_count - last_tick_at >= 600:
                 last_tick_at = char_count
                 pct = min(int(char_count / (slide_count * 220) * 100), 95)
-                yield ("log", (
+                yield ("spinner", (
                     f"  📝 Generating JSON… {char_count:,} chars written (~{pct}% complete)"
                 ))
 
@@ -1321,7 +1361,7 @@ Rules:
     yield ("slide_data", slide_data)
 
     # ── STAGE 4: PPTX rendering ───────────────────────────────────────────────
-    yield ("log", (
+    yield ("spinner", (
         "🖥️ <b>Stage 4 of 4 — Building the PowerPoint file</b><br>"
         "<span class='log-detail'>Rendering {} slides with python-pptx: setting the dark SEGA "
         "background, drawing coloured shape layers, placing all text boxes with proper fonts "
@@ -1370,14 +1410,38 @@ if run_btn:
                 ):
                     etype = event[0]
 
-                    if etype == "log":
-                        log_lines.append(event[1])
-                        entries = "".join(
-                            f'<div class="log-entry">{line}</div>'
-                            for line in log_lines[-14:]
-                        )
+                    if etype in ("log", "spinner"):
+                        # "spinner" = active working entry (animated ring at bottom)
+                        # "log"     = completed entry (static, left-border style)
+                        # When a new event arrives, any previous spinner is promoted
+                        # to a plain log entry so only the latest one animates.
+                        if etype == "spinner":
+                            # Promote the last spinner (if any) to a plain log entry
+                            if log_lines and log_lines[-1][0] == "spinner":
+                                log_lines[-1] = ("log", log_lines[-1][1])
+                            log_lines.append(("spinner", event[1]))
+                        else:
+                            # Promote any trailing spinner before adding the completed msg
+                            if log_lines and log_lines[-1][0] == "spinner":
+                                log_lines[-1] = ("log", log_lines[-1][1])
+                            log_lines.append(("log", event[1]))
+
+                        # Build HTML — last spinner entry gets the animated ring
+                        html_parts = []
+                        for kind, text in log_lines[-14:]:
+                            if kind == "spinner":
+                                html_parts.append(
+                                    f'<div class="log-active">'
+                                    f'<div class="log-spinner"></div>'
+                                    f'<div class="log-active-text">{text}</div>'
+                                    f'</div>'
+                                )
+                            else:
+                                html_parts.append(
+                                    f'<div class="log-entry">{text}</div>'
+                                )
                         log_area.markdown(
-                            f'<div class="result-log">{entries}</div>',
+                            f'<div class="result-log">{" ".join(html_parts)}</div>',
                             unsafe_allow_html=True,
                         )
 
