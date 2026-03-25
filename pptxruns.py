@@ -646,6 +646,41 @@ def generate_pptx(slide_data: dict) -> str:
     return output_file
 
 
+def _api_post(headers: dict, payload: dict, timeout: int = 120, max_retries: int = 4) -> dict:
+    """
+    POST to the Anthropic messages endpoint with exponential-backoff retry on 429.
+    Reads the retry-after header when present; otherwise backs off at 10s, 20s, 40s, 80s.
+    Raises RuntimeError on non-retryable errors or exhausted retries.
+    """
+    base_wait = 10
+    for attempt in range(max_retries + 1):
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers=headers,
+            json=payload,
+            timeout=timeout,
+        )
+        if resp.status_code == 429:
+            if attempt == max_retries:
+                raise RuntimeError(
+                    f"Rate limited after {max_retries} retries. "
+                    "Try again in a minute, or switch to a lower-tier model (Haiku) in the sidebar."
+                )
+            # Honour the retry-after header if the API sends one
+            retry_after = resp.headers.get("retry-after") or resp.headers.get("x-ratelimit-reset-requests")
+            try:
+                wait = max(float(retry_after), 1)
+            except (TypeError, ValueError):
+                wait = base_wait * (2 ** attempt)
+            time.sleep(wait)
+            continue
+
+        resp.raise_for_status()
+        return resp.json()
+
+    raise RuntimeError("Unexpected exit from retry loop")
+
+
 def run_pipeline(model, uploaded_files, game_title, business_question, audience,
                  theme_preset, web_search_en, slide_count):
     """Generator — yields (type, ...) tuples for incremental UI updates."""
@@ -677,10 +712,9 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
     research_text = ""
     if web_search_en and game_title:
         try:
-            resp = requests.post(
-                "https://api.anthropic.com/v1/messages",
+            data = _api_post(
                 headers=headers,
-                json={
+                payload={
                     "model": model,
                     "max_tokens": 3000,
                     "tools": [{"type": "web_search_20250305", "name": "web_search"}],
@@ -694,9 +728,11 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
                 },
                 timeout=60,
             )
-            resp.raise_for_status()
-            blocks = resp.json().get("content", [])
+            blocks = data.get("content", [])
             research_text = "\n".join(b.get("text", "") for b in blocks if b.get("type") == "text")
+        except RuntimeError as e:
+            yield ("error", str(e))
+            return
         except Exception as e:
             research_text = f"[Web search error: {e}]"
     elif game_title:
@@ -757,10 +793,9 @@ Use REAL data from the documents and research.
 Return ONLY the JSON object — no markdown, no explanation."""
 
     try:
-        resp = requests.post(
-            "https://api.anthropic.com/v1/messages",
+        data = _api_post(
             headers=headers,
-            json={
+            payload={
                 "model": model,
                 "max_tokens": 8000,
                 "system": "You are a precise game industry analyst. Always return valid JSON only.",
@@ -768,8 +803,10 @@ Return ONLY the JSON object — no markdown, no explanation."""
             },
             timeout=120,
         )
-        resp.raise_for_status()
-        raw_json = resp.json()["content"][0]["text"].strip()
+        raw_json = data["content"][0]["text"].strip()
+    except RuntimeError as e:
+        yield ("error", str(e))
+        return
     except Exception as e:
         yield ("error", f"API error: {e}")
         return
