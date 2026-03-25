@@ -987,14 +987,28 @@ def extract_template_palette(pptx_bytes: bytes) -> dict:
     }
 
 
-def generate_pptx(slide_data: dict, template_palette: dict | None = None) -> bytes:
-    """Build a PPTX in memory with python-pptx. Returns raw bytes."""
+def generate_pptx(slide_data: dict, template_bytes: bytes | None = None) -> bytes:
+    """
+    Build a PPTX from slide_data.
+
+    Two modes:
+    - template_bytes provided → open the template as the Presentation base,
+      map slide types to the template's own layouts, fill title/body
+      placeholders, and draw extra shapes (stats, comparison tables) on top.
+      All master backgrounds, logos, fonts, and decorative elements are
+      preserved exactly as they appear in the template.
+    - No template → scratch-build with the SEGA dark palette (unchanged).
+    """
     from pptx.util import Inches, Emu
+
+    if template_bytes:
+        return _generate_from_template(slide_data, template_bytes)
+
+    # ── SCRATCH-BUILD PATH (SEGA dark palette) ────────────────────────────
 
     theme = slide_data.get("theme", {})
 
     def _safe_dark_hex(val, fallback):
-        """Accept Claude's hex only if it is a mid/dark vivid colour (lum 0.04–0.82)."""
         if not val or not isinstance(val, str): return fallback
         h = val.lstrip("#").upper()
         if len(h) != 6: return fallback
@@ -1004,7 +1018,6 @@ def generate_pptx(slide_data: dict, template_palette: dict | None = None) -> byt
         lum = (0.299*r + 0.587*g + 0.114*b) / 255
         return h if 0.04 < lum < 0.82 else fallback
 
-    # Base SEGA defaults
     C = {
         "bg":        "040A1C",
         "subtle":    "1A2A4A",
@@ -1023,20 +1036,9 @@ def generate_pptx(slide_data: dict, template_palette: dict | None = None) -> byt
         "body_font":    "Calibri",
     }
 
-    # If a template was uploaded, override with its extracted palette
-    if template_palette:
-        for key in ("bg","subtle","header_bg","white","light","midgray","neutral",
-                    "gold","green","red","dark","primary","accent",
-                    "heading_font","body_font"):
-            if template_palette.get(key):
-                C[key] = template_palette[key]
-
     prs = Presentation()
-    # 13.3 × 7.5 inches  (LAYOUT_WIDE equivalent)
     prs.slide_width  = Inches(W_IN)
     prs.slide_height = Inches(H_IN)
-
-    # Blank layout (index 6 is always blank in the default template)
     blank_layout = prs.slide_layouts[6]
 
     slides_data = slide_data.get("slides", [])
@@ -1060,17 +1062,281 @@ def generate_pptx(slide_data: dict, template_palette: dict | None = None) -> byt
 
     buf = io.BytesIO()
     prs.save(buf)
-    buf.seek(0)
-    # Replace the Office theme with SEGA dark theme so that any text
-    # or shape that falls back to theme colours uses white-on-dark,
-    # never black-on-dark or white-on-white.
     return _patch_theme(buf.read())
 
 
+def _get_layout_map(prs):
+    """Map our 7 slide types to the best matching layout in the template."""
+    layouts = {i: l.name.lower() for i, l in enumerate(prs.slide_layouts)}
 
-# ─────────────────────────────────────────────────────────────
-# API HELPERS  (with rate-limit retry + back-off)
-# ─────────────────────────────────────────────────────────────
+    def best(*prefs):
+        for pref in prefs:
+            for i, name in layouts.items():
+                if pref in name:
+                    return i
+        # Last resort: layout with fewest non-footer placeholders
+        return min(
+            range(len(prs.slide_layouts)),
+            key=lambda i: len([p for p in prs.slide_layouts[i].placeholders
+                                if p.placeholder_format.idx < 10])
+        )
+
+    return {
+        "title":          best("title slide", "title,"),
+        "section":        best("section header", "section", "title only"),
+        "bullets":        best("title and content", "content"),
+        "stats":          best("blank", "title only", "content"),
+        "comparison":     best("comparison", "two content", "blank"),
+        "recommendation": best("title and content", "content"),
+        "closing":        best("title slide", "title,", "blank"),
+    }
+
+
+def _get_ph(slide, idx):
+    """Return placeholder by index, or None."""
+    for ph in slide.placeholders:
+        if ph.placeholder_format.idx == idx:
+            return ph
+    return None
+
+
+def _fill_ph(ph, text, size=None, bold=None, italic=None, color=None, font=None):
+    """Set a placeholder's text and optionally override run-level formatting."""
+    if not ph or not text:
+        return
+    ph.text_frame.text = str(text)
+    for para in ph.text_frame.paragraphs:
+        for run in para.runs:
+            if size  is not None: run.font.size   = _pt(size)
+            if bold  is not None: run.font.bold   = bold
+            if italic is not None: run.font.italic = italic
+            if color is not None: run.font.color.rgb = _rgb(color)
+            if font  is not None: run.font.name   = font
+
+
+def _fill_bullets_ph(ph, bullets, size=None, font=None):
+    """Fill a content placeholder with bullet text items."""
+    if not ph or not bullets:
+        return
+    tf = ph.text_frame
+    tf.clear()
+    for i, b in enumerate(bullets):
+        para = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
+        para.text  = str(b)
+        para.level = 0
+        for run in para.runs:
+            if size: run.font.size = _pt(size)
+            if font: run.font.name = font
+
+
+def _template_palette(prs):
+    """
+    Pull accent, text, card-fill colours from the template's theme for
+    use in any added shapes (stat cards, comparison tables).
+    Returns a simple dict with safe hex strings.
+    """
+    import zipfile as _zf, xml.etree.ElementTree as ET
+    buf = io.BytesIO()
+    prs.save(buf)
+    zf  = _zf.ZipFile(io.BytesIO(buf.getvalue()))
+    ns  = {'a': 'http://schemas.openxmlformats.org/drawingml/2006/main'}
+    colors = {}
+    for fname in zf.namelist():
+        if 'ppt/theme/theme' in fname and fname.endswith('.xml'):
+            tree = ET.fromstring(zf.read(fname))
+            clr  = tree.find('.//a:clrScheme', ns)
+            if clr is not None:
+                for child in clr:
+                    tag = child.tag.split('}')[-1]
+                    for cel in child:
+                        if cel.tag.split('}')[-1] == 'srgbClr':
+                            val = cel.get('val','').upper()
+                            if len(val) == 6:
+                                colors[tag] = val
+            break
+
+    def lum(h):
+        h = (h or '').upper()
+        if len(h) != 6: return 0.5
+        r,g,b = int(h[0:2],16),int(h[2:4],16),int(h[4:6],16)
+        return (0.299*r+0.587*g+0.114*b)/255
+
+    bg      = colors.get('lt1', 'FFFFFF')
+    is_dark = lum(bg) < 0.4
+    text    = 'FFFFFF' if is_dark else '111122'
+    muted   = '9999AA' if is_dark else '556677'
+    accent  = colors.get('dk2') or colors.get('accent1') or '0055AA'
+    card    = '1A2A4A' if is_dark else 'EEF2FF'
+    gold    = colors.get('accent2') or 'E8A800'
+    green   = '22AA66'
+    red     = 'CC2244'
+    return dict(text=text, muted=muted, accent=accent,
+                card=card, gold=gold, green=green, red=red,
+                is_dark=is_dark)
+
+
+def _add_shape(slide, x, y, w, h, fill_hex):
+    shape = slide.shapes.add_shape(1, _in(x), _in(y), _in(w), _in(h))
+    shape.fill.solid()
+    shape.fill.fore_color.rgb = _rgb(fill_hex)
+    shape.line.fill.background()
+    return shape
+
+
+def _add_label(slide, text, x, y, w, h, size=11, bold=False, italic=False,
+               color="111111", align=PP_ALIGN.LEFT, font="Calibri"):
+    """Add a plain text box — used for shapes added on top of template layouts."""
+    if not text:
+        return
+    txb = slide.shapes.add_textbox(_in(x), _in(y), _in(w), _in(h))
+    txb.text_frame.word_wrap = True
+    p   = txb.text_frame.paragraphs[0]
+    p.alignment = align
+    run = p.add_run()
+    run.text        = str(text)
+    run.font.size   = _pt(size)
+    run.font.bold   = bold
+    run.font.italic = italic
+    run.font.color.rgb = _rgb(color)
+    run.font.name   = font
+
+
+def _generate_from_template(slide_data: dict, template_bytes: bytes) -> bytes:
+    """
+    Build a PPTX using the uploaded template as the Presentation base.
+    Uses the template's slide layouts and masters so all branding
+    (backgrounds, logos, colour schemes, fonts) is inherited automatically.
+
+    For each of our 7 slide types we pick the best matching layout, fill
+    its title/body placeholders, then draw extra shapes on top for any
+    content that doesn't map to a standard placeholder (stats cards,
+    comparison tables, numbered recommendation rows).
+    """
+    prs = Presentation(io.BytesIO(template_bytes))
+
+    # Preserve the template's slide dimensions; if it's 4:3, keep it.
+    # Only override if the template is the Office default (10 x 7.5).
+    if abs(prs.slide_width - Inches(10)) < 10000 and abs(prs.slide_height - Inches(7.5)) < 10000:
+        prs.slide_width  = Inches(W_IN)
+        prs.slide_height = Inches(H_IN)
+
+    W = prs.slide_width  / 914400   # EMU → inches
+    H = prs.slide_height / 914400
+
+    layout_map = _get_layout_map(prs)
+    pal        = _template_palette(prs)
+    T = pal["text"];   A = pal["accent"]; MU = pal["muted"]
+    CA = pal["card"];  G = pal["gold"];   GR = pal["green"]; RE = pal["red"]
+
+    slides_data = slide_data.get("slides", [])
+
+    for s in slides_data:
+        stype  = (s.get("type") or "bullets").lower()
+        layout = prs.slide_layouts[layout_map.get(stype, layout_map["bullets"])]
+        slide  = prs.slides.add_slide(layout)
+
+        title_ph = _get_ph(slide, 0)
+        body_ph  = _get_ph(slide, 1)
+
+        # ── TITLE ────────────────────────────────────────────────────────
+        if stype == "title":
+            _fill_ph(title_ph, s.get("title",""))
+            _fill_ph(body_ph,  s.get("subtitle","") or s.get("body",""))
+
+        # ── SECTION ──────────────────────────────────────────────────────
+        elif stype == "section":
+            _fill_ph(title_ph, s.get("title",""))
+            _fill_ph(body_ph,  s.get("subtitle",""))
+
+        # ── BULLETS / RECOMMENDATION ─────────────────────────────────────
+        elif stype in ("bullets", "recommendation"):
+            _fill_ph(title_ph, s.get("title",""))
+            bullets = s.get("bullets") or []
+            if bullets:
+                if body_ph:
+                    _fill_bullets_ph(body_ph, bullets)
+                else:
+                    # No body placeholder — draw bullets as text boxes
+                    y0 = 1.4
+                    for i, b in enumerate(bullets[:7]):
+                        _add_label(slide, f"▸  {b}", 0.5, y0 + i*0.65,
+                                   W-1.0, 0.58, size=14, color=T)
+            elif s.get("body"):
+                _fill_ph(body_ph, s.get("body",""))
+
+        # ── STATS ────────────────────────────────────────────────────────
+        elif stype == "stats":
+            _fill_ph(title_ph, s.get("title",""))
+            stats = s.get("stats") or []
+            n  = min(len(stats), 4)
+            if n:
+                bw  = (W - 1.2) / n
+                top = 1.55
+                for i, stat in enumerate(stats[:4]):
+                    x = 0.6 + i * (bw + 0.1)
+                    _add_shape(slide, x, top, bw, 2.9, CA)
+                    _add_label(slide, stat.get("value","—"),
+                               x+0.1, top+0.25, bw-0.2, 1.1,
+                               size=36, bold=True, color=A,
+                               align=PP_ALIGN.CENTER)
+                    _add_label(slide, stat.get("label",""),
+                               x+0.1, top+1.45, bw-0.2, 0.65,
+                               size=12, bold=True, color=T,
+                               align=PP_ALIGN.CENTER)
+                    if stat.get("note"):
+                        _add_label(slide, stat["note"],
+                                   x+0.1, top+2.18, bw-0.2, 0.42,
+                                   size=9, color=MU, align=PP_ALIGN.CENTER)
+
+        # ── COMPARISON ───────────────────────────────────────────────────
+        elif stype == "comparison":
+            _fill_ph(title_ph, s.get("title",""))
+            cmp  = s.get("comparison") or {}
+            rows = cmp.get("rows") or []
+            lw   = (W - 1.0) / 2 - 1.35
+            lx   = 0.5 + 2.75 + 0.05
+            rx   = lx + lw + 0.05
+            sy   = 1.4
+            rh   = 0.42
+            _add_shape(slide, lx,   sy, lw, rh, A)
+            _add_shape(slide, rx,   sy, lw, rh, G)
+            _add_label(slide, cmp.get("left_title","Internal"),
+                       lx+0.05, sy, lw-0.1, rh,
+                       size=10, bold=True, color="FFFFFF",
+                       align=PP_ALIGN.CENTER)
+            _add_label(slide, cmp.get("right_title","Reference"),
+                       rx+0.05, sy, lw-0.1, rh,
+                       size=10, bold=True, color="FFFFFF",
+                       align=PP_ALIGN.CENTER)
+            for ri, row in enumerate(rows[:10]):
+                y   = sy + rh + ri * rh
+                bg  = CA if ri % 2 == 0 else ("1E3050" if pal["is_dark"] else "FFFFFF")
+                _add_shape(slide, 0.5, y, W-1.0, rh-0.03, bg)
+                _add_label(slide, row.get("label",""),
+                           0.58, y, 2.65, rh, size=9, bold=True, color=MU)
+                _add_label(slide, row.get("left","—"),
+                           lx+0.05, y, lw-0.1, rh, size=9, color=T,
+                           align=PP_ALIGN.CENTER)
+                delta = (row.get("delta","") or "").lower()
+                dc = GR if delta=="positive" else RE if delta=="negative" else MU
+                _add_label(slide, row.get("right","—"),
+                           rx+0.05, y, lw-0.1, rh, size=9, color=dc,
+                           align=PP_ALIGN.CENTER)
+
+        # ── CLOSING ──────────────────────────────────────────────────────
+        elif stype == "closing":
+            _fill_ph(title_ph, s.get("title",""))
+            _fill_ph(body_ph,  s.get("subtitle","") or s.get("body",""))
+
+        # Speaker notes
+        if s.get("speaker_notes"):
+            slide.notes_slide.notes_text_frame.text = s["speaker_notes"]
+
+    buf = io.BytesIO()
+    prs.save(buf)
+    return buf.getvalue()
+
+
 
 _RL_WAIT_BASE = 20   # seconds to wait on first 429
 _RL_MAX_TRIES = 5    # max retries before giving up
@@ -1192,7 +1458,7 @@ _MAX_DOC_CHARS = 8_000
 
 
 def run_pipeline(model, uploaded_files, game_title, business_question, audience,
-                 theme_preset, web_search_en, slide_count, template_palette=None):
+                 theme_preset, web_search_en, slide_count, template_bytes=None):
     """
     Generator yielding (event_type, payload) tuples consumed by the run-button
     handler.  Produces rich narrative log messages so users understand exactly
@@ -1613,11 +1879,11 @@ Rules:
         "adding chrome footer with page numbers, writing to memory.</span>"
     ).format(
         n_slides,
-        " using your uploaded template's colour palette and fonts" if template_palette else " with SEGA dark theme",
+        " using your uploaded .pptx as the base (master backgrounds and logos preserved)" if template_bytes else " with SEGA dark theme",
     ))
 
     try:
-        pptx_bytes_out = generate_pptx(slide_data, template_palette=template_palette)
+        pptx_bytes_out = generate_pptx(slide_data, template_bytes=template_bytes)
     except Exception as e:
         yield ("error", f"PPTX generation error: {e}")
         return
@@ -1640,14 +1906,14 @@ if run_btn:
         st.error("Please enter a business question.")
     else:
         # Extract template palette if a file was uploaded
-        _template_palette = None
+        _template_bytes = None
         _template_file = st.session_state.get("template_upload")
         if _template_file is not None:
             try:
                 _template_file.seek(0)
-                _template_palette = extract_template_palette(_template_file.read())
+                _template_bytes = _template_file.read()
             except Exception as _e:
-                st.warning(f"Could not read template palette: {_e}. Using default theme.")
+                st.warning(f"Could not read template file: {_e}. Using default theme.")
 
         pipeline_steps = {
             "upload": bool(uploaded_files), "extract": False,
@@ -1664,7 +1930,7 @@ if run_btn:
                 for event in run_pipeline(
                     model, uploaded_files, game_title, business_question,
                     audience, theme_preset, web_search_enabled, slide_count,
-                    template_palette=_template_palette,
+                    template_bytes=_template_bytes,
                 ):
                     etype = event[0]
 
