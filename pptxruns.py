@@ -489,6 +489,17 @@ with st.sidebar:
         label_visibility="hidden",
     )
 
+    template_file = st.file_uploader(
+        "Upload .pptx template (optional)",
+        type=["pptx"],
+        label_visibility="hidden",
+        help="Upload a branded .pptx file to extract its colour palette and fonts. "
+             "Overrides the theme preset above.",
+        key="template_upload",
+    )
+    if template_file:
+        st.caption(f"✓ Template: {template_file.name}")
+
     st.markdown('<span class="sidebar-section">Pipeline</span>', unsafe_allow_html=True)
     pipeline_steps = st.session_state.get("pipeline_steps", {
         "upload": False, "extract": False, "research": False, "analyze": False, "generate": False,
@@ -670,11 +681,11 @@ def _chrome(slide, idx, total, C):
     _add_text(slide, "SEGA INTELLIGENCE ANALYZER",
               0.3, H_IN-0.30, 5, 0.24,
               size=7, bold=True, color=C["midgray"],
-              font_name="Calibri")
+              font_name=C["body_font"])
     _add_text(slide, f"{idx} / {total}",
               W_IN-1.4, H_IN-0.30, 1.1, 0.24,
               size=8, color=C["neutral"], align=PP_ALIGN.RIGHT,
-              font_name="Calibri")
+              font_name=C["body_font"])
     _rect(slide, W_IN-0.1, 0, 0.1, H_IN, C["primary"])
 
 def _set_bg(slide, hex_color):
@@ -684,7 +695,7 @@ def _set_bg(slide, hex_color):
     fill.fore_color.rgb = _rgb(hex_color)
 
 def _add_bullets(slide, bullets, x, y, w, h, bullet_color, text_color,
-                 size=13, font_name="Calibri"):
+                 size=13, font_name=C["body_font"]):
     if not bullets:
         return
     txb = slide.shapes.add_textbox(_in(x), _in(y), _in(w), _in(h))
@@ -720,26 +731,26 @@ def _slide_title(slide, s, idx, total, C):
               align=PP_ALIGN.CENTER)
     _rect(slide, 8.3, 1.52, 4.2, 0.05, C["accent"])
     _add_text(slide, "INTELLIGENCE ANALYZER", 8.0, 1.58, 4.8, 0.38,
-              size=9, color=C["accent"], align=PP_ALIGN.CENTER, font_name="Calibri")
+              size=9, color=C["accent"], align=PP_ALIGN.CENTER, font_name=C["body_font"])
     # Main title
     _add_text(slide, s.get("title",""), 0.6, 1.8, 6.8, 2.2,
-              size=34, bold=True, color=C["white"], font_name="Calibri")
+              size=34, bold=True, color=C["white"], font_name=C["body_font"])
     if s.get("subtitle"):
         _add_text(slide, s["subtitle"], 0.6, 4.2, 6.6, 0.6,
-                  size=16, italic=True, color=C["accent"], font_name="Calibri")
+                  size=16, italic=True, color=C["accent"], font_name=C["body_font"])
     if s.get("body"):
         _add_text(slide, s["body"], 0.6, 4.95, 6.6, 1.4,
-                  size=12, color=C["midgray"], font_name="Calibri")
+                  size=12, color=C["midgray"], font_name=C["body_font"])
     _chrome(slide, idx, total, C)
 
 def _slide_section(slide, s, idx, total, C):
     _set_bg(slide, C["bg"])
     _rect(slide, 0, 0, 0.28, H_IN, C["accent"])
     _add_text(slide, s.get("title",""), 0.55, 2.3, 12.0, 1.6,
-              size=40, bold=True, color=C["white"], font_name="Calibri")
+              size=40, bold=True, color=C["white"], font_name=C["heading_font"])
     if s.get("subtitle"):
         _add_text(slide, s["subtitle"], 0.55, 4.1, 11.0, 0.65,
-                  size=19, italic=True, color=C["accent"], font_name="Calibri")
+                  size=19, italic=True, color=C["accent"], font_name=C["body_font"])
     _chrome(slide, idx, total, C)
 
 def _slide_bullets(slide, s, idx, total, C):
@@ -747,14 +758,14 @@ def _slide_bullets(slide, s, idx, total, C):
     _rect(slide, 0, 0.1, W_IN, 0.95, C["subtle"])
     _rect(slide, 0, 0.1, 0.17, 0.95, C["accent"])
     _add_text(slide, s.get("title",""), 0.38, 0.14, W_IN-0.6, 0.84,
-              size=22, bold=True, color=C["white"], font_name="Calibri")
+              size=22, bold=True, color=C["white"], font_name=C["body_font"])
     _add_bullets(slide, s.get("bullets",[]),
                  0.45, 1.2, W_IN-1.0, H_IN-2.0,
                  bullet_color=C["accent"], text_color=C["white"],
                  size=13)
     if s.get("body"):
         _add_text(slide, s["body"], 0.45, H_IN-1.45, W_IN-1.0, 1.0,
-                  size=11, italic=True, color=C["midgray"], font_name="Calibri")
+                  size=11, italic=True, color=C["midgray"], font_name=C["body_font"])
     _chrome(slide, idx, total, C)
 
 def _slide_stats(slide, s, idx, total, C):
@@ -762,7 +773,7 @@ def _slide_stats(slide, s, idx, total, C):
     _rect(slide, 0, 0.1, W_IN, 0.95, C["subtle"])
     _rect(slide, 0, 0.1, 0.17, 0.95, C["gold"])
     _add_text(slide, s.get("title",""), 0.38, 0.14, W_IN-0.6, 0.84,
-              size=22, bold=True, color=C["white"], font_name="Calibri")
+              size=22, bold=True, color=C["white"], font_name=C["body_font"])
     stats = s.get("stats", [])[:4]
     if stats:
         box_w = (W_IN - 1.2) / len(stats)
@@ -772,19 +783,19 @@ def _slide_stats(slide, s, idx, total, C):
             _add_text(slide, stat.get("value","—"),
                       x+0.1, 1.55, box_w-0.2, 1.2,
                       size=36, bold=True, color=C["accent"],
-                      align=PP_ALIGN.CENTER, font_name="Calibri")
+                      align=PP_ALIGN.CENTER, font_name=C["body_font"])
             _add_text(slide, stat.get("label",""),
                       x+0.1, 2.85, box_w-0.2, 0.7,
                       size=12, bold=True, color=C["white"],
-                      align=PP_ALIGN.CENTER, font_name="Calibri")
+                      align=PP_ALIGN.CENTER, font_name=C["body_font"])
             if stat.get("note"):
                 _add_text(slide, stat["note"],
                           x+0.1, 3.6, box_w-0.2, 0.45,
                           size=9, color=C["midgray"],
-                          align=PP_ALIGN.CENTER, font_name="Calibri")
+                          align=PP_ALIGN.CENTER, font_name=C["body_font"])
     if s.get("body"):
         _add_text(slide, s["body"], 0.45, H_IN-1.5, W_IN-1.0, 1.0,
-                  size=11, italic=True, color=C["midgray"], font_name="Calibri")
+                  size=11, italic=True, color=C["midgray"], font_name=C["body_font"])
     _chrome(slide, idx, total, C)
 
 def _slide_comparison(slide, s, idx, total, C):
@@ -792,7 +803,7 @@ def _slide_comparison(slide, s, idx, total, C):
     _rect(slide, 0, 0.1, W_IN, 0.95, C["subtle"])
     _rect(slide, 0, 0.1, 0.17, 0.95, C["accent"])
     _add_text(slide, s.get("title",""), 0.38, 0.14, W_IN-0.6, 0.84,
-              size=20, bold=True, color=C["white"], font_name="Calibri")
+              size=20, bold=True, color=C["white"], font_name=C["body_font"])
     cmp    = s.get("comparison", {})
     rows   = cmp.get("rows", [])
     label_w = 2.8
@@ -818,15 +829,15 @@ def _slide_comparison(slide, s, idx, total, C):
         _rect(slide, left_x, y, total_w, row_h - 0.04, row_bg)
         _add_text(slide, row.get("label",""),
                   left_x+0.08, y, label_w-0.12, row_h,
-                  size=9, bold=True, color=C["midgray"], font_name="Calibri")
+                  size=9, bold=True, color=C["midgray"], font_name=C["body_font"])
         _add_text(slide, row.get("left","—"),
                   mid_x+0.05, y, col_w-0.1, row_h,
-                  size=9, color=C["light"], align=PP_ALIGN.CENTER, font_name="Calibri")
+                  size=9, color=C["light"], align=PP_ALIGN.CENTER, font_name=C["body_font"])
         delta = (row.get("delta","") or "").lower()
         dc = C["green"] if delta == "positive" else C["red"] if delta == "negative" else C["neutral"]
         _add_text(slide, row.get("right","—"),
                   right_x+0.05, y, col_w-0.1, row_h,
-                  size=9, color=dc, align=PP_ALIGN.CENTER, font_name="Calibri")
+                  size=9, color=dc, align=PP_ALIGN.CENTER, font_name=C["body_font"])
     _chrome(slide, idx, total, C)
 
 def _slide_recommendation(slide, s, idx, total, C):
@@ -834,7 +845,7 @@ def _slide_recommendation(slide, s, idx, total, C):
     _rect(slide, 0, 0.1, W_IN, 0.95, C["subtle"])
     _rect(slide, 0, 0.1, 0.17, 0.95, C["green"])
     _add_text(slide, s.get("title",""), 0.38, 0.14, W_IN-0.6, 0.84,
-              size=22, bold=True, color=C["white"], font_name="Calibri")
+              size=22, bold=True, color=C["white"], font_name=C["body_font"])
     for i, b in enumerate((s.get("bullets") or [])[:6]):
         y = 1.3 + i * 0.88
         _rect(slide, 0.45, y, W_IN-1.0, 0.76, C["subtle"])
@@ -842,9 +853,9 @@ def _slide_recommendation(slide, s, idx, total, C):
         _rect(slide, 0.55, y+0.1, 0.5, 0.5, C["green"])
         _add_text(slide, str(i+1), 0.55, y+0.1, 0.5, 0.5,
                   size=14, bold=True, color="000000",
-                  align=PP_ALIGN.CENTER, font_name="Calibri")
+                  align=PP_ALIGN.CENTER, font_name=C["body_font"])
         _add_text(slide, b, 1.18, y+0.1, W_IN-1.8, 0.56,
-                  size=12, color=C["white"], font_name="Calibri")
+                  size=12, color=C["white"], font_name=C["body_font"])
     _chrome(slide, idx, total, C)
 
 def _slide_closing(slide, s, idx, total, C):
@@ -852,20 +863,130 @@ def _slide_closing(slide, s, idx, total, C):
     _rect(slide, 0, H_IN/2 - 0.05, W_IN, 0.1,  C["accent"])
     _rect(slide, 0, 0,              0.28, H_IN,  C["accent"])
     _add_text(slide, s.get("title",""), 0.55, 1.8, 12.0, 1.6,
-              size=38, bold=True, color=C["white"], font_name="Calibri")
+              size=38, bold=True, color=C["white"], font_name=C["body_font"])
     if s.get("subtitle"):
         _add_text(slide, s["subtitle"], 0.55, 3.6, 11.0, 0.65,
-                  size=17, italic=True, color=C["accent"], font_name="Calibri")
+                  size=17, italic=True, color=C["accent"], font_name=C["body_font"])
     if s.get("body"):
         _add_text(slide, s["body"], 0.55, 4.4, 11.0, 1.5,
-                  size=12, color=C["midgray"], font_name="Calibri")
+                  size=12, color=C["midgray"], font_name=C["body_font"])
     _add_text(slide, "SEGA  •  CONFIDENTIAL",
               0.55, H_IN-0.75, 8, 0.38,
-              size=9, bold=True, color=C["midgray"], font_name="Calibri")
+              size=9, bold=True, color=C["midgray"], font_name=C["body_font"])
     _chrome(slide, idx, total, C)
 
 
-def generate_pptx(slide_data: dict) -> bytes:
+def _darken(hex6: str, amount: float = 0.15) -> str:
+    h = hex6.lstrip('#').upper().ljust(6,'0')[:6]
+    r,g,b = int(h[0:2],16), int(h[2:4],16), int(h[4:6],16)
+    return f"{max(0,int(r*(1-amount))):02X}{max(0,int(g*(1-amount))):02X}{max(0,int(b*(1-amount))):02X}"
+
+def _lighten(hex6: str, amount: float = 0.1) -> str:
+    h = hex6.lstrip('#').upper().ljust(6,'0')[:6]
+    r,g,b = int(h[0:2],16), int(h[2:4],16), int(h[4:6],16)
+    return f"{min(255,int(r+(255-r)*amount)):02X}{min(255,int(g+(255-g)*amount)):02X}{min(255,int(b+(255-b)*amount)):02X}"
+
+def extract_template_palette(pptx_bytes: bytes) -> dict:
+    """
+    Read a .pptx template and return a palette dict compatible with
+    the generate_pptx() C dict.  Pulls colours and fonts from the
+    theme XML and slide master, then derives text colours based on
+    whether the background is dark or light.
+    """
+    import zipfile as _zf, xml.etree.ElementTree as ET
+
+    ns = {'a': 'http://schemas.openxmlformats.org/drawingml/2006/main'}
+
+    def _lum(h):
+        h = (h or '').lstrip('#').upper()
+        if len(h) != 6: return 0.5
+        r,g,b = int(h[0:2],16), int(h[2:4],16), int(h[4:6],16)
+        return (0.299*r + 0.587*g + 0.114*b) / 255
+
+    def _safe(h):
+        if not h: return None
+        h = h.lstrip('#').upper()
+        return h if len(h) == 6 and all(c in '0123456789ABCDEF' for c in h) else None
+
+    zf = _zf.ZipFile(io.BytesIO(pptx_bytes))
+    colors, fonts = {}, {}
+
+    # ── Theme XML ────────────────────────────────────────────────────────
+    theme_files = [n for n in zf.namelist() if 'ppt/theme/theme' in n and n.endswith('.xml')]
+    if theme_files:
+        tree = ET.fromstring(zf.read(theme_files[0]))
+        clr  = tree.find('.//a:clrScheme', ns)
+        if clr is not None:
+            for child in clr:
+                tag = child.tag.split('}')[-1]
+                for cel in child:
+                    ctag = cel.tag.split('}')[-1]
+                    val  = cel.get('val') or cel.get('lastClr')
+                    if val:
+                        if ctag == 'srgbClr':
+                            colors[tag] = _safe(val)
+                        elif ctag == 'sysClr':
+                            colors[tag] = 'FFFFFF' if 'window' in val.lower() else '000000'
+
+        fscheme = tree.find('.//a:fontScheme', ns)
+        if fscheme is not None:
+            for child in fscheme:
+                tag   = child.tag.split('}')[-1]
+                latin = child.find('a:latin', ns)
+                if latin is not None:
+                    tf = (latin.get('typeface') or '').strip()
+                    if tf and not tf.startswith('+'):
+                        fonts['major' if 'major' in tag.lower() else 'minor'] = tf
+
+    # ── Slide master background ──────────────────────────────────────────
+    master_bg = None
+    master_files = [n for n in zf.namelist() if 'slideMasters/slideMaster' in n and n.endswith('.xml')]
+    if master_files:
+        mtree = ET.fromstring(zf.read(master_files[0]))
+        for solidFill in mtree.iter('{http://schemas.openxmlformats.org/drawingml/2006/main}solidFill'):
+            for srgb in solidFill:
+                val = _safe(srgb.get('val') or '')
+                if val:
+                    master_bg = val
+                    break
+            if master_bg:
+                break
+
+    # ── Derive palette ───────────────────────────────────────────────────
+    bg      = _safe(master_bg or colors.get('lt1') or colors.get('dk1') or '') or '040A1C'
+    is_dark = _lum(bg) < 0.4
+
+    primary = _safe(colors.get('dk2') or colors.get('accent1') or '') or '0055AA'
+    # Pick accent that differs from primary
+    accent  = _safe(colors.get('accent1') if colors.get('accent1') != primary else
+                    colors.get('accent5') or '') or '00AADD'
+
+    if is_dark:
+        white, light = 'FFFFFF', 'D0E8FF'
+        midgray      = '8899BB'
+        subtle       = _darken(bg, 0.12) if _lum(_darken(bg, 0.12)) > 0.05 else _lighten(bg, 0.12)
+        header_bg    = _darken(primary, 0.3)
+    else:
+        white, light = '111122', '334466'
+        midgray      = '556677'
+        subtle       = _lighten(bg, 0.06)
+        header_bg    = primary
+
+    heading_font = fonts.get('major', 'Calibri')
+    body_font    = fonts.get('minor', 'Calibri')
+
+    return {
+        'bg': bg, 'subtle': subtle, 'header_bg': header_bg,
+        'white': white, 'light': light, 'midgray': midgray, 'neutral': midgray,
+        'gold':  _safe(colors.get('accent2') or '') or 'F5C242',
+        'green': '22DD88', 'red': 'EE3355', 'dark': '111122',
+        'primary': primary, 'accent': accent,
+        'heading_font': heading_font, 'body_font': body_font,
+        'is_dark': is_dark,
+    }
+
+
+def generate_pptx(slide_data: dict, template_palette: dict | None = None) -> bytes:
     """Build a PPTX in memory with python-pptx. Returns raw bytes."""
     from pptx.util import Inches, Emu
 
@@ -882,23 +1003,32 @@ def generate_pptx(slide_data: dict) -> bytes:
         lum = (0.299*r + 0.587*g + 0.114*b) / 255
         return h if 0.04 < lum < 0.82 else fallback
 
+    # Base SEGA defaults
     C = {
-        # ── HARDCODED — never influenced by Claude's theme JSON ─
-        "bg":        "040A1C",   # slide background (near-black)
-        "subtle":    "1A2A4A",   # dark card/band background
-        "header_bg": "0033AA",   # chrome footer bar
-        "white":     "FFFFFF",   # primary text colour (always on dark bg)
-        "light":     "D0E4FF",   # secondary text / table body
-        "midgray":   "8899BB",   # muted text, notes, captions
-        "neutral":   "AABBCC",   # table body on dark rows
-        "gold":      "F5C242",   # highlight / stats accent
-        "green":     "22DD88",   # positive delta
-        "red":       "EE3355",   # negative delta
-        "dark":      "040A1C",   # (reserved — dark text on light shapes)
-        # ── FROM CLAUDE (validated, fallback to SEGA defaults) ──
+        "bg":        "040A1C",
+        "subtle":    "1A2A4A",
+        "header_bg": "0033AA",
+        "white":     "FFFFFF",
+        "light":     "D0E4FF",
+        "midgray":   "8899BB",
+        "neutral":   "AABBCC",
+        "gold":      "F5C242",
+        "green":     "22DD88",
+        "red":       "EE3355",
+        "dark":      "040A1C",
         "primary":   _safe_dark_hex(theme.get("primary"), "0055AA"),
         "accent":    _safe_dark_hex(theme.get("accent"),  "00AADD"),
+        "heading_font": "Calibri",
+        "body_font":    "Calibri",
     }
+
+    # If a template was uploaded, override with its extracted palette
+    if template_palette:
+        for key in ("bg","subtle","header_bg","white","light","midgray","neutral",
+                    "gold","green","red","dark","primary","accent",
+                    "heading_font","body_font"):
+            if template_palette.get(key):
+                C[key] = template_palette[key]
 
     prs = Presentation()
     # 13.3 × 7.5 inches  (LAYOUT_WIDE equivalent)
@@ -982,7 +1112,7 @@ def _api_post(headers: dict, payload: dict, timeout: int = 90,
     raise RuntimeError("Unexpected exit from retry loop.")
 
 
-def _api_stream(headers: dict, payload: dict, timeout: int = 150,
+def _api_stream(headers: dict, payload: dict, timeout: int = 240,
                 on_rate_limit=None):
     """
     POST with stream=True using httpx for a true wall-clock timeout.
@@ -1061,7 +1191,7 @@ _MAX_DOC_CHARS = 8_000
 
 
 def run_pipeline(model, uploaded_files, game_title, business_question, audience,
-                 theme_preset, web_search_en, slide_count):
+                 theme_preset, web_search_en, slide_count, template_palette=None):
     """
     Generator yielding (event_type, payload) tuples consumed by the run-button
     handler.  Produces rich narrative log messages so users understand exactly
@@ -1326,6 +1456,9 @@ Rules:
 - theme.primary and theme.accent must be dark-to-mid vivid hex colours (6 digits, no #).
   Never use white, near-white, or light pastels (no values above DDDDDD).
   Good: "0055AA", "003380", "00AADD". Bad: "FFFFFF", "F0F0F0", "C8D8EE".
+- Keep speaker_notes to 1-2 sentences maximum — they are brief presenter cues, not essays
+- Bullets: max 6 per slide, each under 15 words
+- Comparison rows: max 8 per slide
 - Return ONLY valid JSON — no markdown fences, no explanation"""
 
     raw_chunks   = []
@@ -1351,7 +1484,7 @@ Rules:
             headers=headers,
             payload={
                 "model": model,
-                "max_tokens": 4000,
+                "max_tokens": 8000,
                 "system": "You are a precise game industry analyst. Return valid JSON only.",
                 "messages": [{"role": "user", "content": analysis_prompt}],
             },
@@ -1399,16 +1532,63 @@ Rules:
         raw_json = raw_json.split("\n", 1)[1]
         raw_json = raw_json.rsplit("```", 1)[0]
 
+    # ── Truncation recovery ───────────────────────────────────────────────
+    # If the stream was cut off mid-JSON (max_tokens hit), try to salvage
+    # whatever complete slides were already written before the truncation.
+    def _recover_truncated_json(s: str) -> dict | None:
+        """
+        Try progressively shorter substrings until we get valid JSON,
+        or attempt to close open brackets to recover partial output.
+        Returns parsed dict or None.
+        """
+        import re
+        # First: try as-is
+        try: return json.loads(s)
+        except json.JSONDecodeError: pass
+
+        # Second: strip everything after the last complete slide object
+        # by finding the last `}` before the slides array closes
+        # Look for the last complete slide: ends with either },\n  { or }]\n}
+        last_close = s.rfind('}\n    ]')  # end of slides array
+        if last_close == -1:
+            last_close = s.rfind('}, {')  # between slides
+        if last_close == -1:
+            last_close = s.rfind('"}')    # end of any string field
+
+        if last_close > 100:
+            # Try to close the JSON properly
+            truncated = s[:last_close + 1]
+            # Count unclosed brackets
+            opens  = truncated.count('{') - truncated.count('}')
+            opens2 = truncated.count('[') - truncated.count(']')
+            candidate = truncated + (']' * opens2) + ('}' * opens)
+            try: return json.loads(candidate)
+            except json.JSONDecodeError: pass
+
+        return None
+
     try:
         slide_data = json.loads(raw_json)
     except json.JSONDecodeError as e:
-        yield ("error",
-            f"JSON parse error: {e}<br>"
-            f"The model returned malformed JSON. Try running again — "
-            f"this is usually caused by the output being truncated mid-stream.<br><br>"
-            f"First 400 chars received:<br><code>{raw_json[:400]}</code>"
-        )
-        return
+        # Try recovery before giving up
+        recovered = _recover_truncated_json(raw_json)
+        if recovered and recovered.get("slides"):
+            n_recovered = len(recovered["slides"])
+            yield ("log", (
+                f"⚠️ <b>Output was truncated</b> — recovered {n_recovered} of {slide_count} slides.<br>"
+                f"<span class='log-detail'>The model hit the token limit mid-stream. "
+                f"Recovered {n_recovered} complete slides. Consider reducing slide count or switching "
+                f"to a higher-capacity model.</span>"
+            ))
+            slide_data = recovered
+        else:
+            yield ("error",
+                f"JSON parse error: {e}<br>"
+                f"The model returned malformed JSON and recovery failed. Try running again, "
+                f"or reduce the slide count in the sidebar.<br><br>"
+                f"First 400 chars received:<br><code>{raw_json[:400]}</code>"
+            )
+            return
 
     n_slides = len(slide_data.get("slides", []))
     yield ("step_done", "analyze")
@@ -1427,14 +1607,16 @@ Rules:
     # ── STAGE 4: PPTX rendering ───────────────────────────────────────────────
     yield ("spinner", (
         "🖥️ <b>Stage 4 of 4 — Building the PowerPoint file</b><br>"
-        "<span class='log-detail'>Rendering {} slides with python-pptx: setting the dark SEGA "
-        "background, drawing coloured shape layers, placing all text boxes with proper fonts "
-        "and sizes, adding the chrome footer with page numbers, and writing the file to memory. "
-        "No external tools required — pure Python.</span>"
-    ).format(n_slides))
+        "<span class='log-detail'>Rendering {} slides with python-pptx{}. "
+        "Setting backgrounds, drawing shape layers, placing text with correct fonts, "
+        "adding chrome footer with page numbers, writing to memory.</span>"
+    ).format(
+        n_slides,
+        " using your uploaded template's colour palette and fonts" if template_palette else " with SEGA dark theme",
+    ))
 
     try:
-        pptx_bytes_out = generate_pptx(slide_data)
+        pptx_bytes_out = generate_pptx(slide_data, template_palette=template_palette)
     except Exception as e:
         yield ("error", f"PPTX generation error: {e}")
         return
@@ -1456,6 +1638,16 @@ if run_btn:
     if not business_question.strip():
         st.error("Please enter a business question.")
     else:
+        # Extract template palette if a file was uploaded
+        _template_palette = None
+        _template_file = st.session_state.get("template_upload")
+        if _template_file is not None:
+            try:
+                _template_file.seek(0)
+                _template_palette = extract_template_palette(_template_file.read())
+            except Exception as _e:
+                st.warning(f"Could not read template palette: {_e}. Using default theme.")
+
         pipeline_steps = {
             "upload": bool(uploaded_files), "extract": False,
             "research": False, "analyze": False, "generate": False,
@@ -1471,6 +1663,7 @@ if run_btn:
                 for event in run_pipeline(
                     model, uploaded_files, game_title, business_question,
                     audience, theme_preset, web_search_enabled, slide_count,
+                    template_palette=_template_palette,
                 ):
                     etype = event[0]
 
