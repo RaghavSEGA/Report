@@ -129,7 +129,7 @@ def _lock_txb(txb):
 
 
 st.set_page_config(
-    page_title="SEGA Intelligence Analyzer",
+    page_title="SEGA PowerPoint Creator",
     page_icon="🎮",
     layout="wide",
 )
@@ -160,13 +160,13 @@ def _send_otp(email: str, code: str) -> bool:
             Destination={"ToAddresses": [email]},
             Message={
                 "Subject": {
-                    "Data": "SEGA Intelligence Analyzer — Your verification code",
+                    "Data": "SEGA PowerPoint Creator — Your verification code",
                     "Charset": "UTF-8",
                 },
                 "Body": {
                     "Text": {
                         "Data": (
-                            f"Your SEGA Intelligence Analyzer verification code is: {code}\n\n"
+                            f"Your SEGA PowerPoint Creator verification code is: {code}\n\n"
                             "This code expires in 10 minutes.\n"
                             "If you didn't request this, you can safely ignore this email."
                         ),
@@ -176,7 +176,7 @@ def _send_otp(email: str, code: str) -> bool:
                         "Data": f"""
                         <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:32px 24px;">
                           <div style="font-size:22px;font-weight:900;letter-spacing:0.1em;color:#1A6BFF;margin-bottom:4px;">SEGA</div>
-                          <div style="font-size:14px;color:#444;margin-bottom:28px;">Intelligence Analyzer</div>
+                          <div style="font-size:14px;color:#444;margin-bottom:28px;">PowerPoint Creator</div>
                           <div style="font-size:14px;color:#222;margin-bottom:16px;">Your verification code is:</div>
                           <div style="font-size:42px;font-weight:900;letter-spacing:0.18em;color:#1a1a2e;
                                       background:#f0f4ff;border-radius:8px;padding:18px 24px;
@@ -280,7 +280,7 @@ if not st.session_state.auth_verified:
         st.markdown("""
         <div class="auth-wrap">
           <div class="auth-logo">SEGA</div>
-          <div class="auth-title">Intelligence Analyzer</div>
+          <div class="auth-title">PowerPoint Creator</div>
           <div class="auth-sub">Sign in with your SEGA America email</div>
         </div>
         """, unsafe_allow_html=True)
@@ -469,8 +469,8 @@ h1 { font-size: 2rem !important; font-weight: 700 !important; color: #f1f5f9 !im
 # SIDEBAR — settings (post-auth)
 # ─────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("<div style='font-size:1rem;font-weight:700;color:#f1f5f9;margin-bottom:.25rem;'>Intelligence Analyzer</div>", unsafe_allow_html=True)
-    st.markdown("<div style='font-size:.65rem;color:#475569;text-transform:uppercase;letter-spacing:.1em;margin-bottom:1rem;'>Game Competitive Analysis</div>", unsafe_allow_html=True)
+    st.markdown("<div style='font-size:1rem;font-weight:700;color:#f1f5f9;margin-bottom:.25rem;'>PowerPoint Creator</div>", unsafe_allow_html=True)
+    st.markdown("<div style='font-size:.65rem;color:#475569;text-transform:uppercase;letter-spacing:.1em;margin-bottom:1rem;'>Game PowerPoint Generator</div>", unsafe_allow_html=True)
 
     st.markdown('<span class="sidebar-section">Model</span>', unsafe_allow_html=True)
     model = st.selectbox(
@@ -517,7 +517,7 @@ with st.sidebar:
 # PAGE HEADER
 # ─────────────────────────────────────────────────────────────
 st.markdown(
-    "<h1>Game Intelligence Analyzer</h1>"
+    "<h1>Game PowerPoint Creator</h1>"
     "<div style='font-size:.78rem;color:#475569;margin-bottom:1.5rem;'>"
     "Upload internal documents &nbsp;·&nbsp; Benchmark against a released title &nbsp;·&nbsp; Generate a SEGA-branded PPTX"
     "</div>",
@@ -678,7 +678,7 @@ def _chrome(slide, idx, total, C):
     """Top stripe, bottom bar, page number, right edge accent."""
     _rect(slide, 0, 0,       W_IN, 0.1,  C["accent"])
     _rect(slide, 0, H_IN-0.36, W_IN, 0.36, C["header_bg"])
-    _add_text(slide, "SEGA INTELLIGENCE ANALYZER",
+    _add_text(slide, "SEGA POWERPOINT CREATOR",
               0.3, H_IN-0.30, 5, 0.24,
               size=7, bold=True, color=C["midgray"],
               font_name=C["body_font"])
@@ -731,7 +731,7 @@ def _slide_title(slide, s, idx, total, C):
               size=52, bold=True, color=C["white"], font_name="Arial Black",
               align=PP_ALIGN.CENTER)
     _rect(slide, 8.3, 1.52, 4.2, 0.05, C["accent"])
-    _add_text(slide, "INTELLIGENCE ANALYZER", 8.0, 1.58, 4.8, 0.38,
+    _add_text(slide, "POWERPOINT CREATOR", 8.0, 1.58, 4.8, 0.38,
               size=9, color=C["accent"], align=PP_ALIGN.CENTER, font_name=C["body_font"])
     # Main title
     _add_text(slide, s.get("title",""), 0.6, 1.8, 6.8, 2.2,
