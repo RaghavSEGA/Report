@@ -1,5 +1,5 @@
 import streamlit as st
-import anthropic
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
 import tempfile
@@ -779,49 +779,78 @@ def generate_pptx(slide_data: dict) -> bytes:
     return buf.read()
 
 
-def _api_post(headers: dict, payload: dict, timeout: int = 120, max_retries: int = 4) -> dict:
-    """
-    POST to the Anthropic messages endpoint with exponential-backoff retry on 429.
-    Reads the retry-after header when present; otherwise backs off at 10s, 20s, 40s, 80s.
-    Raises RuntimeError on non-retryable errors or exhausted retries.
-    """
-    base_wait = 10
-    for attempt in range(max_retries + 1):
+
+# ─────────────────────────────────────────────────────────────
+# API HELPERS
+# ─────────────────────────────────────────────────────────────
+
+def _api_post(headers: dict, payload: dict, timeout: int = 90) -> dict:
+    """Single POST with rate-limit retry (max 3 attempts, exponential back-off)."""
+    for attempt in range(3):
         resp = requests.post(
             "https://api.anthropic.com/v1/messages",
-            headers=headers,
-            json=payload,
-            timeout=timeout,
+            headers=headers, json=payload, timeout=timeout,
         )
         if resp.status_code == 429:
-            if attempt == max_retries:
-                raise RuntimeError(
-                    f"Rate limited after {max_retries} retries. "
-                    "Try again in a minute, or switch to a lower-tier model (Haiku) in the sidebar."
-                )
-            # Honour the retry-after header if the API sends one
-            retry_after = resp.headers.get("retry-after") or resp.headers.get("x-ratelimit-reset-requests")
-            try:
-                wait = max(float(retry_after), 1)
-            except (TypeError, ValueError):
-                wait = base_wait * (2 ** attempt)
+            wait = float(resp.headers.get("retry-after") or (10 * 2 ** attempt))
             time.sleep(wait)
             continue
-
         resp.raise_for_status()
         return resp.json()
+    raise RuntimeError("Rate limited after 3 retries. Try again shortly.")
 
-    raise RuntimeError("Unexpected exit from retry loop")
 
+def _api_stream(headers: dict, payload: dict, timeout: int = 120):
+    """
+    POST with stream=True. Yields text chunks as they arrive (SSE parsing).
+    Caller collects chunks; raises RuntimeError on HTTP errors.
+    """
+    stream_headers = {**headers, "Accept": "text/event-stream"}
+    payload = {**payload, "stream": True}
+    with requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers=stream_headers, json=payload,
+        timeout=timeout, stream=True,
+    ) as resp:
+        if resp.status_code != 200:
+            raise RuntimeError(f"API error {resp.status_code}: {resp.text[:300]}")
+        for raw_line in resp.iter_lines():
+            if not raw_line:
+                continue
+            line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
+            if not line.startswith("data: "):
+                continue
+            payload_str = line[6:].strip()
+            if payload_str == "[DONE]":
+                break
+            try:
+                evt = json.loads(payload_str)
+            except json.JSONDecodeError:
+                continue
+            if evt.get("type") == "content_block_delta":
+                delta = evt.get("delta", {})
+                if delta.get("type") == "text_delta":
+                    yield delta.get("text", "")
+
+
+# ─────────────────────────────────────────────────────────────
+# PIPELINE  (parallel extraction + research, streaming analysis)
+# ─────────────────────────────────────────────────────────────
 
 def run_pipeline(model, uploaded_files, game_title, business_question, audience,
                  theme_preset, web_search_en, slide_count):
-    """Generator — yields (type, ...) tuples for incremental UI updates."""
+    """
+    Generator yielding (event_type, payload) tuples.
 
-    # API key from st.secrets — same pattern as BIreport.py
+    Speed optimisations vs. the previous version:
+      1. Document extraction and web research run in PARALLEL via ThreadPoolExecutor.
+      2. The analysis call uses SSE streaming so text appears token-by-token.
+      3. max_tokens reduced to 4 000 (enough for 10-slide JSON; was 8 000).
+      4. Web-search summary capped at 1 500 tokens (was 3 000) — we only need facts.
+    """
     api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
     if not api_key:
-        yield ("error", "ANTHROPIC_API_KEY not found in st.secrets. Add it to .streamlit/secrets.toml.")
+        yield ("error", "ANTHROPIC_API_KEY not found in st.secrets.")
         return
 
     headers = {
@@ -830,54 +859,67 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
         "anthropic-version": "2023-06-01",
     }
 
-    # Step 1 — extract
-    yield ("log", "📄 Extracting document content…")
-    doc_texts = []
-    for f in uploaded_files:
-        f.seek(0)
-        doc_texts.append(f"=== {f.name} ===\n{extract_text_from_file(f)}")
-    combined_docs = "\n\n".join(doc_texts) if doc_texts else "[No documents uploaded]"
-    yield ("step_done", "extract")
-    yield ("log", f"✅ Extracted {len(uploaded_files)} document(s)")
+    # ── Step 1 + 2 in parallel ────────────────────────────────
+    yield ("log", "📄 Extracting documents & searching web in parallel…")
 
-    # Step 2 — web research
-    yield ("log", f"🔍 Searching web for: {game_title}…")
-    research_text = ""
-    if web_search_en and game_title:
+    combined_docs   = "[No documents uploaded]"
+    research_text   = "[No reference game specified]"
+
+    def _extract_docs():
+        texts = []
+        for f in uploaded_files:
+            f.seek(0)
+            texts.append(f"=== {f.name} ===\n{extract_text_from_file(f)}")
+        return "\n\n".join(texts) if texts else "[No documents uploaded]"
+
+    def _web_research():
+        if not (web_search_en and game_title):
+            if game_title:
+                return f"[Web search disabled — using model knowledge for '{game_title}']"
+            return "[No reference game specified]"
         try:
             data = _api_post(
                 headers=headers,
                 payload={
                     "model": model,
-                    "max_tokens": 3000,
+                    "max_tokens": 1500,       # ← was 3 000; halved
                     "tools": [{"type": "web_search_20250305", "name": "web_search"}],
                     "messages": [{"role": "user", "content": (
-                        f"Research the game '{game_title}' for a business analysis. Cover: "
-                        "genre, platform, developer, publisher, release date, Metacritic/OpenCritic scores, "
-                        "user sentiment, sales figures, key gameplay mechanics, scope, player reception "
-                        "(what worked/didn't), post-launch updates/DLC, and market context. "
-                        "Provide a thorough structured summary."
+                        f"Research '{game_title}' for a game business analysis. "
+                        "Give a concise structured summary covering: genre, platforms, "
+                        "developer, release date, Metacritic score, sales estimates, "
+                        "key mechanics, player reception highlights, and any DLC/post-launch. "
+                        "Be brief and factual — 400 words max."
                     )}],
                 },
                 timeout=60,
             )
             blocks = data.get("content", [])
-            research_text = "\n".join(b.get("text", "") for b in blocks if b.get("type") == "text")
-        except RuntimeError as e:
-            yield ("error", str(e))
-            return
+            return "\n".join(b.get("text","") for b in blocks if b.get("type")=="text")
         except Exception as e:
-            research_text = f"[Web search error: {e}]"
-    elif game_title:
-        research_text = f"[Web search disabled — using model knowledge for '{game_title}']"
-    else:
-        research_text = "[No reference game specified]"
+            return f"[Web search error: {e}]"
 
-    yield ("step_done", "research")
-    yield ("log", "✅ Web research complete")
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        fut_docs     = pool.submit(_extract_docs)
+        fut_research = pool.submit(_web_research)
 
-    # Step 3 — analysis
-    yield ("log", "🤖 Running Claude analysis…")
+        # Surface completions as they finish
+        for fut in as_completed([fut_docs, fut_research]):
+            if fut is fut_docs:
+                combined_docs = fut.result()
+                yield ("log", f"✅ Documents extracted ({len(combined_docs):,} chars)")
+                yield ("step_done", "extract")
+            else:
+                res = fut.result()
+                if res.startswith("[Web search error"):
+                    yield ("log", f"⚠️ {res}")
+                else:
+                    research_text = res
+                    yield ("log", "✅ Web research complete")
+                yield ("step_done", "research")
+
+    # ── Step 3: streaming analysis ────────────────────────────
+    yield ("log", "🤖 Analysing with Claude (streaming)…")
 
     theme_desc = {
         "SEGA Blue — Corporate Executive": "Professional SEGA corporate blue (#0055AA) — boardroom-ready.",
@@ -886,7 +928,7 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
     }.get(theme_preset, "SEGA corporate blue")
 
     analysis_prompt = f"""You are a senior game industry analyst at SEGA.
-Analyse the following and produce structured content for a {slide_count}-slide executive presentation.
+Analyse the following and produce a JSON object for a {slide_count}-slide executive presentation.
 
 ## INTERNAL GAME DOCUMENTS:
 {combined_docs}
@@ -897,15 +939,12 @@ Analyse the following and produce structured content for a {slide_count}-slide e
 ## BUSINESS QUESTION:
 {business_question}
 
-## AUDIENCE:
-{audience}
+## AUDIENCE: {audience}
 
-Produce a JSON object for {slide_count} slides in SEGA style ({theme_desc}).
-Schema:
-
+Output a single JSON object. Schema:
 {{
   "title":"...", "subtitle":"...",
-  "theme":{{"primary":"hex","secondary":"hex","accent":"hex","background":"hex","text_light":"hex","text_dark":"hex"}},
+  "theme":{{"primary":"hex","accent":"hex","background":"hex","text_light":"hex","text_dark":"hex"}},
   "slides":[
     {{
       "type":"title|section|comparison|bullets|stats|recommendation|closing",
@@ -921,33 +960,42 @@ Schema:
   ]
 }}
 
-Make content specific, data-driven, and genuinely useful for {audience}.
-Use REAL data from the documents and research.
-Return ONLY the JSON object — no markdown, no explanation."""
+Rules:
+- Use REAL data from the documents and research
+- Be specific and data-driven for {audience}
+- Return ONLY valid JSON — no markdown fences, no explanation"""
+
+    raw_chunks = []
+    token_count = [0]
 
     try:
-        data = _api_post(
+        for chunk in _api_stream(
             headers=headers,
             payload={
                 "model": model,
-                "max_tokens": 8000,
-                "system": "You are a precise game industry analyst. Always return valid JSON only.",
+                "max_tokens": 4000,     # ← was 8 000; halved
+                "system": "You are a precise game industry analyst. Return valid JSON only.",
                 "messages": [{"role": "user", "content": analysis_prompt}],
             },
-            timeout=120,
-        )
-        raw_json = data["content"][0]["text"].strip()
+        ):
+            raw_chunks.append(chunk)
+            token_count[0] += 1
+            # Surface a progress tick every 40 tokens so the UI feels live
+            if token_count[0] % 40 == 0:
+                yield ("log", f"🤖 Generating slide content… ({token_count[0]} tokens)")
+
     except RuntimeError as e:
         yield ("error", str(e))
         return
     except Exception as e:
-        yield ("error", f"API error: {e}")
+        yield ("error", f"API streaming error: {e}")
         return
 
+    raw_json = "".join(raw_chunks).strip()
+    # Strip accidental markdown fences
     if raw_json.startswith("```"):
         raw_json = raw_json.split("\n", 1)[1]
-        if raw_json.endswith("```"):
-            raw_json = raw_json.rsplit("```", 1)[0]
+        raw_json = raw_json.rsplit("```", 1)[0]
 
     try:
         slide_data = json.loads(raw_json)
@@ -955,12 +1003,13 @@ Return ONLY the JSON object — no markdown, no explanation."""
         yield ("error", f"JSON parse error: {e}\n\nFirst 400 chars:\n{raw_json[:400]}")
         return
 
+    n_slides = len(slide_data.get("slides", []))
     yield ("step_done", "analyze")
-    yield ("log", f"✅ Analysis complete — {len(slide_data.get('slides', []))} slides planned")
+    yield ("log", f"✅ Analysis complete — {n_slides} slides, {token_count[0]} tokens")
     yield ("slide_data", slide_data)
 
-    # Step 4 — generate PPTX
-    yield ("log", "🖥️ Generating PPTX…")
+    # ── Step 4: PPTX generation ───────────────────────────────
+    yield ("log", "🖥️ Building PPTX…")
     try:
         pptx_bytes_out = generate_pptx(slide_data)
     except Exception as e:
@@ -968,7 +1017,7 @@ Return ONLY the JSON object — no markdown, no explanation."""
         return
 
     yield ("step_done", "generate")
-    yield ("log", "✅ PPTX ready!")
+    yield ("log", f"✅ Done — {len(pptx_bytes_out):,} bytes")
     yield ("pptx_bytes_out", pptx_bytes_out)
 
 
