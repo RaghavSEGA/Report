@@ -1172,36 +1172,75 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
         return combined or "[No research results returned]"
 
 
+    # ── Poll futures with heartbeat so Streamlit never blocks ────────────────
+    # as_completed() would block the generator for up to 120 s with no yields,
+    # freezing the UI.  Instead we poll every 3 s and emit a spinner tick so
+    # Streamlit keeps receiving events and the log stays alive.
     with ThreadPoolExecutor(max_workers=2) as pool:
         fut_docs     = pool.submit(_extract_docs)
         fut_research = pool.submit(_web_research)
 
-        for fut in as_completed([fut_docs, fut_research]):
-            if fut is fut_docs:
-                combined_docs = fut.result()
-                n_files = len(uploaded_files)
-                n_chars = len(combined_docs)
-                yield ("log", (
-                    "✅ <b>Documents extracted</b> — {} file{}, {:,} characters of content<br>"
-                    "<span class='log-detail'>Text successfully pulled from your uploads. "
-                    "This content will be the primary source of facts about your internal game.</span>"
-                ).format(n_files, "s" if n_files != 1 else "", n_chars))
-                yield ("step_done", "extract")
-            else:
-                res = fut.result()
-                if "[Web search error" in res or "[Web search disabled" in res or "[No reference" in res:
-                    research_text = res
-                    yield ("log", f"⚠️ <b>Web research note:</b> {res}")
-                else:
-                    research_text = res
-                    word_count = len(res.split())
+        pending      = {fut_docs: "docs", fut_research: "research"}
+        docs_done    = False
+        research_done = False
+        elapsed       = 0
+        TICK          = 3   # seconds between heartbeat yields
+
+        while pending:
+            # Check each pending future without blocking
+            resolved = []
+            for fut, label in list(pending.items()):
+                if fut.done():
+                    resolved.append((fut, label))
+
+            for fut, label in resolved:
+                del pending[fut]
+                if label == "docs":
+                    docs_done     = True
+                    combined_docs = fut.result()
+                    n_files = len(uploaded_files)
+                    n_chars = len(combined_docs)
                     yield ("log", (
-                        "✅ <b>Web research complete</b> — ~{} words of competitive intelligence on <i>{}</i><br>"
-                        "<span class='log-detail'>Claude searched the web and compiled key facts: "
-                        "review scores, sales data, gameplay mechanics, and player reception. "
-                        "This will be used as the benchmark in the comparison slides.</span>"
-                    ).format(word_count, game_title))
-                yield ("step_done", "research")
+                        "✅ <b>Documents extracted</b> — {} file{}, {:,} characters of content<br>"
+                        "<span class='log-detail'>Text successfully pulled from your uploads. "
+                        "This content will be the primary source of facts about your internal game.</span>"
+                    ).format(n_files, "s" if n_files != 1 else "", n_chars))
+                    yield ("step_done", "extract")
+                else:
+                    research_done = True
+                    res = fut.result()
+                    if "[Web search error" in res or "[Web search disabled" in res or "[No reference" in res:
+                        research_text = res
+                        yield ("log", f"⚠️ <b>Web research note:</b> {res}")
+                    else:
+                        research_text = res
+                        word_count    = len(res.split())
+                        yield ("log", (
+                            "✅ <b>Web research complete</b> — ~{} words of competitive intelligence on <i>{}</i><br>"
+                            "<span class='log-detail'>Claude searched the web and compiled key facts: "
+                            "review scores, sales data, gameplay mechanics, and player reception. "
+                            "This will be used as the benchmark in the comparison slides.</span>"
+                        ).format(word_count, game_title))
+                    yield ("step_done", "research")
+
+            if pending:
+                # Sleep briefly then emit a heartbeat so the UI stays live
+                time.sleep(TICK)
+                elapsed += TICK
+                still_doing = []
+                if not docs_done:
+                    still_doing.append("extracting documents")
+                if not research_done:
+                    still_doing.append(
+                        f"searching web for <i>{game_title}</i> ({elapsed}s elapsed)"
+                    )
+                if still_doing:
+                    yield ("spinner", (
+                        "⏳ <b>Still working…</b> " + " &amp; ".join(still_doing) + "<br>"
+                        "<span class='log-detail'>Web searches can take 60–120 s for well-covered titles. "
+                        "The pipeline has not stalled — results will appear when ready.</span>"
+                    ))
+
 
     # ── STAGE 3: streaming analysis ───────────────────────────────────────────
 
