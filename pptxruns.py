@@ -1104,51 +1104,58 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
         return full
 
     def _web_research():
+        """
+        Fetch competitive intel via Anthropic web-search tool.
+        Uses httpx with a true wall-clock timeout so the call CANNOT
+        run longer than HARD_TIMEOUT seconds regardless of socket behaviour.
+        """
         if not (web_search_en and game_title):
             if game_title:
                 return f"[Web search disabled — using model knowledge for '{game_title}']"
             return "[No reference game specified]"
 
-        # Single focused prompt, one API call, hard 90 s wall-clock limit.
-        # If it times out we fall back to model training knowledge gracefully.
+        import httpx
+
+        HARD_TIMEOUT = 80  # httpx enforces this as a true wall-clock deadline
+
         prompt = (
             f"Research the video game \"{game_title}\" for a competitive business analysis. "
-            "Structured summary covering: developer/publisher/release date/platforms, "
-            "Metacritic and OpenCritic scores, 3 key praise themes, 3 key criticism themes, "
-            "estimated sales figures, 4-5 core gameplay mechanics, game length, "
-            "any notable DLC or post-launch content, and main competitor titles. "
-            "Use real numbers. Keep it under 500 words."
+            "Give a structured summary: developer/publisher/release date/platforms, "
+            "Metacritic + OpenCritic scores (critic & user), 3 specific praise themes, "
+            "3 specific criticism themes, estimated sales figures, "
+            "4-5 core gameplay mechanics, approximate game length, "
+            "notable DLC or post-launch content, and main competitor titles. "
+            "Real numbers only. Under 400 words."
         )
 
-        HARD_TIMEOUT = 90  # better a fast fallback than a 3-min hang
+        payload = {
+            "model": model,
+            "max_tokens": 1200,
+            "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+            "messages": [{"role": "user", "content": prompt}],
+        }
 
         try:
-            data = _api_post(
+            resp = httpx.post(
+                "https://api.anthropic.com/v1/messages",
                 headers=headers,
-                payload={
-                    "model": model,
-                    "max_tokens": 1500,
-                    "tools": [{"type": "web_search_20250305", "name": "web_search"}],
-                    "messages": [{"role": "user", "content": prompt}],
-                },
-                timeout=HARD_TIMEOUT,
+                json=payload,
+                timeout=httpx.Timeout(HARD_TIMEOUT, connect=10),
             )
-            blocks = data.get("content", [])
+            resp.raise_for_status()
+            blocks = resp.json().get("content", [])
             text = "\n".join(b.get("text", "") for b in blocks if b.get("type") == "text")
-            return text if text.strip() else (
+            return text.strip() or (
                 f"[No web results — analysis will use model knowledge for '{game_title}']"
             )
+        except httpx.TimeoutException:
+            return (
+                f"[Web search timed out after {HARD_TIMEOUT}s. "
+                f"The analysis will use Claude's training knowledge for '{game_title}' instead. "
+                "This is normal for popular titles with many search results.]"
+            )
         except Exception as e:
-            err = str(e).lower()
-            if any(t in err for t in ("timed out", "timeout", "read timeout", "connection")):
-                return (
-                    f"[Web search timed out after {HARD_TIMEOUT}s. "
-                    f"The analysis will use Claude's training knowledge for '{game_title}' instead. "
-                    "This is normal for popular titles with many search results.]"
-                )
             return f"[Web search error: {e}]"
-
-
 
     # ── Poll futures with heartbeat so Streamlit never blocks ────────────────
     # as_completed() would block the generator for up to 120 s with no yields,
