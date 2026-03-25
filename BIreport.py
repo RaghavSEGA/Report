@@ -15,10 +15,10 @@ st.set_page_config(layout="wide", page_title="Sales Dashboard", page_icon="=")
 # OTP AUTHENTICATION
 # ─────────────────────────────────────────────────────────────
 
-ALLOWED_DOMAIN     = st.secrets.get("ALLOWED_DOMAIN", "@yourcompany.com")
+ALLOWED_DOMAIN     = "@segaamerica.com"
 OTP_EXPIRY_SECS    = 600   # 10 minutes
 COOKIE_EXPIRY_DAYS = 7
-COOKIE_NAME        = "sales_dashboard_auth"
+COOKIE_NAME        = "sega_sales_auth"
 
 def _send_otp(email: str, code: str) -> bool:
     """Send OTP via AWS SES. Returns True on success."""
@@ -32,25 +32,25 @@ def _send_otp(email: str, code: str) -> bool:
             aws_secret_access_key=st.secrets.get("AWS_SECRET_ACCESS_KEY", ""),
         )
         ses.send_email(
-            Source=st.secrets.get("EMAIL_FROM", f"noreply{ALLOWED_DOMAIN}"),
+            Source=st.secrets.get("EMAIL_FROM", "noreply@segaamerica.com"),
             Destination={"ToAddresses": [email]},
             Message={
-                "Subject": {"Data": "Sales Dashboard — Your verification code", "Charset": "UTF-8"},
+                "Subject": {"Data": "SEGA Sales Dashboard — Your verification code", "Charset": "UTF-8"},
                 "Body": {
                     "Text": {
-                        "Data": f"Your Sales Dashboard verification code is: {code}\n\nThis code expires in 10 minutes.\nIf you didn't request this, you can safely ignore this email.",
+                        "Data": f"Your SEGA Sales Dashboard verification code is: {code}\n\nThis code expires in 10 minutes.\nIf you didn't request this, you can safely ignore this email.",
                         "Charset": "UTF-8",
                     },
                     "Html": {
                         "Data": f"""
                         <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:32px 24px;">
-                          <div style="font-size:18px;font-weight:700;color:#1e293b;margin-bottom:4px;">Sales Dashboard</div>
-                          <div style="font-size:13px;color:#64748b;margin-bottom:28px;">Verification Code</div>
-                          <div style="font-size:13px;color:#334155;margin-bottom:16px;">Your verification code is:</div>
-                          <div style="font-size:42px;font-weight:900;letter-spacing:0.18em;color:#111827;
-                                      background:#f1f5f9;border-radius:8px;padding:18px 24px;
+                          <div style="font-size:22px;font-weight:900;letter-spacing:0.1em;color:#1A6BFF;margin-bottom:4px;">SEGA</div>
+                          <div style="font-size:14px;color:#444;margin-bottom:28px;">Sales Dashboard</div>
+                          <div style="font-size:14px;color:#222;margin-bottom:16px;">Your verification code is:</div>
+                          <div style="font-size:42px;font-weight:900;letter-spacing:0.18em;color:#1a1a2e;
+                                      background:#f0f4ff;border-radius:8px;padding:18px 24px;
                                       display:inline-block;margin-bottom:24px;">{code}</div>
-                          <div style="font-size:12px;color:#94a3b8;">
+                          <div style="font-size:12px;color:#888;">
                             This code expires in 10 minutes.<br>
                             If you didn't request this, you can safely ignore this email.
                           </div>
@@ -127,30 +127,38 @@ if not st.session_state.auth_verified:
     <style>
     .auth-wrap {
         max-width: 420px; margin: 5rem auto; padding: 2.5rem 2.5rem 2rem;
-        background: #1e293b; border: 1px solid #334155;
-        border-top: 3px solid #3b82f6; border-radius: 0 0 10px 10px;
+        background: var(--surface); border: 1px solid var(--border);
+        border-top: 3px solid var(--blue); border-radius: 0 0 10px 10px;
     }
-    .auth-title { font-size: 1.5rem; font-weight: 700; color: #f1f5f9 !important;
-                  letter-spacing: -0.02em; margin-bottom: 0.2rem; }
-    .auth-sub { font-size: 0.8rem; color: #64748b !important; margin-bottom: 1.5rem; }
-    .auth-note { font-size: 0.72rem; color: #475569 !important; margin-top: 1rem;
-                 text-align: center; line-height: 1.5; }
+    .auth-logo { font-family:'Inter Tight',sans-serif; font-size:1.6rem; font-weight:900;
+                 letter-spacing:0.12em; color:var(--blue) !important; margin-bottom:0.2rem; }
+    .auth-title { font-family:'Inter Tight',sans-serif; font-size:1rem; font-weight:700;
+                  color:var(--text) !important; margin-bottom:0.25rem; }
+    .auth-sub { font-size:0.8rem; color:var(--muted) !important; margin-bottom:1.5rem; }
+    .auth-note { font-size:0.72rem; color:var(--muted) !important; margin-top:1rem;
+                 text-align:center; line-height:1.5; }
+    :root {
+        --bg: #0a0c1a; --surface: #0f1120; --border: #232640;
+        --blue: #4080ff; --text: #eef0fa; --muted: #5a5f82;
+    }
+    html, body, .stApp { background: var(--bg) !important; }
     </style>
     """, unsafe_allow_html=True)
 
     _lc, _mc, _rc = st.columns([1, 2, 1])
     with _mc:
-        st.markdown(f"""
+        st.markdown("""
         <div class="auth-wrap">
+          <div class="auth-logo">SEGA</div>
           <div class="auth-title">Sales Dashboard</div>
-          <div class="auth-sub">Sign in with your company email to continue</div>
+          <div class="auth-sub">Sign in with your SEGA America email</div>
         </div>
         """, unsafe_allow_html=True)
 
         if not st.session_state.otp_sent:
             _email_input = st.text_input(
                 "Email address",
-                placeholder=f"you{ALLOWED_DOMAIN}",
+                placeholder="you@segaamerica.com",
                 label_visibility="hidden",
                 key="auth_email_input",
             )
@@ -210,8 +218,8 @@ if not st.session_state.auth_verified:
                 st.rerun()
 
         st.markdown(
-            f'<div class="auth-note">Restricted to {ALLOWED_DOMAIN} addresses only.<br>'
-            f'Codes expire after 10 minutes.</div>',
+            '<div class="auth-note">Restricted to @segaamerica.com addresses only.<br>'
+            'Codes expire after 10 minutes.</div>',
             unsafe_allow_html=True,
         )
 
@@ -220,8 +228,10 @@ if not st.session_state.auth_verified:
 # ── Signed-in user + sign out (sidebar) ──────────────────────
 with st.sidebar:
     st.markdown(
-        f"<div style='font-size:.7rem;color:#64748b;margin-bottom:.25rem;'>Signed in as</div>"
-        f"<div style='font-size:.82rem;font-weight:600;color:#e2e8f0;margin-bottom:.75rem;'>{st.session_state.auth_email}</div>",
+        f'<div style="font-size:.6rem;font-weight:700;letter-spacing:.12em;text-transform:uppercase;'
+        f'color:#5a5f82;margin-bottom:.3rem;">SEGA America</div>'
+        f'<div style="font-size:.7rem;font-weight:600;color:#b8bcd4;margin-bottom:.75rem;">'
+        f'{st.session_state.auth_email}</div>',
         unsafe_allow_html=True,
     )
     if st.button("Sign out", key="sign_out_btn"):
@@ -231,7 +241,7 @@ with st.sidebar:
                    "otp_email", "otp_expiry", "otp_attempts"]:
             st.session_state[_k] = False if _k == "auth_verified" else ""
         st.rerun()
-    st.markdown("<hr style='border:none;border-top:1px solid #1e293b;margin:.5rem 0 1rem;'>", unsafe_allow_html=True)
+    st.markdown("<hr style='border:none;border-top:1px solid #232640;margin:.5rem 0 1rem;'>", unsafe_allow_html=True)
 
 st.markdown(
     """
