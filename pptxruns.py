@@ -985,59 +985,70 @@ def _api_post(headers: dict, payload: dict, timeout: int = 90,
 def _api_stream(headers: dict, payload: dict, timeout: int = 150,
                 on_rate_limit=None):
     """
-    POST with stream=True. Yields text delta chunks via SSE.
-    Retries the whole request up to _RL_MAX_TRIES times on 429.
-    on_rate_limit(wait_secs, attempt) is called before sleeping.
+    POST with stream=True using httpx for a true wall-clock timeout.
+    Yields text delta chunks as they arrive via SSE.
+    Retries on 429; raises RuntimeError on other errors.
     """
+    import httpx
+
     for attempt in range(_RL_MAX_TRIES):
-        stream_headers = {**headers, "Accept": "text/event-stream"}
         stream_payload = {**payload, "stream": True}
-        with requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers=stream_headers, json=stream_payload,
-            timeout=timeout, stream=True,
-        ) as resp:
-            if resp.status_code == 429:
-                if attempt == _RL_MAX_TRIES - 1:
+        stream_headers = {**headers, "Accept": "text/event-stream"}
+
+        try:
+            with httpx.stream(
+                "POST",
+                "https://api.anthropic.com/v1/messages",
+                headers=stream_headers,
+                json=stream_payload,
+                timeout=httpx.Timeout(timeout, connect=10),
+            ) as resp:
+                if resp.status_code == 429:
+                    if attempt == _RL_MAX_TRIES - 1:
+                        raise RuntimeError(
+                            "Rate limited after max retries. "
+                            "Switch to Haiku in the sidebar or wait a minute."
+                        )
+                    try:
+                        wait = max(float(
+                            resp.headers.get("retry-after") or
+                            _RL_WAIT_BASE * (2 ** attempt)
+                        ), 1.0)
+                    except (TypeError, ValueError):
+                        wait = _RL_WAIT_BASE * (2 ** attempt)
+                    if on_rate_limit:
+                        on_rate_limit(wait, attempt + 1)
+                    time.sleep(wait)
+                    continue
+
+                if resp.status_code != 200:
                     raise RuntimeError(
-                        "Rate limited after max retries on streaming call. "
-                        "Switch to Haiku in the sidebar or wait a minute."
+                        f"API error {resp.status_code}: {resp.text[:400]}"
                     )
-                try:
-                    wait = max(float(
-                        resp.headers.get("retry-after") or
-                        _RL_WAIT_BASE * (2 ** attempt)
-                    ), 1.0)
-                except (TypeError, ValueError):
-                    wait = _RL_WAIT_BASE * (2 ** attempt)
-                if on_rate_limit:
-                    on_rate_limit(wait, attempt + 1)
-                time.sleep(wait)
-                continue   # retry
 
-            if resp.status_code != 200:
-                raise RuntimeError(
-                    f"API error {resp.status_code}: {resp.text[:400]}"
-                )
+                for raw_line in resp.iter_lines():
+                    line = raw_line.strip()
+                    if not line or not line.startswith("data: "):
+                        continue
+                    payload_str = line[6:].strip()
+                    if payload_str == "[DONE]":
+                        return
+                    try:
+                        evt = json.loads(payload_str)
+                    except json.JSONDecodeError:
+                        continue
+                    if evt.get("type") == "content_block_delta":
+                        delta = evt.get("delta", {})
+                        if delta.get("type") == "text_delta":
+                            yield delta.get("text", "")
+                return  # clean exit
 
-            for raw_line in resp.iter_lines():
-                if not raw_line:
-                    continue
-                line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
-                if not line.startswith("data: "):
-                    continue
-                payload_str = line[6:].strip()
-                if payload_str == "[DONE]":
-                    return
-                try:
-                    evt = json.loads(payload_str)
-                except json.JSONDecodeError:
-                    continue
-                if evt.get("type") == "content_block_delta":
-                    delta = evt.get("delta", {})
-                    if delta.get("type") == "text_delta":
-                        yield delta.get("text", "")
-            return  # clean exit after a successful stream
+        except httpx.TimeoutException:
+            raise RuntimeError(
+                f"Analysis API timed out after {timeout}s. "
+                "Try reducing the slide count or switching to Haiku in the sidebar."
+            )
+
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1084,7 +1095,7 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
             "simultaneously searching the web for <i>{}</i>. "
             "Two focused searches run in sequence: first critical reception &amp; sales data, "
             "then gameplay mechanics &amp; market context. "
-            "Single focused search with a 90s hard timeout — falls back to model knowledge if it times out.</span>"
+            "Single focused search with a 110s hard timeout — falls back to model knowledge if it times out.</span>"
         ).format(game_title))
 
     combined_docs  = "[No documents uploaded]"
@@ -1116,21 +1127,32 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
 
         import httpx
 
-        HARD_TIMEOUT = 80  # httpx enforces this as a true wall-clock deadline
+        HARD_TIMEOUT = 110  # httpx enforces this as a true wall-clock deadline
 
         prompt = (
-            f"Research the video game \"{game_title}\" for a competitive business analysis. "
-            "Give a structured summary: developer/publisher/release date/platforms, "
-            "Metacritic + OpenCritic scores (critic & user), 3 specific praise themes, "
-            "3 specific criticism themes, estimated sales figures, "
-            "4-5 core gameplay mechanics, approximate game length, "
-            "notable DLC or post-launch content, and main competitor titles. "
-            "Real numbers only. Under 400 words."
+            f"Research the video game \"{game_title}\" for an executive competitive analysis presentation. "
+            "Search the web for current information and write a thorough structured report with these sections:\n\n"
+            "OVERVIEW: Developer, publisher, release date, platforms, genre, ESRB/PEGI rating, launch price.\n\n"
+            "CRITICAL RECEPTION: Metacritic score (critic + user), OpenCritic score, "
+            "scores from at least 3-4 named outlets (e.g. IGN, Eurogamer, GameSpot). "
+            "List 4 specific things reviewers praised and 4 specific things they criticised — "
+            "be precise (e.g. 'combat depth', 'open world size', 'performance issues on Switch').\n\n"
+            "COMMERCIAL PERFORMANCE: Launch window sales figures, lifetime sales if available, "
+            "any sales milestones or statements from the publisher, chart positions.\n\n"
+            "GAMEPLAY & FEATURES: 6-7 core mechanics explained in 1-2 sentences each. "
+            "Main story length and completionist length. Multiplayer or co-op features. "
+            "Accessibility options.\n\n"
+            "POST-LAUNCH: Each DLC pack — name, price, release date, brief description, reception. "
+            "Major patches or updates. Current player activity signals.\n\n"
+            "MARKET CONTEXT: The 3-4 biggest competitor titles released in the same window. "
+            "How this game compares to the previous entry in its franchise. "
+            "Any notable controversies, marketing moments, or cultural impact.\n\n"
+            "Use real numbers throughout. Aim for 700-900 words total."
         )
 
         payload = {
             "model": model,
-            "max_tokens": 1200,
+            "max_tokens": 2500,
             "tools": [{"type": "web_search_20250305", "name": "web_search"}],
             "messages": [{"role": "user", "content": prompt}],
         }
@@ -1239,7 +1261,7 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
                 if still_doing:
                     yield ("spinner", (
                         "⏳ <b>Still working…</b> " + " &amp; ".join(still_doing) + "<br>"
-                        "<span class='log-detail'>Web search has a 90s hard limit — if it times out, "
+                        "<span class='log-detail'>Web search has a 110s hard limit — if it times out, "
                         "the analysis will automatically use Claude's training knowledge instead. "
                         "The pipeline will not hang.</span>"
                     ))
