@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 import subprocess
+import shutil
 import base64
 import pandas as pd
 import pypdf
@@ -13,6 +14,56 @@ import hashlib
 import hmac
 import random
 import requests
+
+
+# ── Node.js resolution ───────────────────────────────────────
+# Streamlit may run in a stripped PATH. Locate node + the npm
+# global module directory at startup so subprocess calls work.
+def _find_node() -> str:
+    """Return the absolute path to the node binary."""
+    # 1. Already on PATH
+    found = shutil.which("node")
+    if found:
+        return found
+    # 2. Common install locations
+    for candidate in ["/usr/bin/node", "/usr/local/bin/node",
+                      "/opt/homebrew/bin/node", "/usr/bin/nodejs"]:
+        if os.path.isfile(candidate):
+            return candidate
+    raise FileNotFoundError(
+        "node binary not found. Install Node.js and ensure it is on PATH."
+    )
+
+
+def _npm_global_modules() -> str:
+    """Return the npm global node_modules path (for NODE_PATH)."""
+    # Try asking npm, fall back to the standard location
+    try:
+        result = subprocess.run(
+            [_find_node(), "-e", "console.log(require('path').join(process.env.npm_config_prefix||'', 'lib','node_modules'))"],
+            capture_output=True, text=True, timeout=10,
+        )
+        path = result.stdout.strip()
+        if path and os.path.isdir(path):
+            return path
+    except Exception:
+        pass
+    # npm -g root
+    try:
+        npm = shutil.which("npm") or "/usr/bin/npm"
+        result = subprocess.run([npm, "root", "-g"], capture_output=True, text=True, timeout=10)
+        path = result.stdout.strip()
+        if path and os.path.isdir(path):
+            return path
+    except Exception:
+        pass
+    # Hardcoded fallback for this environment
+    fallback = os.path.expanduser("~/.npm-global/lib/node_modules")
+    return fallback
+
+
+NODE_BIN        = _find_node()
+NODE_MODULES    = _npm_global_modules()
 
 st.set_page_config(
     page_title="SEGA Intelligence Analyzer",
@@ -638,7 +689,13 @@ def generate_pptx(slide_data: dict) -> str:
         json.dump(slide_data, f, indent=2)
     with open(script_file, "w") as f:
         f.write(build_js_script(data_file, output_file))
-    result = subprocess.run(["node", script_file], capture_output=True, text=True, timeout=60)
+    env = os.environ.copy()
+    existing_np = env.get("NODE_PATH", "")
+    env["NODE_PATH"] = (NODE_MODULES + os.pathsep + existing_np) if existing_np else NODE_MODULES
+    result = subprocess.run(
+        [NODE_BIN, script_file],
+        capture_output=True, text=True, timeout=60, env=env,
+    )
     if result.returncode != 0:
         raise RuntimeError(f"pptxgenjs error:\n{result.stderr}\n{result.stdout}")
     if not os.path.exists(output_file):
