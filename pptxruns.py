@@ -321,10 +321,16 @@ h1 { font-size: 2rem !important; font-weight: 700 !important; color: #f1f5f9 !im
 
 .result-log {
     background: #0f172a; border: 1px solid #1e293b; border-radius: 8px;
-    padding: 1rem 1.25rem; font-size: .78rem;
-    font-family: "SF Mono","Fira Code",monospace;
-    color: #94a3b8; max-height: 320px; overflow-y: auto; line-height: 1.8;
+    padding: 1rem 1.25rem; font-size: .82rem;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    color: #94a3b8; max-height: 480px; overflow-y: auto; line-height: 1.7;
 }
+.result-log b  { color: #e2e8f0; font-weight: 600; }
+.result-log i  { color: #60a5fa; }
+.log-detail    { color: #64748b; font-size: .76rem; line-height: 1.55; display: block;
+                 margin-top: .15rem; margin-bottom: .35rem; }
+.log-entry     { border-left: 2px solid #1e3a5f; padding-left: .6rem;
+                 margin-bottom: .5rem; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -781,76 +787,128 @@ def generate_pptx(slide_data: dict) -> bytes:
 
 
 # ─────────────────────────────────────────────────────────────
-# API HELPERS
+# API HELPERS  (with rate-limit retry + back-off)
 # ─────────────────────────────────────────────────────────────
 
-def _api_post(headers: dict, payload: dict, timeout: int = 90) -> dict:
-    """Single POST with rate-limit retry (max 3 attempts, exponential back-off)."""
-    for attempt in range(3):
+_RL_WAIT_BASE = 20   # seconds to wait on first 429
+_RL_MAX_TRIES = 5    # max retries before giving up
+
+
+def _api_post(headers: dict, payload: dict, timeout: int = 90,
+              on_wait=None) -> dict:
+    """
+    POST to /v1/messages with exponential back-off on 429.
+    on_wait(seconds, attempt) is called before each sleep so callers can
+    surface a countdown message to the UI.
+    """
+    for attempt in range(_RL_MAX_TRIES):
         resp = requests.post(
             "https://api.anthropic.com/v1/messages",
             headers=headers, json=payload, timeout=timeout,
         )
         if resp.status_code == 429:
-            wait = float(resp.headers.get("retry-after") or (10 * 2 ** attempt))
+            if attempt == _RL_MAX_TRIES - 1:
+                raise RuntimeError(
+                    f"Rate limited after {_RL_MAX_TRIES} retries. "
+                    "Try switching to Haiku in the sidebar (much higher rate limit) "
+                    "or wait a minute and run again."
+                )
+            # Honour retry-after header when present; otherwise double each time
+            try:
+                wait = max(float(
+                    resp.headers.get("retry-after") or
+                    resp.headers.get("x-ratelimit-reset-requests") or
+                    _RL_WAIT_BASE * (2 ** attempt)
+                ), 1.0)
+            except (TypeError, ValueError):
+                wait = _RL_WAIT_BASE * (2 ** attempt)
+            if on_wait:
+                on_wait(wait, attempt + 1)
             time.sleep(wait)
             continue
         resp.raise_for_status()
         return resp.json()
-    raise RuntimeError("Rate limited after 3 retries. Try again shortly.")
+    raise RuntimeError("Unexpected exit from retry loop.")
 
 
-def _api_stream(headers: dict, payload: dict, timeout: int = 120):
+def _api_stream(headers: dict, payload: dict, timeout: int = 150,
+                on_rate_limit=None):
     """
-    POST with stream=True. Yields text chunks as they arrive (SSE parsing).
-    Caller collects chunks; raises RuntimeError on HTTP errors.
+    POST with stream=True. Yields text delta chunks via SSE.
+    Retries the whole request up to _RL_MAX_TRIES times on 429.
+    on_rate_limit(wait_secs, attempt) is called before sleeping.
     """
-    stream_headers = {**headers, "Accept": "text/event-stream"}
-    payload = {**payload, "stream": True}
-    with requests.post(
-        "https://api.anthropic.com/v1/messages",
-        headers=stream_headers, json=payload,
-        timeout=timeout, stream=True,
-    ) as resp:
-        if resp.status_code != 200:
-            raise RuntimeError(f"API error {resp.status_code}: {resp.text[:300]}")
-        for raw_line in resp.iter_lines():
-            if not raw_line:
-                continue
-            line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
-            if not line.startswith("data: "):
-                continue
-            payload_str = line[6:].strip()
-            if payload_str == "[DONE]":
-                break
-            try:
-                evt = json.loads(payload_str)
-            except json.JSONDecodeError:
-                continue
-            if evt.get("type") == "content_block_delta":
-                delta = evt.get("delta", {})
-                if delta.get("type") == "text_delta":
-                    yield delta.get("text", "")
+    for attempt in range(_RL_MAX_TRIES):
+        stream_headers = {**headers, "Accept": "text/event-stream"}
+        stream_payload = {**payload, "stream": True}
+        with requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers=stream_headers, json=stream_payload,
+            timeout=timeout, stream=True,
+        ) as resp:
+            if resp.status_code == 429:
+                if attempt == _RL_MAX_TRIES - 1:
+                    raise RuntimeError(
+                        "Rate limited after max retries on streaming call. "
+                        "Switch to Haiku in the sidebar or wait a minute."
+                    )
+                try:
+                    wait = max(float(
+                        resp.headers.get("retry-after") or
+                        _RL_WAIT_BASE * (2 ** attempt)
+                    ), 1.0)
+                except (TypeError, ValueError):
+                    wait = _RL_WAIT_BASE * (2 ** attempt)
+                if on_rate_limit:
+                    on_rate_limit(wait, attempt + 1)
+                time.sleep(wait)
+                continue   # retry
+
+            if resp.status_code != 200:
+                raise RuntimeError(
+                    f"API error {resp.status_code}: {resp.text[:400]}"
+                )
+
+            for raw_line in resp.iter_lines():
+                if not raw_line:
+                    continue
+                line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
+                if not line.startswith("data: "):
+                    continue
+                payload_str = line[6:].strip()
+                if payload_str == "[DONE]":
+                    return
+                try:
+                    evt = json.loads(payload_str)
+                except json.JSONDecodeError:
+                    continue
+                if evt.get("type") == "content_block_delta":
+                    delta = evt.get("delta", {})
+                    if delta.get("type") == "text_delta":
+                        yield delta.get("text", "")
+            return  # clean exit after a successful stream
 
 
 # ─────────────────────────────────────────────────────────────
 # PIPELINE  (parallel extraction + research, streaming analysis)
 # ─────────────────────────────────────────────────────────────
 
+# Characters of document context to send.  Keeping this under ~8 000 chars
+# (~2 000 tokens) leaves plenty of headroom on the 30 000 input-token/min limit.
+_MAX_DOC_CHARS = 8_000
+
+
 def run_pipeline(model, uploaded_files, game_title, business_question, audience,
                  theme_preset, web_search_en, slide_count):
     """
-    Generator yielding (event_type, payload) tuples.
-
-    Speed optimisations vs. the previous version:
-      1. Document extraction and web research run in PARALLEL via ThreadPoolExecutor.
-      2. The analysis call uses SSE streaming so text appears token-by-token.
-      3. max_tokens reduced to 4 000 (enough for 10-slide JSON; was 8 000).
-      4. Web-search summary capped at 1 500 tokens (was 3 000) — we only need facts.
+    Generator yielding (event_type, payload) tuples consumed by the run-button
+    handler.  Produces rich narrative log messages so users understand exactly
+    what is happening at each stage.
     """
     api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
     if not api_key:
-        yield ("error", "ANTHROPIC_API_KEY not found in st.secrets.")
+        yield ("error", "ANTHROPIC_API_KEY not found in st.secrets. "
+                        "Add it to .streamlit/secrets.toml.")
         return
 
     headers = {
@@ -859,43 +917,64 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
         "anthropic-version": "2023-06-01",
     }
 
-    # ── Step 1 + 2 in parallel ────────────────────────────────
-    yield ("log", "📄 Extracting documents & searching web in parallel…")
+    # ── STAGE 1 + 2: document extraction & web research in parallel ──────────
+    yield ("log", (
+        "📂 <b>Stage 1 of 4 — Loading your documents</b><br>"
+        "<span class='log-detail'>Reading uploaded files and extracting their text content. "
+        "PDFs are parsed page-by-page; Excel/CSV sheets are converted to plain text tables; "
+        "Word documents are unzipped and their paragraph text pulled out. "
+        "Content is capped at {:,} characters to stay within API token limits.</span>"
+    ).format(_MAX_DOC_CHARS))
 
-    combined_docs   = "[No documents uploaded]"
-    research_text   = "[No reference game specified]"
+    if web_search_en and game_title:
+        yield ("log", (
+            "🔍 <b>Stage 2 of 4 — Web research running in parallel</b><br>"
+            "<span class='log-detail'>While your documents are being extracted, Claude is "
+            "simultaneously searching the web for <i>{}</i>. It will gather Metacritic scores, "
+            "sales estimates, key mechanics, player reception, and post-launch data. "
+            "Running both stages at the same time saves ~30 seconds.</span>"
+        ).format(game_title))
+
+    combined_docs  = "[No documents uploaded]"
+    research_text  = "[No reference game specified]"
 
     def _extract_docs():
+        if not uploaded_files:
+            return "[No documents uploaded]"
         texts = []
         for f in uploaded_files:
             f.seek(0)
             texts.append(f"=== {f.name} ===\n{extract_text_from_file(f)}")
-        return "\n\n".join(texts) if texts else "[No documents uploaded]"
+        full = "\n\n".join(texts)
+        # Trim to token-safe length
+        if len(full) > _MAX_DOC_CHARS:
+            full = full[:_MAX_DOC_CHARS] + "\n\n[... document content trimmed to fit token budget ...]"
+        return full
 
     def _web_research():
         if not (web_search_en and game_title):
             if game_title:
-                return f"[Web search disabled — using model knowledge for '{game_title}']"
+                return f"[Web search disabled — relying on model training knowledge for '{game_title}']"
             return "[No reference game specified]"
         try:
             data = _api_post(
                 headers=headers,
                 payload={
                     "model": model,
-                    "max_tokens": 1500,       # ← was 3 000; halved
+                    "max_tokens": 1000,
                     "tools": [{"type": "web_search_20250305", "name": "web_search"}],
                     "messages": [{"role": "user", "content": (
                         f"Research '{game_title}' for a game business analysis. "
-                        "Give a concise structured summary covering: genre, platforms, "
-                        "developer, release date, Metacritic score, sales estimates, "
-                        "key mechanics, player reception highlights, and any DLC/post-launch. "
-                        "Be brief and factual — 400 words max."
+                        "Concise structured summary — 300 words max — covering: "
+                        "genre, platforms, developer, release date, Metacritic score, "
+                        "estimated sales, 3 key mechanics, player reception (2 positives, "
+                        "2 negatives), and any notable DLC or post-launch content."
                     )}],
                 },
                 timeout=60,
             )
             blocks = data.get("content", [])
-            return "\n".join(b.get("text","") for b in blocks if b.get("type")=="text")
+            return "\n".join(b.get("text", "") for b in blocks if b.get("type") == "text")
         except Exception as e:
             return f"[Web search error: {e}]"
 
@@ -903,28 +982,51 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
         fut_docs     = pool.submit(_extract_docs)
         fut_research = pool.submit(_web_research)
 
-        # Surface completions as they finish
         for fut in as_completed([fut_docs, fut_research]):
             if fut is fut_docs:
                 combined_docs = fut.result()
-                yield ("log", f"✅ Documents extracted ({len(combined_docs):,} chars)")
+                n_files = len(uploaded_files)
+                n_chars = len(combined_docs)
+                yield ("log", (
+                    "✅ <b>Documents extracted</b> — {} file{}, {:,} characters of content<br>"
+                    "<span class='log-detail'>Text successfully pulled from your uploads. "
+                    "This content will be the primary source of facts about your internal game.</span>"
+                ).format(n_files, "s" if n_files != 1 else "", n_chars))
                 yield ("step_done", "extract")
             else:
                 res = fut.result()
-                if res.startswith("[Web search error"):
-                    yield ("log", f"⚠️ {res}")
+                if "[Web search error" in res or "[Web search disabled" in res or "[No reference" in res:
+                    research_text = res
+                    yield ("log", f"⚠️ <b>Web research note:</b> {res}")
                 else:
                     research_text = res
-                    yield ("log", "✅ Web research complete")
+                    word_count = len(res.split())
+                    yield ("log", (
+                        "✅ <b>Web research complete</b> — ~{} words gathered on <i>{}</i><br>"
+                        "<span class='log-detail'>Claude searched the web and compiled key facts: "
+                        "review scores, sales data, gameplay mechanics, and player reception. "
+                        "This will be used as the benchmark in the comparison slides.</span>"
+                    ).format(word_count, game_title))
                 yield ("step_done", "research")
 
-    # ── Step 3: streaming analysis ────────────────────────────
-    yield ("log", "🤖 Analysing with Claude (streaming)…")
+    # ── STAGE 3: streaming analysis ───────────────────────────────────────────
+
+    # Estimate input token count roughly (1 token ≈ 4 chars)
+    prompt_chars = len(combined_docs) + len(research_text) + len(business_question) + 800
+    est_input_tokens = prompt_chars // 4
+    yield ("log", (
+        "🤖 <b>Stage 3 of 4 — Claude is writing your presentation</b><br>"
+        "<span class='log-detail'>Sending ~{:,} input tokens to {}. Claude will read all your "
+        "document content, cross-reference the research on <i>{}</i>, interpret your business "
+        "question, and produce a structured {}-slide JSON outline with titles, bullet points, "
+        "comparison tables, stat callouts, and speaker notes. "
+        "You will see progress updates as each section is written.</span>"
+    ).format(est_input_tokens, model, game_title or "the reference game", slide_count))
 
     theme_desc = {
-        "SEGA Blue — Corporate Executive": "Professional SEGA corporate blue (#0055AA) — boardroom-ready.",
+        "SEGA Blue — Corporate Executive": "Professional SEGA corporate blue (#0055AA), boardroom-ready.",
         "SEGA Dark — Game Reveal Style":   "Dark dramatic (#040A1C) with electric blue accents.",
-        "SEGA Sonic — High Energy":        "Vibrant SEGA blue + gold accents, dynamic energy.",
+        "SEGA Sonic — High Energy":        "Vibrant SEGA blue with gold accents, high energy.",
     }.get(theme_preset, "SEGA corporate blue")
 
     analysis_prompt = f"""You are a senior game industry analyst at SEGA.
@@ -961,38 +1063,77 @@ Output a single JSON object. Schema:
 }}
 
 Rules:
-- Use REAL data from the documents and research
+- Use REAL data from the documents and research — no generic placeholders
 - Be specific and data-driven for {audience}
 - Return ONLY valid JSON — no markdown fences, no explanation"""
 
-    raw_chunks = []
-    token_count = [0]
+    raw_chunks   = []
+    char_count   = 0
+    last_tick_at = 0
+
+    # Slide detection: watch for "title": patterns in the accumulating JSON
+    # so we can announce each slide as it is written
+    slides_announced = 0
+
+    def _count_slides_so_far(text):
+        """Count how many slide title fields have appeared so far in the stream."""
+        import re
+        return len(re.findall(r'"type"\s*:\s*"(?:title|section|bullets|stats|comparison|recommendation|closing)"', text))
+
+    def _on_rate_limit(wait_secs, attempt):
+        # This runs in the main thread during the stream retry sleep;
+        # we can't yield from here, so we just log via a mutable flag
+        pass  # handled below via RuntimeError propagation
 
     try:
         for chunk in _api_stream(
             headers=headers,
             payload={
                 "model": model,
-                "max_tokens": 4000,     # ← was 8 000; halved
+                "max_tokens": 4000,
                 "system": "You are a precise game industry analyst. Return valid JSON only.",
                 "messages": [{"role": "user", "content": analysis_prompt}],
             },
         ):
             raw_chunks.append(chunk)
-            token_count[0] += 1
-            # Surface a progress tick every 40 tokens so the UI feels live
-            if token_count[0] % 40 == 0:
-                yield ("log", f"🤖 Generating slide content… ({token_count[0]} tokens)")
+            char_count += len(chunk)
+
+            # Announce new slides as they appear in the stream
+            current_text  = "".join(raw_chunks)
+            slides_so_far = _count_slides_so_far(current_text)
+            if slides_so_far > slides_announced:
+                for _ in range(slides_so_far - slides_announced):
+                    slides_announced += 1
+                    yield ("log", (
+                        f"  ✏️ Writing slide {slides_announced} of {slide_count}…"
+                    ))
+
+            # Periodic byte-count tick every ~600 chars
+            if char_count - last_tick_at >= 600:
+                last_tick_at = char_count
+                pct = min(int(char_count / (slide_count * 220) * 100), 95)
+                yield ("log", (
+                    f"  📝 Generating JSON… {char_count:,} chars written (~{pct}% complete)"
+                ))
 
     except RuntimeError as e:
-        yield ("error", str(e))
+        err = str(e)
+        if "rate limit" in err.lower() or "429" in err:
+            yield ("error",
+                "⏱️ <b>Rate limit hit</b> — your organisation has exceeded 30,000 input tokens/min.<br><br>"
+                "Quick fixes:<br>"
+                "• Switch to <b>Haiku</b> in the sidebar (much higher rate limits)<br>"
+                "• Wait 60 seconds then click Run again<br>"
+                "• Reduce the number of uploaded documents to lower input token usage"
+            )
+        else:
+            yield ("error", err)
         return
     except Exception as e:
-        yield ("error", f"API streaming error: {e}")
+        yield ("error", f"Streaming error: {e}")
         return
 
     raw_json = "".join(raw_chunks).strip()
-    # Strip accidental markdown fences
     if raw_json.startswith("```"):
         raw_json = raw_json.split("\n", 1)[1]
         raw_json = raw_json.rsplit("```", 1)[0]
@@ -1000,16 +1141,37 @@ Rules:
     try:
         slide_data = json.loads(raw_json)
     except json.JSONDecodeError as e:
-        yield ("error", f"JSON parse error: {e}\n\nFirst 400 chars:\n{raw_json[:400]}")
+        yield ("error",
+            f"JSON parse error: {e}<br>"
+            f"The model returned malformed JSON. Try running again — "
+            f"this is usually caused by the output being truncated mid-stream.<br><br>"
+            f"First 400 chars received:<br><code>{raw_json[:400]}</code>"
+        )
         return
 
     n_slides = len(slide_data.get("slides", []))
     yield ("step_done", "analyze")
-    yield ("log", f"✅ Analysis complete — {n_slides} slides, {token_count[0]} tokens")
+    yield ("log", (
+        "✅ <b>Analysis complete</b> — {} slides generated, {:,} characters of content<br>"
+        "<span class='log-detail'>Claude has finished writing all slide content including "
+        "titles, bullet points, comparison rows, stat callouts, and speaker notes. "
+        "Slide types used: {}.</span>"
+    ).format(
+        n_slides,
+        char_count,
+        ", ".join(sorted(set(s.get("type","?") for s in slide_data.get("slides",[]))))
+    ))
     yield ("slide_data", slide_data)
 
-    # ── Step 4: PPTX generation ───────────────────────────────
-    yield ("log", "🖥️ Building PPTX…")
+    # ── STAGE 4: PPTX rendering ───────────────────────────────────────────────
+    yield ("log", (
+        "🖥️ <b>Stage 4 of 4 — Building the PowerPoint file</b><br>"
+        "<span class='log-detail'>Rendering {} slides with python-pptx: setting the dark SEGA "
+        "background, drawing coloured shape layers, placing all text boxes with proper fonts "
+        "and sizes, adding the chrome footer with page numbers, and writing the file to memory. "
+        "No external tools required — pure Python.</span>"
+    ).format(n_slides))
+
     try:
         pptx_bytes_out = generate_pptx(slide_data)
     except Exception as e:
@@ -1017,7 +1179,12 @@ Rules:
         return
 
     yield ("step_done", "generate")
-    yield ("log", f"✅ Done — {len(pptx_bytes_out):,} bytes")
+    yield ("log", (
+        "🎉 <b>All done!</b> — PPTX is {:.0f} KB across {} slides<br>"
+        "<span class='log-detail'>Your presentation is ready to download. "
+        "Open it in PowerPoint or Google Slides. Speaker notes are included on each slide. "
+        "The file uses standard OOXML format and is compatible with all modern presentation apps.</span>"
+    ).format(len(pptx_bytes_out) / 1024, n_slides))
     yield ("pptx_bytes_out", pptx_bytes_out)
 
 
@@ -1048,8 +1215,12 @@ if run_btn:
 
                     if etype == "log":
                         log_lines.append(event[1])
+                        entries = "".join(
+                            f'<div class="log-entry">{line}</div>'
+                            for line in log_lines[-14:]
+                        )
                         log_area.markdown(
-                            '<div class="result-log">' + "<br>".join(log_lines[-12:]) + "</div>",
+                            f'<div class="result-log">{entries}</div>',
                             unsafe_allow_html=True,
                         )
 
