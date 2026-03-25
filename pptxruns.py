@@ -19,6 +19,115 @@ from pptx.enum.text import PP_ALIGN
 from pptx.oxml.ns import qn
 from lxml import etree
 
+# ─────────────────────────────────────────────────────────────
+# THEME & FILL HELPERS — prevent white-on-white text
+# ─────────────────────────────────────────────────────────────
+
+# Dark SEGA theme: dk1=white, lt1=dark-navy.
+# This means any text that falls back to theme colour is white,
+# which is correct on our dark backgrounds.  Replaces the default
+# Office theme (dk1=windowText which can resolve to white on some
+# systems/dark-mode setups, making text invisible).
+_SEGA_THEME_XML = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+    '<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" name="SEGA Dark">'
+    '<a:themeElements>'
+    '<a:clrScheme name="SEGA Dark">'
+    '<a:dk1><a:srgbClr val="FFFFFF"/></a:dk1>'
+    '<a:lt1><a:srgbClr val="040A1C"/></a:lt1>'
+    '<a:dk2><a:srgbClr val="0055AA"/></a:dk2>'
+    '<a:lt2><a:srgbClr val="1A2A4A"/></a:lt2>'
+    '<a:accent1><a:srgbClr val="00AADD"/></a:accent1>'
+    '<a:accent2><a:srgbClr val="F5C218"/></a:accent2>'
+    '<a:accent3><a:srgbClr val="00BB66"/></a:accent3>'
+    '<a:accent4><a:srgbClr val="CC2244"/></a:accent4>'
+    '<a:accent5><a:srgbClr val="8899BB"/></a:accent5>'
+    '<a:accent6><a:srgbClr val="AABBCC"/></a:accent6>'
+    '<a:hlink><a:srgbClr val="00AADD"/></a:hlink>'
+    '<a:folHlink><a:srgbClr val="0055AA"/></a:folHlink>'
+    '</a:clrScheme>'
+    '<a:fontScheme name="SEGA">'
+    '<a:majorFont><a:latin typeface="Calibri"/><a:ea typeface=""/><a:cs typeface=""/></a:majorFont>'
+    '<a:minorFont><a:latin typeface="Calibri"/><a:ea typeface=""/><a:cs typeface=""/></a:minorFont>'
+    '</a:fontScheme>'
+    '<a:fmtScheme name="Office">'
+    '<a:fillStyleLst>'
+    '<a:solidFill><a:schemeClr val="phClr"/></a:solidFill>'
+    '<a:gradFill rotWithShape="1"><a:gsLst>'
+    '<a:gs pos="0"><a:schemeClr val="phClr"><a:tint val="50000"/></a:schemeClr></a:gs>'
+    '<a:gs pos="100000"><a:schemeClr val="phClr"><a:tint val="15000"/></a:schemeClr></a:gs>'
+    '</a:gsLst><a:lin ang="16200000" scaled="1"/></a:gradFill>'
+    '<a:gradFill rotWithShape="1"><a:gsLst>'
+    '<a:gs pos="0"><a:schemeClr val="phClr"><a:shade val="51000"/></a:schemeClr></a:gs>'
+    '<a:gs pos="100000"><a:schemeClr val="phClr"><a:shade val="94000"/></a:schemeClr></a:gs>'
+    '</a:gsLst><a:lin ang="16200000" scaled="0"/></a:gradFill>'
+    '</a:fillStyleLst>'
+    '<a:lnStyleLst>'
+    '<a:ln w="9525"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:prstDash val="solid"/></a:ln>'
+    '<a:ln w="25400"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:prstDash val="solid"/></a:ln>'
+    '<a:ln w="38100"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:prstDash val="solid"/></a:ln>'
+    '</a:lnStyleLst>'
+    '<a:effectStyleLst>'
+    '<a:effectStyle><a:effectLst/></a:effectStyle>'
+    '<a:effectStyle><a:effectLst/></a:effectStyle>'
+    '<a:effectStyle><a:effectLst/></a:effectStyle>'
+    '</a:effectStyleLst>'
+    '<a:bgFillStyleLst>'
+    '<a:solidFill><a:schemeClr val="phClr"/></a:solidFill>'
+    '<a:solidFill><a:schemeClr val="phClr"/></a:solidFill>'
+    '<a:gradFill rotWithShape="1"><a:gsLst>'
+    '<a:gs pos="0"><a:schemeClr val="phClr"><a:tint val="93000"/></a:schemeClr></a:gs>'
+    '<a:gs pos="100000"><a:schemeClr val="phClr"><a:shade val="98000"/></a:schemeClr></a:gs>'
+    '</a:gsLst><a:lin ang="16200000" scaled="1"/></a:gradFill>'
+    '</a:bgFillStyleLst>'
+    '</a:fmtScheme>'
+    '</a:themeElements>'
+    '</a:theme>'
+)
+
+
+def _patch_theme(pptx_bytes: bytes) -> bytes:
+    """Swap every theme file in the PPTX zip for the SEGA dark theme."""
+    import zipfile, re as _re
+    buf_in  = io.BytesIO(pptx_bytes)
+    buf_out = io.BytesIO()
+    theme_bytes = _SEGA_THEME_XML.encode("utf-8")
+    with zipfile.ZipFile(buf_in, "r") as zin,          zipfile.ZipFile(buf_out, "w", zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            data = zin.read(item.filename)
+            if _re.match(r"ppt/theme/theme\d+\.xml", item.filename):
+                data = theme_bytes
+            zout.writestr(item, data)
+    return buf_out.getvalue()
+
+
+def _lock_txb(txb):
+    """
+    Add explicit noFill + noLine to a textbox shape element so it can never
+    inherit a white background from the theme or slide layout.
+    Must be called after add_textbox() but before saving.
+    """
+    sp   = txb._element
+    spPr = sp.find(qn("p:spPr"))
+    if spPr is None:
+        return
+    # Remove any existing fill child
+    for tag in ("a:solidFill", "a:gradFill", "a:pattFill", "a:blipFill", "a:grpFill", "a:noFill"):
+        el = spPr.find(qn(tag))
+        if el is not None:
+            spPr.remove(el)
+    # Insert <a:noFill/> after the <a:xfrm> and <a:prstGeom> elements
+    no_fill = etree.SubElement(spPr, qn("a:noFill"))
+    # Also kill any line (border) that might show as white
+    ln = spPr.find(qn("a:ln"))
+    if ln is None:
+        ln = etree.SubElement(spPr, qn("a:ln"))
+    # Clear the line's fill children and set noFill
+    for child in list(ln):
+        ln.remove(child)
+    etree.SubElement(ln, qn("a:noFill"))
+
+
 st.set_page_config(
     page_title="SEGA Intelligence Analyzer",
     page_icon="🎮",
@@ -518,6 +627,7 @@ def _add_text(slide, text, x, y, w, h,
               size=12, bold=False, italic=False, color="FFFFFF",
               align=PP_ALIGN.LEFT, wrap=True, font_name="Calibri"):
     txb = slide.shapes.add_textbox(_in(x), _in(y), _in(w), _in(h))
+    _lock_txb(txb)  # prevent white-box inheritance
     tf  = txb.text_frame
     tf.word_wrap = wrap
     p   = tf.paragraphs[0]
@@ -556,6 +666,7 @@ def _add_bullets(slide, bullets, x, y, w, h, bullet_color, text_color,
     if not bullets:
         return
     txb = slide.shapes.add_textbox(_in(x), _in(y), _in(w), _in(h))
+    _lock_txb(txb)  # prevent white-box inheritance
     tf  = txb.text_frame
     tf.word_wrap = True
     first = True
@@ -688,7 +799,7 @@ def _slide_comparison(slide, s, idx, total, C):
                   size=9, bold=True, color=C["midgray"], font_name="Calibri")
         _add_text(slide, row.get("left","—"),
                   mid_x+0.05, y, col_w-0.1, row_h,
-                  size=9, color=C["white"], align=PP_ALIGN.CENTER, font_name="Calibri")
+                  size=9, color=C["light"], align=PP_ALIGN.CENTER, font_name="Calibri")
         delta = (row.get("delta","") or "").lower()
         dc = C["green"] if delta == "positive" else C["red"] if delta == "negative" else C["neutral"]
         _add_text(slide, row.get("right","—"),
@@ -737,19 +848,34 @@ def generate_pptx(slide_data: dict) -> bytes:
     from pptx.util import Inches, Emu
 
     theme = slide_data.get("theme", {})
+
+    def _safe_dark_hex(val, fallback):
+        """Accept Claude's hex only if it is a mid/dark vivid colour (lum 0.04–0.82)."""
+        if not val or not isinstance(val, str): return fallback
+        h = val.lstrip("#").upper()
+        if len(h) != 6: return fallback
+        try: int(h, 16)
+        except ValueError: return fallback
+        r, g, b = int(h[0:2],16), int(h[2:4],16), int(h[4:6],16)
+        lum = (0.299*r + 0.587*g + 0.114*b) / 255
+        return h if 0.04 < lum < 0.82 else fallback
+
     C = {
-        "bg":        theme.get("background", "040A1C"),
-        "primary":   theme.get("primary",    "0055AA"),
-        "accent":    theme.get("accent",     "00AADD"),
-        "white":     theme.get("text_light", "FFFFFF"),
-        "dark":      theme.get("text_dark",  "0A0A1A"),
-        "gold":      "F5C842",
-        "subtle":    "1A2A4A",
-        "midgray":   "8899BB",
-        "green":     "00BB66",
-        "red":       "CC2244",
-        "neutral":   "AABBCC",
-        "header_bg": "0033AA",
+        # ── HARDCODED — never influenced by Claude's theme JSON ─
+        "bg":        "040A1C",   # slide background (near-black)
+        "subtle":    "1A2A4A",   # dark card/band background
+        "header_bg": "0033AA",   # chrome footer bar
+        "white":     "FFFFFF",   # primary text colour (always on dark bg)
+        "light":     "D0E4FF",   # secondary text / table body
+        "midgray":   "8899BB",   # muted text, notes, captions
+        "neutral":   "AABBCC",   # table body on dark rows
+        "gold":      "F5C242",   # highlight / stats accent
+        "green":     "22DD88",   # positive delta
+        "red":       "EE3355",   # negative delta
+        "dark":      "040A1C",   # (reserved — dark text on light shapes)
+        # ── FROM CLAUDE (validated, fallback to SEGA defaults) ──
+        "primary":   _safe_dark_hex(theme.get("primary"), "0055AA"),
+        "accent":    _safe_dark_hex(theme.get("accent"),  "00AADD"),
     }
 
     prs = Presentation()
@@ -782,7 +908,10 @@ def generate_pptx(slide_data: dict) -> bytes:
     buf = io.BytesIO()
     prs.save(buf)
     buf.seek(0)
-    return buf.read()
+    # Replace the Office theme with SEGA dark theme so that any text
+    # or shape that falls back to theme colours uses white-on-dark,
+    # never black-on-dark or white-on-white.
+    return _patch_theme(buf.read())
 
 
 
@@ -961,14 +1090,39 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
                 headers=headers,
                 payload={
                     "model": model,
-                    "max_tokens": 1000,
+                    "max_tokens": 2500,
                     "tools": [{"type": "web_search_20250305", "name": "web_search"}],
                     "messages": [{"role": "user", "content": (
-                        f"Research '{game_title}' for a game business analysis. "
-                        "Concise structured summary — 300 words max — covering: "
-                        "genre, platforms, developer, release date, Metacritic score, "
-                        "estimated sales, 3 key mechanics, player reception (2 positives, "
-                        "2 negatives), and any notable DLC or post-launch content."
+                        f"You are a game industry research analyst. "
+                        f"Produce a thorough competitive intelligence report on '{game_title}' "
+                        "for use in an executive presentation. Search for current information and cover:\n\n"
+                        "**IDENTITY**\n"
+                        "- Developer, publisher, release date, platforms\n"
+                        "- Genre, sub-genre, ESRB/PEGI rating, price at launch\n\n"
+                        "**CRITICAL RECEPTION**\n"
+                        "- Metacritic and OpenCritic scores (critic + user)\n"
+                        "- Key praise themes from reviews (be specific — e.g. 'combat depth', 'open world design')\n"
+                        "- Key criticism themes (e.g. 'performance issues', 'repetitive missions')\n"
+                        "- Notable review outlets and their scores if available\n\n"
+                        "**COMMERCIAL PERFORMANCE**\n"
+                        "- Launch window sales figures or estimates\n"
+                        "- Lifetime sales if available\n"
+                        "- Sales milestones or publisher statements\n"
+                        "- Chart positions (UK, US, Japan if notable)\n\n"
+                        "**GAMEPLAY & FEATURES**\n"
+                        "- Core gameplay loop and main mechanics (5-7 bullet points)\n"
+                        "- Approximate game length (main story + completionist)\n"
+                        "- Multiplayer / co-op / online features\n"
+                        "- Accessibility features\n\n"
+                        "**POST-LAUNCH & LONGEVITY**\n"
+                        "- DLC released: names, prices, reception\n"
+                        "- Major patches or updates\n"
+                        "- Player retention signals (concurrent player counts, community activity)\n\n"
+                        "**MARKET CONTEXT**\n"
+                        "- Main competitor titles in the same window\n"
+                        "- How it performed vs. previous entries in the franchise\n"
+                        "- Any notable controversy, marketing moments, or viral moments\n\n"
+                        "Be specific with numbers wherever possible. Cite sources inline."
                     )}],
                 },
                 timeout=60,
@@ -1002,7 +1156,7 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
                     research_text = res
                     word_count = len(res.split())
                     yield ("log", (
-                        "✅ <b>Web research complete</b> — ~{} words gathered on <i>{}</i><br>"
+                        "✅ <b>Web research complete</b> — ~{} words of competitive intelligence on <i>{}</i><br>"
                         "<span class='log-detail'>Claude searched the web and compiled key facts: "
                         "review scores, sales data, gameplay mechanics, and player reception. "
                         "This will be used as the benchmark in the comparison slides.</span>"
@@ -1046,7 +1200,7 @@ Analyse the following and produce a JSON object for a {slide_count}-slide execut
 Output a single JSON object. Schema:
 {{
   "title":"...", "subtitle":"...",
-  "theme":{{"primary":"hex","accent":"hex","background":"hex","text_light":"hex","text_dark":"hex"}},
+  "theme":{{"primary":"hex (dark-to-mid blue for SEGA branding, e.g. 0055AA)","accent":"hex (vivid cyan or teal, e.g. 00AADD)"}},
   "slides":[
     {{
       "type":"title|section|comparison|bullets|stats|recommendation|closing",
@@ -1065,6 +1219,9 @@ Output a single JSON object. Schema:
 Rules:
 - Use REAL data from the documents and research — no generic placeholders
 - Be specific and data-driven for {audience}
+- theme.primary and theme.accent must be dark-to-mid vivid hex colours (6 digits, no #).
+  Never use white, near-white, or light pastels (no values above DDDDDD).
+  Good: "0055AA", "003380", "00AADD". Bad: "FFFFFF", "F0F0F0", "C8D8EE".
 - Return ONLY valid JSON — no markdown fences, no explanation"""
 
     raw_chunks   = []
