@@ -1426,25 +1426,41 @@ if run_btn:
                                 log_lines[-1] = ("log", log_lines[-1][1])
                             log_lines.append(("log", event[1]))
 
-                        # Build HTML — last spinner entry gets the animated ring
-                        html_parts = []
-                        for kind, text in log_lines[-14:]:
-                            if kind == "spinner":
+                        # Build self-contained HTML with inline CSS.
+                        # Streamlit does NOT share CSS between separate markdown() calls,
+                        # so all styles must be embedded in every render.
+                        _CSS = (
+                            "<style>"
+                            "@keyframes _sp{to{transform:rotate(360deg)}}"
+                            "._lw{background:#0f172a;border:1px solid #1e293b;border-radius:8px;"
+                            "padding:1rem 1.25rem;font-size:.82rem;"
+                            "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;"
+                            "color:#94a3b8;max-height:480px;overflow-y:auto;line-height:1.7}"
+                            "._lw b{color:#e2e8f0;font-weight:600}"
+                            "._lw i{color:#60a5fa}"
+                            "._ld{color:#64748b;font-size:.76rem;line-height:1.55;display:block;"
+                            "margin-top:.15rem;margin-bottom:.35rem}"
+                            "._le{border-left:2px solid #1e3a5f;padding-left:.6rem;margin-bottom:.5rem}"
+                            "._la{border-left:2px solid #00AADD;padding-left:.6rem;"
+                            "margin-bottom:.5rem;display:flex;align-items:flex-start;gap:.55rem}"
+                            "._lr{flex-shrink:0;width:14px;height:14px;margin-top:3px;"
+                            "border:2px solid rgba(0,170,221,.25);border-top-color:#00AADD;"
+                            "border-radius:50%;animation:_sp .8s linear infinite}"
+                            "._lt{flex:1}"
+                            "</style>"
+                        )
+                        html_parts = [_CSS, '<div class="_lw">']
+                        for _kind, _text in log_lines[-14:]:
+                            _t = _text.replace("class='log-detail'", "class='_ld'")
+                            if _kind == "spinner":
                                 html_parts.append(
-                                    f'<div class="log-active">'
-                                    f'<div class="log-spinner"></div>'
-                                    f'<div class="log-active-text">{text}</div>'
-                                    f'</div>'
+                                    f'<div class="_la"><div class="_lr"></div>'
+                                    f'<div class="_lt">{_t}</div></div>'
                                 )
                             else:
-                                html_parts.append(
-                                    f'<div class="log-entry">{text}</div>'
-                                )
-                        log_area.markdown(
-                            f'<div class="result-log">{" ".join(html_parts)}</div>',
-                            unsafe_allow_html=True,
-                        )
-
+                                html_parts.append(f'<div class="_le">{_t}</div>')
+                        html_parts.append("</div>")
+                        log_area.markdown("".join(html_parts), unsafe_allow_html=True)
                     elif etype == "step_done":
                         pipeline_steps[event[1]] = True
                         st.session_state["pipeline_steps"] = pipeline_steps
