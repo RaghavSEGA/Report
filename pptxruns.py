@@ -1084,7 +1084,7 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
             "simultaneously searching the web for <i>{}</i>. "
             "Two focused searches run in sequence: first critical reception &amp; sales data, "
             "then gameplay mechanics &amp; market context. "
-            "Each has a 120s timeout with one automatic retry if it times out.</span>"
+            "Single focused search with a 90s hard timeout — falls back to model knowledge if it times out.</span>"
         ).format(game_title))
 
     combined_docs  = "[No documents uploaded]"
@@ -1106,70 +1106,48 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
     def _web_research():
         if not (web_search_en and game_title):
             if game_title:
-                return f"[Web search disabled \u2014 relying on model training knowledge for '{game_title}']"
+                return f"[Web search disabled — using model knowledge for '{game_title}']"
             return "[No reference game specified]"
 
-        def _call(prompt, max_tok=1200, timeout=120, attempt=0):
-            """Single web-search call with one automatic timeout retry."""
-            try:
-                data = _api_post(
-                    headers=headers,
-                    payload={
-                        "model": model,
-                        "max_tokens": max_tok,
-                        "tools": [{"type": "web_search_20250305", "name": "web_search"}],
-                        "messages": [{"role": "user", "content": prompt}],
-                    },
-                    timeout=timeout,
+        # Single focused prompt, one API call, hard 90 s wall-clock limit.
+        # If it times out we fall back to model training knowledge gracefully.
+        prompt = (
+            f"Research the video game \"{game_title}\" for a competitive business analysis. "
+            "Structured summary covering: developer/publisher/release date/platforms, "
+            "Metacritic and OpenCritic scores, 3 key praise themes, 3 key criticism themes, "
+            "estimated sales figures, 4-5 core gameplay mechanics, game length, "
+            "any notable DLC or post-launch content, and main competitor titles. "
+            "Use real numbers. Keep it under 500 words."
+        )
+
+        HARD_TIMEOUT = 90  # better a fast fallback than a 3-min hang
+
+        try:
+            data = _api_post(
+                headers=headers,
+                payload={
+                    "model": model,
+                    "max_tokens": 1500,
+                    "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+                    "messages": [{"role": "user", "content": prompt}],
+                },
+                timeout=HARD_TIMEOUT,
+            )
+            blocks = data.get("content", [])
+            text = "\n".join(b.get("text", "") for b in blocks if b.get("type") == "text")
+            return text if text.strip() else (
+                f"[No web results — analysis will use model knowledge for '{game_title}']"
+            )
+        except Exception as e:
+            err = str(e).lower()
+            if any(t in err for t in ("timed out", "timeout", "read timeout", "connection")):
+                return (
+                    f"[Web search timed out after {HARD_TIMEOUT}s. "
+                    f"The analysis will use Claude's training knowledge for '{game_title}' instead. "
+                    "This is normal for popular titles with many search results.]"
                 )
-                blocks = data.get("content", [])
-                return "\n".join(b.get("text", "") for b in blocks if b.get("type") == "text")
-            except Exception as e:
-                err = str(e).lower()
-                is_timeout = any(t in err for t in ("timed out", "timeout", "read timeout"))
-                if is_timeout and attempt == 0:
-                    return _call(prompt, max_tok=max_tok, timeout=180, attempt=1)
-                return f"[Web search error: {e}]"
+            return f"[Web search error: {e}]"
 
-        # Two focused prompts instead of one large prompt.
-        # Splitting reduces the number of web searches Claude must chain per call,
-        # cutting both latency and timeout risk.
-        p1 = (
-            f"Research the video game \"{game_title}\". Concise factual report covering:\n"
-            "1. Identity: developer, publisher, release date, platforms, genre, launch price\n"
-            "2. Critical reception: Metacritic + OpenCritic scores (critic & user), "
-            "3-4 specific praise themes, 3-4 specific criticism themes, a few outlet scores\n"
-            "3. Commercial performance: launch/lifetime sales estimates, "
-            "notable chart positions or publisher statements\n"
-            "Use real numbers. Be brief."
-        )
-        p2 = (
-            f"Research the video game \"{game_title}\". Concise factual report covering:\n"
-            "1. Gameplay: core mechanics (5-6 bullets), approximate game length, "
-            "multiplayer/co-op features\n"
-            "2. Post-launch: DLC names/prices/reception, major patches\n"
-            "3. Market context: competitors in the same window, "
-            "comparison to prior franchise entries, any notable controversies\n"
-            "Use real numbers. Be brief."
-        )
-
-        # Sequential calls - safer on rate limits than parallel
-        part1 = _call(p1)
-        part2 = _call(p2)
-
-        parts, warnings = [], []
-        for label, result in [("Reception & Sales", part1), ("Gameplay & Context", part2)]:
-            if result.startswith("[Web search error"):
-                warnings.append(f"{label}: {result}")
-            else:
-                parts.append(f"=== {label} ===\n{result}")
-
-        combined = "\n\n".join(parts)
-        if warnings and not combined:
-            return "[Web search error: " + "; ".join(warnings) + "]"
-        if warnings:
-            combined += "\n\n[Note: partial errors \u2014 " + "; ".join(warnings) + "]"
-        return combined or "[No research results returned]"
 
 
     # ── Poll futures with heartbeat so Streamlit never blocks ────────────────
@@ -1209,15 +1187,32 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
                 else:
                     research_done = True
                     res = fut.result()
-                    if "[Web search error" in res or "[Web search disabled" in res or "[No reference" in res:
+                    is_error   = "[Web search error" in res
+                    is_timeout = "timed out after" in res
+                    is_fallback = any(x in res for x in (
+                        "[Web search disabled", "[No reference", "[No web results",
+                        "timed out after", "[No results"
+                    ))
+                    if is_error and not is_timeout:
                         research_text = res
-                        yield ("log", f"⚠️ <b>Web research note:</b> {res}")
+                        yield ("log", f"⚠️ <b>Web research error</b> — {res}<br>"
+                               "<span class='log-detail'>The analysis will proceed using "
+                               "Claude's training knowledge for this title.</span>")
+                    elif is_fallback:
+                        research_text = res
+                        yield ("log", (
+                            "⚠️ <b>Web search timed out</b> — falling back to model training knowledge "
+                            f"for <i>{game_title}</i><br>"
+                            "<span class='log-detail'>Claude has extensive knowledge of most "
+                            "released games from training data. The analysis will still be "
+                            "data-rich; it just won't include the very latest web sources.</span>"
+                        ))
                     else:
                         research_text = res
                         word_count    = len(res.split())
                         yield ("log", (
-                            "✅ <b>Web research complete</b> — ~{} words of competitive intelligence on <i>{}</i><br>"
-                            "<span class='log-detail'>Claude searched the web and compiled key facts: "
+                            "✅ <b>Web research complete</b> — ~{} words on <i>{}</i><br>"
+                            "<span class='log-detail'>Claude searched the web and compiled: "
                             "review scores, sales data, gameplay mechanics, and player reception. "
                             "This will be used as the benchmark in the comparison slides.</span>"
                         ).format(word_count, game_title))
@@ -1237,8 +1232,9 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
                 if still_doing:
                     yield ("spinner", (
                         "⏳ <b>Still working…</b> " + " &amp; ".join(still_doing) + "<br>"
-                        "<span class='log-detail'>Web searches can take 60–120 s for well-covered titles. "
-                        "The pipeline has not stalled — results will appear when ready.</span>"
+                        "<span class='log-detail'>Web search has a 90s hard limit — if it times out, "
+                        "the analysis will automatically use Claude's training knowledge instead. "
+                        "The pipeline will not hang.</span>"
                     ))
 
 
