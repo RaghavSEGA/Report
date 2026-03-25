@@ -3,67 +3,21 @@ import anthropic
 import json
 import os
 import tempfile
-import subprocess
-import shutil
-import base64
-import pandas as pd
-import pypdf
 import io
 import time
 import hashlib
 import hmac
 import random
+import base64
 import requests
-
-
-# ── Node.js resolution ───────────────────────────────────────
-# Streamlit may run in a stripped PATH. Locate node + the npm
-# global module directory at startup so subprocess calls work.
-def _find_node() -> str:
-    """Return the absolute path to the node binary."""
-    # 1. Already on PATH
-    found = shutil.which("node")
-    if found:
-        return found
-    # 2. Common install locations
-    for candidate in ["/usr/bin/node", "/usr/local/bin/node",
-                      "/opt/homebrew/bin/node", "/usr/bin/nodejs"]:
-        if os.path.isfile(candidate):
-            return candidate
-    raise FileNotFoundError(
-        "node binary not found. Install Node.js and ensure it is on PATH."
-    )
-
-
-def _npm_global_modules() -> str:
-    """Return the npm global node_modules path (for NODE_PATH)."""
-    # Try asking npm, fall back to the standard location
-    try:
-        result = subprocess.run(
-            [_find_node(), "-e", "console.log(require('path').join(process.env.npm_config_prefix||'', 'lib','node_modules'))"],
-            capture_output=True, text=True, timeout=10,
-        )
-        path = result.stdout.strip()
-        if path and os.path.isdir(path):
-            return path
-    except Exception:
-        pass
-    # npm -g root
-    try:
-        npm = shutil.which("npm") or "/usr/bin/npm"
-        result = subprocess.run([npm, "root", "-g"], capture_output=True, text=True, timeout=10)
-        path = result.stdout.strip()
-        if path and os.path.isdir(path):
-            return path
-    except Exception:
-        pass
-    # Hardcoded fallback for this environment
-    fallback = os.path.expanduser("~/.npm-global/lib/node_modules")
-    return fallback
-
-
-NODE_BIN        = _find_node()
-NODE_MODULES    = _npm_global_modules()
+import pandas as pd
+import pypdf
+from pptx import Presentation
+from pptx.util import Inches, Pt, Emu
+from pptx.dml.color import RGBColor
+from pptx.enum.text import PP_ALIGN
+from pptx.oxml.ns import qn
+from lxml import etree
 
 st.set_page_config(
     page_title="SEGA Intelligence Analyzer",
@@ -524,183 +478,305 @@ def extract_text_from_file(uploaded_file) -> str:
     return content
 
 
-def build_js_script(data_file: str, output_file: str) -> str:
-    return f"""
-const pptxgen = require("pptxgenjs");
-const fs = require("fs");
 
-const raw = fs.readFileSync("{data_file}", "utf8");
-const data = JSON.parse(raw);
-const theme = data.theme || {{}};
+# ─────────────────────────────────────────────────────────────
+# PPTX GENERATION — pure python-pptx (no Node.js required)
+# ─────────────────────────────────────────────────────────────
 
-const C = {{
-  bg:       theme.background || "040A1C",
-  primary:  theme.primary    || "0055AA",
-  accent:   theme.accent     || "00AADD",
-  white:    theme.text_light || "FFFFFF",
-  dark:     theme.text_dark  || "0A0A1A",
-  gold:     "F5C842",  subtle:"1A2A4A",  midgray:"8899BB",
-  green:    "00BB66",  red:"CC2244",     neutral:"AABBCC",
-  header_bg:"0033AA",
-}};
+def _rgb(hex_str: str) -> RGBColor:
+    h = hex_str.lstrip("#")
+    return RGBColor(int(h[0:2],16), int(h[2:4],16), int(h[4:6],16))
 
-const pres = new pptxgen();
-pres.layout = "LAYOUT_WIDE";
-pres.title  = data.title || "SEGA Analysis";
-const W = 13.3, H = 7.5;
+# Slide canvas: 13.3 × 7.5 inches (LAYOUT_WIDE)
+W_IN, H_IN = 13.3, 7.5
 
-function addChrome(slide, n, total) {{
-  slide.addShape(pres.shapes.RECTANGLE,{{x:0,y:0,w:W,h:0.12,fill:{{color:C.accent}},line:{{type:"none"}}}});
-  slide.addShape(pres.shapes.RECTANGLE,{{x:0,y:H-0.38,w:W,h:0.38,fill:{{color:C.header_bg}},line:{{type:"none"}}}});
-  slide.addText("SEGA INTELLIGENCE ANALYZER",{{x:0.3,y:H-0.32,w:5,h:0.28,fontSize:7,color:"8899BB",fontFace:"Calibri",align:"left",valign:"middle",bold:true,charSpacing:3}});
-  slide.addText(`${{n}} / ${{total}}`,{{x:W-1.5,y:H-0.32,w:1.2,h:0.28,fontSize:8,color:C.neutral,fontFace:"Calibri",align:"right",valign:"middle"}});
-  slide.addShape(pres.shapes.RECTANGLE,{{x:W-0.12,y:0,w:0.12,h:H,fill:{{color:C.primary}},line:{{type:"none"}}}});
-}}
+def _in(v):  return Inches(v)
+def _pt(v):  return Pt(v)
 
-function makeTitleSlide(sl,s,i,t){{
-  sl.background={{color:C.bg}};
-  sl.addShape(pres.shapes.RECTANGLE,{{x:7.5,y:0,w:5.8,h:H,fill:{{color:C.primary}},line:{{type:"none"}}}});
-  sl.addShape(pres.shapes.RECTANGLE,{{x:6.8,y:0,w:1.0,h:H,fill:{{color:C.accent,transparency:60}},line:{{type:"none"}}}});
-  sl.addText("SEGA",{{x:8,y:0.6,w:4.8,h:0.9,fontSize:52,bold:true,color:C.white,fontFace:"Arial Black",align:"center",charSpacing:12}});
-  sl.addShape(pres.shapes.RECTANGLE,{{x:8.3,y:1.55,w:4.2,h:0.04,fill:{{color:C.accent}},line:{{type:"none"}}}});
-  sl.addText("INTELLIGENCE ANALYZER",{{x:8,y:1.6,w:4.8,h:0.4,fontSize:9,color:C.accent,fontFace:"Calibri",align:"center",charSpacing:4}});
-  sl.addText(s.title||pres.title,{{x:0.6,y:1.8,w:6.8,h:2.4,fontSize:36,bold:true,color:C.white,fontFace:"Calibri",align:"left",valign:"middle",wrap:true}});
-  if(s.subtitle) sl.addText(s.subtitle,{{x:0.6,y:4.3,w:6.6,h:0.6,fontSize:16,color:C.accent,fontFace:"Calibri",italic:true}});
-  if(s.body)     sl.addText(s.body,{{x:0.6,y:5.0,w:6.6,h:1.5,fontSize:13,color:C.midgray,fontFace:"Calibri",wrap:true}});
-  addChrome(sl,i+1,t);
-}}
-
-function makeSectionSlide(sl,s,i,t){{
-  sl.background={{color:C.bg}};
-  sl.addShape(pres.shapes.RECTANGLE,{{x:0,y:0,w:0.3,h:H,fill:{{color:C.accent}},line:{{type:"none"}}}});
-  sl.addText(s.title,{{x:0.9,y:2.5,w:11,h:1.5,fontSize:42,bold:true,color:C.white,fontFace:"Calibri"}});
-  if(s.subtitle) sl.addText(s.subtitle,{{x:0.9,y:4.2,w:10,h:0.6,fontSize:20,color:C.accent,fontFace:"Calibri",italic:true}});
-  addChrome(sl,i+1,t);
-}}
-
-function makeBulletsSlide(sl,s,i,t){{
-  sl.background={{color:C.bg}};
-  sl.addShape(pres.shapes.RECTANGLE,{{x:0,y:0.12,w:W,h:1.0,fill:{{color:C.subtle}},line:{{type:"none"}}}});
-  sl.addShape(pres.shapes.RECTANGLE,{{x:0,y:0.12,w:0.18,h:1.0,fill:{{color:C.accent}},line:{{type:"none"}}}});
-  sl.addText(s.title,{{x:0.4,y:0.18,w:W-0.6,h:0.88,fontSize:24,bold:true,color:C.white,fontFace:"Calibri",valign:"middle"}});
-  const bullets=(s.bullets||[]);
-  const items=bullets.map((b,j)=>[
-    {{text:"▸ ",options:{{color:C.accent,bold:true,fontSize:15}}}},
-    {{text:b,   options:{{color:C.white, fontSize:15,breakLine:j<bullets.length-1}}}}
-  ]).flat();
-  if(items.length) sl.addText(items,{{x:0.5,y:1.4,w:W-1.2,h:H-2.1,fontFace:"Calibri",valign:"top",wrap:true,paraSpaceAfter:10}});
-  if(s.body) sl.addText(s.body,{{x:0.5,y:H-1.5,w:W-1.0,h:1.0,fontSize:12,color:C.midgray,fontFace:"Calibri",italic:true,wrap:true}});
-  addChrome(sl,i+1,t);
-}}
-
-function makeStatsSlide(sl,s,i,t){{
-  sl.background={{color:C.bg}};
-  sl.addShape(pres.shapes.RECTANGLE,{{x:0,y:0.12,w:W,h:1.0,fill:{{color:C.subtle}},line:{{type:"none"}}}});
-  sl.addShape(pres.shapes.RECTANGLE,{{x:0,y:0.12,w:0.18,h:1.0,fill:{{color:C.gold}},line:{{type:"none"}}}});
-  sl.addText(s.title,{{x:0.4,y:0.18,w:W-0.6,h:0.88,fontSize:24,bold:true,color:C.white,fontFace:"Calibri",valign:"middle"}});
-  const stats=s.stats||[];
-  const cols=Math.min(stats.length,4), boxW=(W-1.2)/cols;
-  stats.forEach((stat,j)=>{{
-    if(j>=4)return;
-    const x=0.6+j*(boxW+0.12);
-    sl.addShape(pres.shapes.RECTANGLE,{{x,y:1.4,w:boxW,h:2.8,fill:{{color:C.subtle}},line:{{color:C.primary,pt:1}}}});
-    sl.addText(stat.value||"—",{{x:x+0.1,y:1.7, w:boxW-0.2,h:1.2,fontSize:38,bold:true,color:C.accent, fontFace:"Calibri",align:"center",valign:"middle"}});
-    sl.addText(stat.label||"",{{x:x+0.1,y:2.95,w:boxW-0.2,h:0.7,fontSize:13,color:C.white,  fontFace:"Calibri",align:"center",wrap:true,bold:true}});
-    if(stat.note) sl.addText(stat.note,{{x:x+0.1,y:3.65,w:boxW-0.2,h:0.45,fontSize:9,color:C.midgray,fontFace:"Calibri",align:"center",wrap:true}});
-  }});
-  if(s.body) sl.addText(s.body,{{x:0.5,y:H-1.6,w:W-1.0,h:1.0,fontSize:12,color:C.midgray,fontFace:"Calibri",italic:true,wrap:true}});
-  addChrome(sl,i+1,t);
-}}
-
-function makeComparisonSlide(sl,s,i,t){{
-  sl.background={{color:C.bg}};
-  sl.addShape(pres.shapes.RECTANGLE,{{x:0,y:0.12,w:W,h:1.0,fill:{{color:C.subtle}},line:{{type:"none"}}}});
-  sl.addShape(pres.shapes.RECTANGLE,{{x:0,y:0.12,w:0.18,h:1.0,fill:{{color:C.accent}},line:{{type:"none"}}}});
-  sl.addText(s.title,{{x:0.4,y:0.18,w:W-0.6,h:0.88,fontSize:22,bold:true,color:C.white,fontFace:"Calibri",valign:"middle"}});
-  const cmp=s.comparison||{{}},rows=cmp.rows||[];
-  const colW=3.8,labelW=2.8,leftX=0.5,midX=leftX+labelW+0.1,rightX=midX+colW+0.1,startY=1.35,rowH=0.48;
-  [[cmp.left_title||"Internal",C.primary],[cmp.right_title||"Reference",C.gold]].forEach(([title,col],ci)=>{{
-    const x=ci===0?midX:rightX;
-    sl.addShape(pres.shapes.RECTANGLE,{{x,y:startY,w:colW,h:0.42,fill:{{color:col}},line:{{type:"none"}}}});
-    sl.addText(title,{{x:x+0.1,y:startY,w:colW-0.2,h:0.42,fontSize:11,bold:true,color:C.white,fontFace:"Calibri",align:"center",valign:"middle"}});
-  }});
-  rows.slice(0,10).forEach((row,ri)=>{{
-    const y=startY+0.44+ri*rowH;
-    sl.addShape(pres.shapes.RECTANGLE,{{x:leftX,y,w:labelW+colW*2+0.22,h:rowH-0.04,fill:{{color:ri%2===0?"0D1530":"111E3A"}},line:{{type:"none"}}}});
-    sl.addText(row.label||"",{{x:leftX+0.1,y,w:labelW-0.2,h:rowH,fontSize:10,color:C.midgray,fontFace:"Calibri",valign:"middle",bold:true}});
-    sl.addText(row.left||"—",{{x:midX+0.1,y,w:colW-0.2,h:rowH,fontSize:10,color:C.white,fontFace:"Calibri",align:"center",valign:"middle",wrap:true}});
-    const dc=(row.delta||"").toLowerCase()==="positive"?C.green:(row.delta||"").toLowerCase()==="negative"?C.red:C.neutral;
-    sl.addText(row.right||"—",{{x:rightX+0.1,y,w:colW-0.2,h:rowH,fontSize:10,color:dc,fontFace:"Calibri",align:"center",valign:"middle",wrap:true}});
-  }});
-  addChrome(sl,i+1,t);
-}}
-
-function makeRecommendationSlide(sl,s,i,t){{
-  sl.background={{color:C.bg}};
-  sl.addShape(pres.shapes.RECTANGLE,{{x:0,y:0.12,w:W,h:1.0,fill:{{color:C.subtle}},line:{{type:"none"}}}});
-  sl.addShape(pres.shapes.RECTANGLE,{{x:0,y:0.12,w:0.18,h:1.0,fill:{{color:C.green}},line:{{type:"none"}}}});
-  sl.addText(s.title,{{x:0.4,y:0.18,w:W-0.6,h:0.88,fontSize:24,bold:true,color:C.white,fontFace:"Calibri",valign:"middle"}});
-  (s.bullets||[]).slice(0,6).forEach((b,j)=>{{
-    const y=1.5+j*0.9;
-    sl.addShape(pres.shapes.RECTANGLE,{{x:0.5,y,w:W-1.2,h:0.78,fill:{{color:C.subtle}},line:{{color:C.green,pt:1}}}});
-    sl.addShape(pres.shapes.OVAL,{{x:0.6,y:y+0.14,w:0.48,h:0.48,fill:{{color:C.green}},line:{{type:"none"}}}});
-    sl.addText(String(j+1),{{x:0.6,y:y+0.14,w:0.48,h:0.48,fontSize:14,bold:true,color:C.dark,fontFace:"Calibri",align:"center",valign:"middle"}});
-    sl.addText(b,{{x:1.22,y:y+0.08,w:W-2.0,h:0.6,fontSize:13,color:C.white,fontFace:"Calibri",valign:"middle",wrap:true}});
-  }});
-  addChrome(sl,i+1,t);
-}}
-
-function makeClosingSlide(sl,s,i,t){{
-  sl.background={{color:C.bg}};
-  sl.addShape(pres.shapes.RECTANGLE,{{x:0,y:H/2-0.05,w:W,h:0.1,fill:{{color:C.accent}},line:{{type:"none"}}}});
-  sl.addShape(pres.shapes.RECTANGLE,{{x:0,y:0,w:0.3,h:H,fill:{{color:C.accent}},line:{{type:"none"}}}});
-  sl.addText(s.title,{{x:0.9,y:2.0,w:11,h:1.6,fontSize:40,bold:true,color:C.white,fontFace:"Calibri"}});
-  if(s.subtitle) sl.addText(s.subtitle,{{x:0.9,y:3.8,w:10,h:0.6,fontSize:18,color:C.accent,fontFace:"Calibri",italic:true}});
-  if(s.body)     sl.addText(s.body,{{x:0.9,y:4.5,w:10,h:1.5,fontSize:13,color:C.midgray,fontFace:"Calibri",wrap:true}});
-  sl.addText("SEGA  •  CONFIDENTIAL",{{x:0.9,y:H-0.8,w:6,h:0.4,fontSize:9,color:C.midgray,fontFace:"Calibri",bold:true,charSpacing:3}});
-  addChrome(sl,i+1,t);
-}}
-
-const slides=data.slides||[], total=slides.length;
-slides.forEach((s,i)=>{{
-  const sl=pres.addSlide(), type=(s.type||"bullets").toLowerCase();
-  if     (type==="title")          makeTitleSlide(sl,s,i,total);
-  else if(type==="section")        makeSectionSlide(sl,s,i,total);
-  else if(type==="comparison")     makeComparisonSlide(sl,s,i,total);
-  else if(type==="stats")          makeStatsSlide(sl,s,i,total);
-  else if(type==="recommendation") makeRecommendationSlide(sl,s,i,total);
-  else if(type==="closing")        makeClosingSlide(sl,s,i,total);
-  else                             makeBulletsSlide(sl,s,i,total);
-  if(s.speaker_notes) sl.addNotes(s.speaker_notes);
-}});
-
-pres.writeFile({{fileName:"{output_file}"}})
-  .then(()=>console.log("done"))
-  .catch(e=>{{console.error(e);process.exit(1);}});
-"""
-
-
-def generate_pptx(slide_data: dict) -> str:
-    tmp_dir     = tempfile.mkdtemp()
-    data_file   = os.path.join(tmp_dir, "slide_data.json")
-    output_file = os.path.join(tmp_dir, "output.pptx")
-    script_file = os.path.join(tmp_dir, "gen_pptx.js")
-    with open(data_file, "w") as f:
-        json.dump(slide_data, f, indent=2)
-    with open(script_file, "w") as f:
-        f.write(build_js_script(data_file, output_file))
-    env = os.environ.copy()
-    existing_np = env.get("NODE_PATH", "")
-    env["NODE_PATH"] = (NODE_MODULES + os.pathsep + existing_np) if existing_np else NODE_MODULES
-    result = subprocess.run(
-        [NODE_BIN, script_file],
-        capture_output=True, text=True, timeout=60, env=env,
+def _rect(slide, x, y, w, h, fill_hex, alpha=None):
+    shape = slide.shapes.add_shape(
+        1,  # MSO_SHAPE_TYPE.RECTANGLE
+        _in(x), _in(y), _in(w), _in(h)
     )
-    if result.returncode != 0:
-        raise RuntimeError(f"pptxgenjs error:\n{result.stderr}\n{result.stdout}")
-    if not os.path.exists(output_file):
-        raise FileNotFoundError("PPTX was not created")
-    return output_file
+    shape.line.fill.background()
+    if fill_hex:
+        shape.fill.solid()
+        shape.fill.fore_color.rgb = _rgb(fill_hex)
+    if alpha is not None:
+        # alpha 0-100 (0=opaque, 100=transparent in pptx land)
+        shape.fill.fore_color._element.getparent().getparent()  # noop touch
+    shape.line.fill.background()
+    return shape
+
+def _add_text(slide, text, x, y, w, h,
+              size=12, bold=False, italic=False, color="FFFFFF",
+              align=PP_ALIGN.LEFT, wrap=True, font_name="Calibri"):
+    txb = slide.shapes.add_textbox(_in(x), _in(y), _in(w), _in(h))
+    tf  = txb.text_frame
+    tf.word_wrap = wrap
+    p   = tf.paragraphs[0]
+    p.alignment = align
+    run = p.add_run()
+    run.text = str(text)
+    run.font.size  = _pt(size)
+    run.font.bold  = bold
+    run.font.italic = italic
+    run.font.color.rgb = _rgb(color)
+    run.font.name  = font_name
+    return txb
+
+def _chrome(slide, idx, total, C):
+    """Top stripe, bottom bar, page number, right edge accent."""
+    _rect(slide, 0, 0,       W_IN, 0.1,  C["accent"])
+    _rect(slide, 0, H_IN-0.36, W_IN, 0.36, C["header_bg"])
+    _add_text(slide, "SEGA INTELLIGENCE ANALYZER",
+              0.3, H_IN-0.30, 5, 0.24,
+              size=7, bold=True, color=C["midgray"],
+              font_name="Calibri")
+    _add_text(slide, f"{idx} / {total}",
+              W_IN-1.4, H_IN-0.30, 1.1, 0.24,
+              size=8, color=C["neutral"], align=PP_ALIGN.RIGHT,
+              font_name="Calibri")
+    _rect(slide, W_IN-0.1, 0, 0.1, H_IN, C["primary"])
+
+def _set_bg(slide, hex_color):
+    bg   = slide.background
+    fill = bg.fill
+    fill.solid()
+    fill.fore_color.rgb = _rgb(hex_color)
+
+def _add_bullets(slide, bullets, x, y, w, h, bullet_color, text_color,
+                 size=13, font_name="Calibri"):
+    if not bullets:
+        return
+    txb = slide.shapes.add_textbox(_in(x), _in(y), _in(w), _in(h))
+    tf  = txb.text_frame
+    tf.word_wrap = True
+    first = True
+    for b in bullets:
+        p = tf.paragraphs[0] if first else tf.add_paragraph()
+        first = False
+        # bullet marker
+        r1 = p.add_run()
+        r1.text = "▸ "
+        r1.font.color.rgb = _rgb(bullet_color)
+        r1.font.bold  = True
+        r1.font.size  = _pt(size)
+        r1.font.name  = font_name
+        # bullet text
+        r2 = p.add_run()
+        r2.text = b
+        r2.font.color.rgb = _rgb(text_color)
+        r2.font.size  = _pt(size)
+        r2.font.name  = font_name
+
+# ── Slide type renderers ──────────────────────────────────────
+
+def _slide_title(slide, s, idx, total, C):
+    _set_bg(slide, C["bg"])
+    _rect(slide, 7.4, 0, 5.9, H_IN, C["primary"])
+    # SEGA wordmark
+    _add_text(slide, "SEGA", 8.0, 0.55, 4.8, 0.9,
+              size=52, bold=True, color=C["white"], font_name="Arial Black",
+              align=PP_ALIGN.CENTER)
+    _rect(slide, 8.3, 1.52, 4.2, 0.05, C["accent"])
+    _add_text(slide, "INTELLIGENCE ANALYZER", 8.0, 1.58, 4.8, 0.38,
+              size=9, color=C["accent"], align=PP_ALIGN.CENTER, font_name="Calibri")
+    # Main title
+    _add_text(slide, s.get("title",""), 0.6, 1.8, 6.8, 2.2,
+              size=34, bold=True, color=C["white"], font_name="Calibri")
+    if s.get("subtitle"):
+        _add_text(slide, s["subtitle"], 0.6, 4.2, 6.6, 0.6,
+                  size=16, italic=True, color=C["accent"], font_name="Calibri")
+    if s.get("body"):
+        _add_text(slide, s["body"], 0.6, 4.95, 6.6, 1.4,
+                  size=12, color=C["midgray"], font_name="Calibri")
+    _chrome(slide, idx, total, C)
+
+def _slide_section(slide, s, idx, total, C):
+    _set_bg(slide, C["bg"])
+    _rect(slide, 0, 0, 0.28, H_IN, C["accent"])
+    _add_text(slide, s.get("title",""), 0.55, 2.3, 12.0, 1.6,
+              size=40, bold=True, color=C["white"], font_name="Calibri")
+    if s.get("subtitle"):
+        _add_text(slide, s["subtitle"], 0.55, 4.1, 11.0, 0.65,
+                  size=19, italic=True, color=C["accent"], font_name="Calibri")
+    _chrome(slide, idx, total, C)
+
+def _slide_bullets(slide, s, idx, total, C):
+    _set_bg(slide, C["bg"])
+    _rect(slide, 0, 0.1, W_IN, 0.95, C["subtle"])
+    _rect(slide, 0, 0.1, 0.17, 0.95, C["accent"])
+    _add_text(slide, s.get("title",""), 0.38, 0.14, W_IN-0.6, 0.84,
+              size=22, bold=True, color=C["white"], font_name="Calibri")
+    _add_bullets(slide, s.get("bullets",[]),
+                 0.45, 1.2, W_IN-1.0, H_IN-2.0,
+                 bullet_color=C["accent"], text_color=C["white"],
+                 size=13)
+    if s.get("body"):
+        _add_text(slide, s["body"], 0.45, H_IN-1.45, W_IN-1.0, 1.0,
+                  size=11, italic=True, color=C["midgray"], font_name="Calibri")
+    _chrome(slide, idx, total, C)
+
+def _slide_stats(slide, s, idx, total, C):
+    _set_bg(slide, C["bg"])
+    _rect(slide, 0, 0.1, W_IN, 0.95, C["subtle"])
+    _rect(slide, 0, 0.1, 0.17, 0.95, C["gold"])
+    _add_text(slide, s.get("title",""), 0.38, 0.14, W_IN-0.6, 0.84,
+              size=22, bold=True, color=C["white"], font_name="Calibri")
+    stats = s.get("stats", [])[:4]
+    if stats:
+        box_w = (W_IN - 1.2) / len(stats)
+        for i, stat in enumerate(stats):
+            x = 0.6 + i * (box_w + 0.1)
+            _rect(slide, x, 1.3, box_w, 2.9, C["subtle"])
+            _add_text(slide, stat.get("value","—"),
+                      x+0.1, 1.55, box_w-0.2, 1.2,
+                      size=36, bold=True, color=C["accent"],
+                      align=PP_ALIGN.CENTER, font_name="Calibri")
+            _add_text(slide, stat.get("label",""),
+                      x+0.1, 2.85, box_w-0.2, 0.7,
+                      size=12, bold=True, color=C["white"],
+                      align=PP_ALIGN.CENTER, font_name="Calibri")
+            if stat.get("note"):
+                _add_text(slide, stat["note"],
+                          x+0.1, 3.6, box_w-0.2, 0.45,
+                          size=9, color=C["midgray"],
+                          align=PP_ALIGN.CENTER, font_name="Calibri")
+    if s.get("body"):
+        _add_text(slide, s["body"], 0.45, H_IN-1.5, W_IN-1.0, 1.0,
+                  size=11, italic=True, color=C["midgray"], font_name="Calibri")
+    _chrome(slide, idx, total, C)
+
+def _slide_comparison(slide, s, idx, total, C):
+    _set_bg(slide, C["bg"])
+    _rect(slide, 0, 0.1, W_IN, 0.95, C["subtle"])
+    _rect(slide, 0, 0.1, 0.17, 0.95, C["accent"])
+    _add_text(slide, s.get("title",""), 0.38, 0.14, W_IN-0.6, 0.84,
+              size=20, bold=True, color=C["white"], font_name="Calibri")
+    cmp    = s.get("comparison", {})
+    rows   = cmp.get("rows", [])
+    label_w = 2.8
+    col_w   = (W_IN - 1.0 - label_w) / 2
+    left_x  = 0.5
+    mid_x   = left_x + label_w + 0.05
+    right_x = mid_x + col_w + 0.05
+    start_y = 1.22
+    row_h   = 0.42
+    # Column headers
+    _rect(slide, mid_x,   start_y, col_w, row_h, C["primary"])
+    _rect(slide, right_x, start_y, col_w, row_h, C["gold"])
+    _add_text(slide, cmp.get("left_title","Internal"),
+              mid_x+0.05, start_y, col_w-0.1, row_h,
+              size=10, bold=True, color=C["white"], align=PP_ALIGN.CENTER)
+    _add_text(slide, cmp.get("right_title","Reference"),
+              right_x+0.05, start_y, col_w-0.1, row_h,
+              size=10, bold=True, color=C["white"], align=PP_ALIGN.CENTER)
+    for ri, row in enumerate(rows[:10]):
+        y   = start_y + row_h + ri * row_h
+        row_bg = "0D1530" if ri % 2 == 0 else "111E3A"
+        total_w = label_w + col_w * 2 + 0.1
+        _rect(slide, left_x, y, total_w, row_h - 0.04, row_bg)
+        _add_text(slide, row.get("label",""),
+                  left_x+0.08, y, label_w-0.12, row_h,
+                  size=9, bold=True, color=C["midgray"], font_name="Calibri")
+        _add_text(slide, row.get("left","—"),
+                  mid_x+0.05, y, col_w-0.1, row_h,
+                  size=9, color=C["white"], align=PP_ALIGN.CENTER, font_name="Calibri")
+        delta = (row.get("delta","") or "").lower()
+        dc = C["green"] if delta == "positive" else C["red"] if delta == "negative" else C["neutral"]
+        _add_text(slide, row.get("right","—"),
+                  right_x+0.05, y, col_w-0.1, row_h,
+                  size=9, color=dc, align=PP_ALIGN.CENTER, font_name="Calibri")
+    _chrome(slide, idx, total, C)
+
+def _slide_recommendation(slide, s, idx, total, C):
+    _set_bg(slide, C["bg"])
+    _rect(slide, 0, 0.1, W_IN, 0.95, C["subtle"])
+    _rect(slide, 0, 0.1, 0.17, 0.95, C["green"])
+    _add_text(slide, s.get("title",""), 0.38, 0.14, W_IN-0.6, 0.84,
+              size=22, bold=True, color=C["white"], font_name="Calibri")
+    for i, b in enumerate((s.get("bullets") or [])[:6]):
+        y = 1.3 + i * 0.88
+        _rect(slide, 0.45, y, W_IN-1.0, 0.76, C["subtle"])
+        # Numbered circle (just a coloured rect behind the number)
+        _rect(slide, 0.55, y+0.1, 0.5, 0.5, C["green"])
+        _add_text(slide, str(i+1), 0.55, y+0.1, 0.5, 0.5,
+                  size=14, bold=True, color="000000",
+                  align=PP_ALIGN.CENTER, font_name="Calibri")
+        _add_text(slide, b, 1.18, y+0.1, W_IN-1.8, 0.56,
+                  size=12, color=C["white"], font_name="Calibri")
+    _chrome(slide, idx, total, C)
+
+def _slide_closing(slide, s, idx, total, C):
+    _set_bg(slide, C["bg"])
+    _rect(slide, 0, H_IN/2 - 0.05, W_IN, 0.1,  C["accent"])
+    _rect(slide, 0, 0,              0.28, H_IN,  C["accent"])
+    _add_text(slide, s.get("title",""), 0.55, 1.8, 12.0, 1.6,
+              size=38, bold=True, color=C["white"], font_name="Calibri")
+    if s.get("subtitle"):
+        _add_text(slide, s["subtitle"], 0.55, 3.6, 11.0, 0.65,
+                  size=17, italic=True, color=C["accent"], font_name="Calibri")
+    if s.get("body"):
+        _add_text(slide, s["body"], 0.55, 4.4, 11.0, 1.5,
+                  size=12, color=C["midgray"], font_name="Calibri")
+    _add_text(slide, "SEGA  •  CONFIDENTIAL",
+              0.55, H_IN-0.75, 8, 0.38,
+              size=9, bold=True, color=C["midgray"], font_name="Calibri")
+    _chrome(slide, idx, total, C)
+
+
+def generate_pptx(slide_data: dict) -> bytes:
+    """Build a PPTX in memory with python-pptx. Returns raw bytes."""
+    from pptx.util import Inches, Emu
+
+    theme = slide_data.get("theme", {})
+    C = {
+        "bg":        theme.get("background", "040A1C"),
+        "primary":   theme.get("primary",    "0055AA"),
+        "accent":    theme.get("accent",     "00AADD"),
+        "white":     theme.get("text_light", "FFFFFF"),
+        "dark":      theme.get("text_dark",  "0A0A1A"),
+        "gold":      "F5C842",
+        "subtle":    "1A2A4A",
+        "midgray":   "8899BB",
+        "green":     "00BB66",
+        "red":       "CC2244",
+        "neutral":   "AABBCC",
+        "header_bg": "0033AA",
+    }
+
+    prs = Presentation()
+    # 13.3 × 7.5 inches  (LAYOUT_WIDE equivalent)
+    prs.slide_width  = Inches(W_IN)
+    prs.slide_height = Inches(H_IN)
+
+    # Blank layout (index 6 is always blank in the default template)
+    blank_layout = prs.slide_layouts[6]
+
+    slides_data = slide_data.get("slides", [])
+    total       = len(slides_data)
+
+    RENDERERS = {
+        "title":          _slide_title,
+        "section":        _slide_section,
+        "bullets":        _slide_bullets,
+        "stats":          _slide_stats,
+        "comparison":     _slide_comparison,
+        "recommendation": _slide_recommendation,
+        "closing":        _slide_closing,
+    }
+
+    for idx, s in enumerate(slides_data, start=1):
+        slide    = prs.slides.add_slide(blank_layout)
+        stype    = (s.get("type") or "bullets").lower()
+        renderer = RENDERERS.get(stype, _slide_bullets)
+        renderer(slide, s, idx, total, C)
+
+    buf = io.BytesIO()
+    prs.save(buf)
+    buf.seek(0)
+    return buf.read()
 
 
 def _api_post(headers: dict, payload: dict, timeout: int = 120, max_retries: int = 4) -> dict:
@@ -886,14 +962,14 @@ Return ONLY the JSON object — no markdown, no explanation."""
     # Step 4 — generate PPTX
     yield ("log", "🖥️ Generating PPTX…")
     try:
-        pptx_path = generate_pptx(slide_data)
+        pptx_bytes_out = generate_pptx(slide_data)
     except Exception as e:
         yield ("error", f"PPTX generation error: {e}")
         return
 
     yield ("step_done", "generate")
     yield ("log", "✅ PPTX ready!")
-    yield ("pptx_path", pptx_path)
+    yield ("pptx_bytes_out", pptx_bytes_out)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -935,11 +1011,9 @@ if run_btn:
                     elif etype == "slide_data":
                         st.session_state["slide_data"] = event[1]
 
-                    elif etype == "pptx_path":
-                        with open(event[1], "rb") as f:
-                            pptx_bytes = f.read()
+                    elif etype == "pptx_bytes_out":
                         fname = f"SEGA_Analysis_{(game_title or 'Report').replace(' ','_')}.pptx"
-                        st.session_state["pptx_bytes"]    = pptx_bytes
+                        st.session_state["pptx_bytes"]    = event[1]
                         st.session_state["pptx_filename"] = fname
 
                     elif etype == "error":
