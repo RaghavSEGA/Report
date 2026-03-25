@@ -695,9 +695,10 @@ def _set_bg(slide, hex_color):
     fill.fore_color.rgb = _rgb(hex_color)
 
 def _add_bullets(slide, bullets, x, y, w, h, bullet_color, text_color,
-                 size=13, font_name=C["body_font"]):
+                 size=13, font_name=None):
     if not bullets:
         return
+    font_name = font_name or "Calibri"   # resolved at call time, not definition time
     txb = slide.shapes.add_textbox(_in(x), _in(y), _in(w), _in(h))
     _lock_txb(txb)  # prevent white-box inheritance
     tf  = txb.text_frame
