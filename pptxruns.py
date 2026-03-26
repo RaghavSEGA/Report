@@ -1514,10 +1514,13 @@ def _generate_from_template(slide_data: dict, template_bytes: bytes) -> bytes:
             CW = W - CX - 0.15 # content width
             CY = 0.45          # top edge
 
-            # Write title into SUBJECT sidebar
+            # Write title into SUBJECT sidebar — truncate to prevent overflow
             subj = _subject_shape(new_slide)
             if subj:
-                _set_text(subj, s.get("title", ""))
+                sidebar_text = s.get("title", "")
+                if len(sidebar_text) > 28:
+                    sidebar_text = sidebar_text[:26] + "…"
+                _set_text(subj, sidebar_text)
 
             if stype in ("bullets", "recommendation", "section"):
                 # Section header + rule (add rule BEFORE bullets — it's a background element)
@@ -1530,7 +1533,8 @@ def _generate_from_template(slide_data: dict, template_bytes: bytes) -> bytes:
                     y = CY + 0.75 + bi * 0.72
                     _txb(CX, y, CW, 0.65, f"▸  {bullet}", size=13, color=TEXT)
                 if s.get("body"):
-                    _txb(CX, H-1.1, CW, 0.5, s["body"], size=10, italic=True, color=MUTED)
+                    # Place body text as a subtitle line under the title, not at the bottom
+                    _txb(CX, CY + 0.65, CW, 0.55, s["body"], size=11, italic=True, color=MUTED)
 
             elif stype == "stats":
                 _txb(CX, CY, CW, 0.5, s.get("title",""),
@@ -1654,7 +1658,7 @@ def _generate_from_template(slide_data: dict, template_bytes: bytes) -> bytes:
             # the SUBJECT sidebar (rotated label), clear it if no title
             subj = _subject_shape(new_slide)
             if subj:
-                _set_text(subj, s.get("title", ""))
+                _set_text(subj, s.get("title","")[:26]+"…" if len(s.get("title",""))>28 else s.get("title",""))
             # Also check for explicit HEADLINE shape (other templates may have it)
             for shape in new_slide.shapes:
                 if shape.has_text_frame:
@@ -1762,7 +1766,7 @@ def _generate_from_template(slide_data: dict, template_bytes: bytes) -> bytes:
             )
             subj = _subject_shape(new_slide)
             if subj:
-                _set_text(subj, s.get("title", ""))
+                _set_text(subj, s.get("title","")[:26]+"…" if len(s.get("title",""))>28 else s.get("title",""))
             for shape in new_slide.shapes:
                 if shape.has_text_frame:
                     t = shape.text_frame.text.strip()
@@ -1799,6 +1803,23 @@ def _generate_from_template(slide_data: dict, template_bytes: bytes) -> bytes:
                     _set_text(shape, subtitle_text)
                 elif t.isdigit() or "presentation template" in t.lower():
                     _set_text(shape, "")
+            # Add subtitle as a visible overlay on the blue content area
+            if subtitle_text:
+                from pptx.util import Inches as _InC, Pt as _PtC
+                from pptx.dml.color import RGBColor as _RGBC
+                stb = new_slide.shapes.add_textbox(
+                    _InC(1.3), _InC(H * 0.62), _InC(W - 2.0), _InC(0.6)
+                )
+                stf = stb.text_frame
+                stf.word_wrap = True
+                sp = stf.paragraphs[0]
+                from pptx.enum.text import PP_ALIGN as _PPAC
+                sp.alignment = _PPAC.CENTER
+                sr = sp.add_run()
+                sr.text = subtitle_text
+                sr.font.size = _PtC(18)
+                sr.font.color.rgb = _RGBC(0xFF, 0xFF, 0xFF)
+                sr.font.bold = False
 
     for s in slides_data:
         stype = (s.get("type") or "bullets").lower()
