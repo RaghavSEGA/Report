@@ -2337,14 +2337,15 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
     def _web_research_one(title: str) -> str:
         """
         Fetch competitive intel for a single game title.
-        Uses a thread future for a hard 90s wall-clock deadline.
+        Already runs inside a thread from the outer pool — no nested executor needed.
+        httpx.Timeout enforces the wall-clock deadline directly.
         """
         if not web_search_en:
             return f"[Web search disabled — using model knowledge for '{title}']"
 
         import httpx
 
-        HARD_TIMEOUT = 90   # true wall-clock deadline enforced via thread future
+        HARD_TIMEOUT = 110   # httpx read timeout — enough for web search tool responses
 
         prompt = (
             f"Research the video game \"{title}\" for an executive competitive analysis presentation. "
@@ -2372,67 +2373,45 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
             "messages": [{"role": "user", "content": prompt}],
         }
 
-        import httpx
-        from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutTimeout
-
-        def _do_request():
-            """Runs in a background thread; may be abandoned after HARD_TIMEOUT."""
-            for _attempt in range(_RL_MAX_TRIES):
-                try:
-                    # Large socket timeout — wall-clock is enforced by future.result()
-                    resp = httpx.post(
-                        "https://api.anthropic.com/v1/messages",
-                        headers=headers,
-                        json=payload,
-                        timeout=httpx.Timeout(300, connect=10),
-                    )
-                    if resp.status_code == 429:
-                        if _attempt == _RL_MAX_TRIES - 1:
-                            return ("[Web search rate-limited. "
-                                    "The analysis will use Claude's training knowledge instead.]")
-                        try:
-                            wait = max(float(
-                                resp.headers.get("retry-after") or
-                                _RL_WAIT_BASE * (2 ** _attempt)
-                            ), 1.0)
-                        except (TypeError, ValueError):
-                            wait = _RL_WAIT_BASE * (2 ** _attempt)
-                        time.sleep(wait)
-                        continue
-                    resp.raise_for_status()
-                    blocks = resp.json().get("content", [])
-                    text = "\n".join(b.get("text","") for b in blocks if b.get("type")=="text")
-                    return text.strip() or f"[No web results for '{title}']"
-                except Exception as e:
-                    err = str(e).lower()
-                    if ("429" in err or "too many requests" in err) and _attempt < _RL_MAX_TRIES - 1:
-                        time.sleep(_RL_WAIT_BASE * (2 ** _attempt))
-                        continue
-                    return f"[Web search error: {e}]"
-            return "[Web search failed after retries]"
-
-        # Submit to a single-thread executor and impose a hard wall-clock limit.
-        # future.result(timeout=N) raises TimeoutError in THIS thread after N seconds
-        # regardless of what the background thread is doing — it doesn't block.
-        _ex  = ThreadPoolExecutor(max_workers=1)
-        _fut = _ex.submit(_do_request)
-        try:
-            return _fut.result(timeout=HARD_TIMEOUT)
-        except _FutTimeout:
-            # Background thread keeps running but we move on immediately
-            _ex.shutdown(wait=False)
-            return (
-                f"[Web search timed out after {HARD_TIMEOUT}s. "
-                f"The analysis will use Claude's training knowledge for '{title}' instead. "
-                "This is normal for popular titles with many search results.]"
-            )
-        except Exception as e:
-            _ex.shutdown(wait=False)
-            return f"[Web search error: {e}]"
-        finally:
-            _ex.shutdown(wait=False)
-
+        for _attempt in range(_RL_MAX_TRIES):
+            try:
+                resp = httpx.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers=headers,
+                    json=payload,
+                    timeout=httpx.Timeout(HARD_TIMEOUT, connect=10),
+                )
+                if resp.status_code == 429:
+                    if _attempt == _RL_MAX_TRIES - 1:
+                        return ("[Web search rate-limited. "
+                                "The analysis will use Claude's training knowledge instead.]")
+                    try:
+                        wait = max(float(
+                            resp.headers.get("retry-after") or
+                            _RL_WAIT_BASE * (2 ** _attempt)
+                        ), 1.0)
+                    except (TypeError, ValueError):
+                        wait = _RL_WAIT_BASE * (2 ** _attempt)
+                    time.sleep(wait)
+                    continue
+                resp.raise_for_status()
+                blocks = resp.json().get("content", [])
+                text = "\n".join(b.get("text", "") for b in blocks if b.get("type") == "text")
+                return text.strip() or f"[No web results for '{title}']"
+            except httpx.TimeoutException:
+                return (
+                    f"[Web search timed out after {HARD_TIMEOUT}s. "
+                    f"The analysis will use Claude's training knowledge for '{title}' instead. "
+                    "This is normal for popular titles with many search results.]"
+                )
+            except Exception as e:
+                err = str(e).lower()
+                if ("429" in err or "too many requests" in err) and _attempt < _RL_MAX_TRIES - 1:
+                    time.sleep(_RL_WAIT_BASE * (2 ** _attempt))
+                    continue
+                return f"[Web search error: {e}]"
         return "[Web search failed after retries — using training knowledge.]"
+
 
     # ── Poll futures with heartbeat so Streamlit never blocks ────────────────
     # One future per game title (parallel searches) + one for doc extraction.
