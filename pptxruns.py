@@ -2337,85 +2337,97 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
     def _web_research_one(title: str) -> str:
         """
         Fetch competitive intel for a single game title.
-        Already runs inside a thread from the outer pool — no nested executor needed.
-        httpx.Timeout enforces the wall-clock deadline directly.
+        Runs the blocking httpx.post() in a daemon thread and enforces a hard
+        wall-clock deadline via future.result(timeout=HARD_TIMEOUT). This fires
+        even if the server is dribbling bytes and the socket never goes idle.
         """
         if not web_search_en:
             return f"[Web search disabled — using model knowledge for '{title}']"
 
         import httpx
+        from concurrent.futures import ThreadPoolExecutor as _TPE, TimeoutError as _FTE
 
-        HARD_TIMEOUT = 110   # httpx read timeout — enough for web search tool responses
+        HARD_TIMEOUT = 90   # true wall-clock seconds — enforced by future.result()
 
         prompt = (
             f"Research the video game \"{title}\" for an executive competitive analysis presentation. "
-            "Search the web for current information and write a thorough structured report with these sections:\n\n"
-            "OVERVIEW: Developer, publisher, release date, platforms, genre, ESRB/PEGI rating, launch price.\n\n"
-            "CRITICAL RECEPTION: Metacritic score (critic + user), OpenCritic score, "
-            "scores from at least 3-4 named outlets (e.g. IGN, Eurogamer, GameSpot). "
-            "List 4 specific things reviewers praised and 4 specific things they criticised.\n\n"
-            "COMMERCIAL PERFORMANCE: Launch window sales figures, lifetime sales if available, "
-            "any sales milestones or statements from the publisher, chart positions.\n\n"
-            "GAMEPLAY & FEATURES: 6-7 core mechanics explained in 1-2 sentences each. "
-            "Main story length and completionist length. Multiplayer or co-op features.\n\n"
-            "POST-LAUNCH: Each DLC pack — name, price, release date, brief description, reception. "
-            "Major patches or updates.\n\n"
-            "MARKET CONTEXT: The 3-4 biggest competitor titles released in the same window. "
-            "How this game compares to the previous entry in its franchise. "
-            "Any notable controversies or cultural impact.\n\n"
-            "Use real numbers throughout. Aim for 700-900 words total."
+            "Search the web for current information and write a concise structured report covering:\n\n"
+            "OVERVIEW: Developer, publisher, release date, platforms, genre, launch price.\n\n"
+            "CRITICAL RECEPTION: Metacritic score (critic + user), scores from 2-3 named outlets. "
+            "3 things reviewers praised and 3 things they criticised.\n\n"
+            "COMMERCIAL PERFORMANCE: Launch sales figures, lifetime sales if available, chart positions.\n\n"
+            "GAMEPLAY & FEATURES: 4-5 core mechanics in 1-2 sentences each.\n\n"
+            "MARKET CONTEXT: 2-3 biggest competitor titles. How it compares to the previous franchise entry.\n\n"
+            "Use real numbers. Aim for 400-600 words total."
         )
 
         payload = {
             "model": model,
-            "max_tokens": 2500,
+            "max_tokens": 1800,
             "tools": [{"type": "web_search_20250305", "name": "web_search"}],
             "messages": [{"role": "user", "content": prompt}],
         }
 
-        for _attempt in range(_RL_MAX_TRIES):
-            try:
-                resp = httpx.post(
-                    "https://api.anthropic.com/v1/messages",
-                    headers=headers,
-                    json=payload,
-                    timeout=httpx.Timeout(HARD_TIMEOUT, connect=10),
-                )
-                if resp.status_code == 429:
-                    if _attempt == _RL_MAX_TRIES - 1:
-                        return ("[Web search rate-limited. "
-                                "The analysis will use Claude's training knowledge instead.]")
-                    try:
-                        wait = max(float(
-                            resp.headers.get("retry-after") or
-                            _RL_WAIT_BASE * (2 ** _attempt)
-                        ), 1.0)
-                    except (TypeError, ValueError):
-                        wait = _RL_WAIT_BASE * (2 ** _attempt)
-                    time.sleep(wait)
-                    continue
-                resp.raise_for_status()
-                blocks = resp.json().get("content", [])
-                text = "\n".join(b.get("text", "") for b in blocks if b.get("type") == "text")
-                return text.strip() or f"[No web results for '{title}']"
-            except httpx.TimeoutException:
-                return (
-                    f"[Web search timed out after {HARD_TIMEOUT}s. "
-                    f"The analysis will use Claude's training knowledge for '{title}' instead. "
-                    "This is normal for popular titles with many search results.]"
-                )
-            except Exception as e:
-                err = str(e).lower()
-                if ("429" in err or "too many requests" in err) and _attempt < _RL_MAX_TRIES - 1:
-                    time.sleep(_RL_WAIT_BASE * (2 ** _attempt))
-                    continue
-                return f"[Web search error: {e}]"
-        return "[Web search failed after retries — using training knowledge.]"
+        def _do_fetch():
+            """Blocking HTTP call — runs in its own daemon thread."""
+            for _attempt in range(_RL_MAX_TRIES):
+                try:
+                    # Large socket timeout — wall-clock enforced by future.result() outside
+                    resp = httpx.post(
+                        "https://api.anthropic.com/v1/messages",
+                        headers=headers,
+                        json=payload,
+                        timeout=httpx.Timeout(300, connect=10),
+                    )
+                    if resp.status_code == 429:
+                        if _attempt == _RL_MAX_TRIES - 1:
+                            return "[Web search rate-limited — using training knowledge.]"
+                        try:
+                            wait = max(float(
+                                resp.headers.get("retry-after") or
+                                _RL_WAIT_BASE * (2 ** _attempt)
+                            ), 1.0)
+                        except (TypeError, ValueError):
+                            wait = _RL_WAIT_BASE * (2 ** _attempt)
+                        time.sleep(wait)
+                        continue
+                    resp.raise_for_status()
+                    blocks = resp.json().get("content", [])
+                    text = "\n".join(b.get("text", "") for b in blocks if b.get("type") == "text")
+                    return text.strip() or f"[No web results for '{title}']"
+                except Exception as e:
+                    err = str(e).lower()
+                    if ("429" in err or "too many requests" in err) and _attempt < _RL_MAX_TRIES - 1:
+                        time.sleep(_RL_WAIT_BASE * (2 ** _attempt))
+                        continue
+                    return f"[Web search error: {e}]"
+            return "[Web search failed after retries — using training knowledge.]"
+
+        # Run in a single-thread executor so future.result(timeout=N) gives a true
+        # wall-clock deadline regardless of socket activity.
+        _ex = _TPE(max_workers=1)
+        _fut = _ex.submit(_do_fetch)
+        try:
+            return _fut.result(timeout=HARD_TIMEOUT)
+        except _FTE:
+            _ex.shutdown(wait=False)
+            return (
+                f"[Web search timed out after {HARD_TIMEOUT}s. "
+                f"Using Claude's training knowledge for '{title}' instead.]"
+            )
+        except Exception as e:
+            return f"[Web search error: {e}]"
+        finally:
+            _ex.shutdown(wait=False)
 
 
     # ── Poll futures with heartbeat so Streamlit never blocks ────────────────
     # One future per game title (parallel searches) + one for doc extraction.
     # Poll every 3 s to keep Streamlit alive with heartbeat spinner ticks.
+    # Hard wall-clock cap: if any game future exceeds RESEARCH_CAP seconds,
+    # cancel it and move on — future.result(timeout) enforces this per-game,
+    # but we also track total elapsed here as a belt-and-suspenders guard.
+    RESEARCH_CAP = 100  # seconds — bail out of a stalled future
     _n_workers = 1 + max(len(game_titles), 1)
     with ThreadPoolExecutor(max_workers=_n_workers) as pool:
         fut_docs   = pool.submit(_extract_docs)
@@ -2427,10 +2439,35 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
         research_done = not bool(game_titles)
         game_results  = {}   # title -> research text
         elapsed       = 0
-        TICK          = 3
+        TICK          = 2   # poll every 2s for more responsive UI
 
         while pending:
             resolved = [(f, l) for f, l in list(pending.items()) if f.done()]
+
+            # Hard cap: if any game future has been running longer than RESEARCH_CAP,
+            # treat it as timed out and remove it from pending so we don't hang forever
+            if elapsed >= RESEARCH_CAP:
+                for fut, label in list(pending.items()):
+                    if label != "__docs__" and not fut.done():
+                        title_stuck = label
+                        del pending[fut]
+                        game_results[title_stuck] = (
+                            f"[Web search exceeded {RESEARCH_CAP}s wall-clock limit for "
+                            f"'{title_stuck}' — using Claude's training knowledge instead.]"
+                        )
+                        yield ("log",
+                            f"⚠️ <b>Web search timed out for <i>{title_stuck}</i></b> — "
+                            f"exceeded {RESEARCH_CAP}s hard limit<br>"
+                            "<span class='log-detail'>Moving on with training knowledge.</span>")
+                remaining_games = [l for l in pending.values() if l != "__docs__"]
+                if not remaining_games:
+                    research_done = True
+                    if game_results:
+                        parts = []
+                        for t, r in game_results.items():
+                            parts.append("=== RESEARCH: " + t + " ===\n" + r)
+                        research_text = "\n\n".join(parts)
+                    yield ("step_done", "research")
 
             for fut, label in resolved:
                 del pending[fut]
