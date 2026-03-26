@@ -480,7 +480,7 @@ with st.sidebar:
 
     st.markdown('<span class="sidebar-section">Options</span>', unsafe_allow_html=True)
     web_search_enabled = st.checkbox("Web search for reference game", value=True)
-    plan_mode          = st.checkbox("✏️ Plan mode — review outline before exporting", value=False)
+    plan_mode          = True  # always on — pipeline stops at outline for review
     slide_count        = st.slider("Target slides", 6, 20, 10)
 
     st.markdown('<span class="sidebar-section">Theme</span>', unsafe_allow_html=True)
@@ -592,7 +592,8 @@ The pipeline will:<br>
 &nbsp;1. Extract your uploaded documents<br>
 &nbsp;2. Search the web for the reference game<br>
 &nbsp;3. Run a Claude-powered comparative analysis<br>
-&nbsp;4. Render a SEGA-branded PPTX for download
+&nbsp;4. Show you the outline to review and edit<br>
+&nbsp;5. Export to a SEGA-branded PPTX on demand
 </div>
 </div>
 """, unsafe_allow_html=True)
