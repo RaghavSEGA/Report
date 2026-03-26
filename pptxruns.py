@@ -128,6 +128,10 @@ def _lock_txb(txb):
     etree.SubElement(ln, qn("a:noFill"))
 
 
+# Safe defaults — widgets defined later in the sidebar.
+run_btn           = False
+business_question = ""
+
 def _render_plan_modal(template_bytes_ref):
     """
     Renders the Plan Mode outline editor as a full-page modal overlay.
@@ -471,6 +475,7 @@ st.set_page_config(
     page_icon="🎮",
     layout="wide",
 )
+
 
 # ─────────────────────────────────────────────────────────────
 # OTP AUTHENTICATION  (mirrors BIreport.py exactly)
