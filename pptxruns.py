@@ -128,6 +128,344 @@ def _lock_txb(txb):
     etree.SubElement(ln, qn("a:noFill"))
 
 
+def _render_plan_modal(template_bytes_ref):
+    """
+    Renders the Plan Mode outline editor as a full-page modal overlay.
+    Reads/writes st.session_state["plan_slide_data"].
+    """
+    sd     = st.session_state.get("plan_slide_data", {})
+    slides = sd.get("slides", [])
+
+    st.markdown(
+        "<style>"
+        ".pm-card{background:#1e293b;border:1px solid #334155;border-radius:8px;"
+        "padding:.8rem 1rem;margin-bottom:.5rem}"
+        ".pm-num{color:#60a5fa;font-size:.68rem;font-weight:700;"
+        "text-transform:uppercase;letter-spacing:.07em;margin-bottom:.25rem}"
+        "</style>",
+        unsafe_allow_html=True,
+    )
+
+    hcol, xcol = st.columns([4, 1])
+    with hcol:
+        st.markdown(
+            f"<h3 style='color:#e2e8f0;margin:0'>✏️ Plan Mode &nbsp;·&nbsp; "
+            f"<span style='color:#60a5fa'>{sd.get('title','Presentation')}</span></h3>",
+            unsafe_allow_html=True,
+        )
+        st.caption(f"{len(slides)} slides · Edit titles & content · ⬆⬇ reorder · ➕ add · 🗑 delete")
+    with xcol:
+        if st.button("✕ Close", key="pm_close", use_container_width=True):
+            st.session_state.pop("plan_slide_data", None)
+            st.session_state.pop("plan_mode_active", None)
+            st.rerun()
+
+    st.divider()
+
+    updated_slides = list(slides)
+    move_up = move_down = delete_idx = insert_after = None
+
+    for i, slide in enumerate(slides):
+        stype = slide.get("type", "bullets")
+        with st.expander(
+            f"**{i+1}.** `{stype.upper()}` — {slide.get('title','(untitled)')}",
+            expanded=(i == 0),
+        ):
+            rc1, rc2 = st.columns([2, 1])
+            with rc1:
+                new_type = st.selectbox(
+                    "Type", SLIDE_TYPES,
+                    index=SLIDE_TYPES.index(stype) if stype in SLIDE_TYPES else 1,
+                    key=f"pm_type_{i}", label_visibility="collapsed",
+                )
+            with rc2:
+                b1, b2, b3, b4 = st.columns(4)
+                if b1.button("⬆", key=f"pu_{i}", help="Move up"):    move_up      = i
+                if b2.button("⬇", key=f"pd_{i}", help="Move down"):  move_down    = i
+                if b3.button("➕", key=f"pa_{i}", help="Insert after"): insert_after = i
+                if b4.button("🗑", key=f"px_{i}", help="Delete"):     delete_idx   = i
+
+            new_title    = st.text_input("Title",    slide.get("title",""),    key=f"pm_ti_{i}")
+            new_subtitle = st.text_input("Subtitle", slide.get("subtitle") or slide.get("body",""), key=f"pm_su_{i}")
+
+            new_slide = {**slide, "type": new_type, "title": new_title, "subtitle": new_subtitle}
+
+            # ── Type-specific editors ──────────────────────────────────────
+            if new_type in ("bullets", "recommendation"):
+                raw = st.text_area(
+                    "Bullets (one per line, max 6)",
+                    value="\n".join(slide.get("bullets") or []),
+                    height=150, key=f"pm_bu_{i}",
+                )
+                new_slide["bullets"] = [b.strip() for b in raw.split("\n") if b.strip()][:6]
+
+            elif new_type == "stats":
+                st.caption("Format: value | label | note")
+                raw = st.text_area(
+                    "Stats", height=110, key=f"pm_st_{i}",
+                    label_visibility="collapsed",
+                    value="\n".join(
+                        f"{s.get('value','')} | {s.get('label','')} | {s.get('note','')}"
+                        for s in (slide.get("stats") or [])
+                    ),
+                )
+                new_stats = []
+                for line in raw.split("\n"):
+                    p = [x.strip() for x in line.split("|")]
+                    if any(p):
+                        new_stats.append({"value": p[0] if p else "", "label": p[1] if len(p)>1 else "", "note": p[2] if len(p)>2 else ""})
+                new_slide["stats"] = new_stats[:4]
+
+            elif new_type == "comparison":
+                cmp  = slide.get("comparison") or {}
+                rows = cmp.get("rows") or []
+                cl, cr = st.columns(2)
+                lt = cl.text_input("Left col title",  cmp.get("left_title",""),  key=f"pm_lt_{i}")
+                rt = cr.text_input("Right col title", cmp.get("right_title",""), key=f"pm_rt_{i}")
+                st.caption("Rows: label | left | right | delta")
+                raw = st.text_area("Rows", height=140, key=f"pm_ro_{i}", label_visibility="collapsed",
+                    value="\n".join(
+                        f"{r.get('label','')} | {r.get('left','')} | {r.get('right','')} | {r.get('delta','neutral')}"
+                        for r in rows
+                    ),
+                )
+                new_rows = []
+                for line in raw.split("\n"):
+                    p = [x.strip() for x in line.split("|")]
+                    if len(p) >= 3 and any(p):
+                        new_rows.append({"label":p[0],"left":p[1],"right":p[2],"delta":p[3] if len(p)>3 else "neutral"})
+                new_slide["comparison"] = {"left_title":lt,"right_title":rt,"rows":new_rows[:8]}
+
+            elif new_type == "chart":
+                chart = slide.get("chart") or {}
+                ct_opts = ["bar","line","scatter","pie","horizontal_bar"]
+                ct  = st.selectbox("Chart type", ct_opts,
+                                    index=ct_opts.index(chart.get("chart_type","bar")),
+                                    key=f"pm_ct_{i}")
+                ca, cb = st.columns(2)
+                xl  = ca.text_input("X label", chart.get("x_label",""), key=f"pm_xl_{i}")
+                yl  = cb.text_input("Y label", chart.get("y_label",""), key=f"pm_yl_{i}")
+                cats = st.text_input(
+                    "Categories (comma-separated)",
+                    ", ".join(chart.get("categories") or []), key=f"pm_ca_{i}"
+                )
+                st.caption("Series: label | val1, val2, …  (one per line)")
+                raw = st.text_area("Series", height=100, key=f"pm_se_{i}", label_visibility="collapsed",
+                    value="\n".join(
+                        f"{s.get('label','')} | {', '.join(str(v) for v in s.get('values',[]))}"
+                        for s in (chart.get("series") or [])
+                    ),
+                )
+                new_series = []
+                for line in raw.split("\n"):
+                    p = [x.strip() for x in line.split("|")]
+                    if len(p) >= 2:
+                        try:
+                            vals = [float(v.strip()) for v in p[1].split(",") if v.strip()]
+                        except ValueError:
+                            vals = []
+                        new_series.append({"label": p[0], "values": vals})
+                new_slide["chart"] = {
+                    "chart_type": ct, "x_label": xl, "y_label": yl,
+                    "categories": [c.strip() for c in cats.split(",") if c.strip()],
+                    "series": new_series,
+                }
+
+            updated_slides[i] = new_slide
+
+    # ── Reorder / delete / insert ────────────────────────────────────────────
+    if move_up is not None and move_up > 0:
+        updated_slides[move_up-1], updated_slides[move_up] = updated_slides[move_up], updated_slides[move_up-1]
+        sd["slides"] = updated_slides; st.session_state["plan_slide_data"] = sd; st.rerun()
+    if move_down is not None and move_down < len(updated_slides)-1:
+        updated_slides[move_down], updated_slides[move_down+1] = updated_slides[move_down+1], updated_slides[move_down]
+        sd["slides"] = updated_slides; st.session_state["plan_slide_data"] = sd; st.rerun()
+    if delete_idx is not None and len(updated_slides) > 1:
+        updated_slides.pop(delete_idx)
+        sd["slides"] = updated_slides; st.session_state["plan_slide_data"] = sd; st.rerun()
+    if insert_after is not None:
+        updated_slides.insert(insert_after+1, {"type":"bullets","title":"New Slide","bullets":[]})
+        sd["slides"] = updated_slides; st.session_state["plan_slide_data"] = sd; st.rerun()
+
+    # Always persist live edits
+    sd["slides"] = updated_slides
+    st.session_state["plan_slide_data"] = sd
+
+    st.divider()
+
+    # ── Export ────────────────────────────────────────────────────────────────
+    ec1, ec2, _ = st.columns([1, 1, 1])
+    with ec1:
+        if st.button("🚀 Export to PPTX", key="pm_export", type="primary", use_container_width=True):
+            _tb = None
+            _tf = st.session_state.get("template_upload")
+            if _tf is not None:
+                try:
+                    _tf.seek(0); _tb = _tf.read()
+                except Exception:
+                    pass
+            with st.spinner("Building PPTX…"):
+                try:
+                    pptx_out = generate_pptx(st.session_state["plan_slide_data"], template_bytes=_tb)
+                    _title   = st.session_state["plan_slide_data"].get("title","Plan")
+                    fname    = f"SEGA_Plan_{_title.replace(' ','_')[:40]}.pptx"
+                    st.session_state["pptx_bytes"]    = pptx_out
+                    st.session_state["pptx_filename"] = fname
+                    st.session_state.pop("plan_mode_active", None)
+                    st.success("PPTX ready — close plan to download.")
+                    st.rerun()
+                except Exception as _ex:
+                    st.error(f"Export failed: {_ex}")
+    with ec2:
+        if "pptx_bytes" in st.session_state:
+            st.download_button(
+                "⬇️ Download PPTX",
+                data=st.session_state["pptx_bytes"],
+                file_name=st.session_state.get("pptx_filename","SEGA_Plan.pptx"),
+                mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                key="pm_dl",
+                use_container_width=True,
+            )
+
+
+# ─────────────────────────────────────────────────────────────
+# RUN BUTTON HANDLER
+# ─────────────────────────────────────────────────────────────
+if run_btn:
+    if not business_question.strip():
+        st.error("Please enter a business question.")
+    else:
+        # Collect data files
+        data_files = st.session_state.get("data_upload") or []
+        if hasattr(data_files, "read"):  # single file — wrap
+            data_files = [data_files]
+
+        # Extract template palette if a file was uploaded
+        _template_bytes = None
+        _template_file = st.session_state.get("template_upload")
+        if _template_file is not None:
+            try:
+                _template_file.seek(0)
+                _template_bytes = _template_file.read()
+            except Exception as _e:
+                st.warning(f"Could not read template file: {_e}. Using default theme.")
+
+        pipeline_steps = {
+            "upload": bool(uploaded_files), "extract": False,
+            "research": False, "analyze": False, "generate": False,
+        }
+        st.session_state["pipeline_steps"] = pipeline_steps
+        log_lines = []
+
+        with output_area.container():
+            st.markdown('<div class="section-label">Pipeline log</div>', unsafe_allow_html=True)
+            log_area = st.empty()
+
+            try:
+                for event in run_pipeline(
+                    model, uploaded_files, game_title, business_question,
+                    audience, theme_preset, web_search_enabled, slide_count,
+                    template_bytes=_template_bytes,
+                    data_files=data_files,
+                    plan_mode=plan_mode,
+                ):
+                    etype = event[0]
+
+                    if etype in ("log", "spinner"):
+                        # "spinner" = active working entry (animated ring at bottom)
+                        # "log"     = completed entry (static, left-border style)
+                        # When a new event arrives, any previous spinner is promoted
+                        # to a plain log entry so only the latest one animates.
+                        if etype == "spinner":
+                            # Promote the last spinner (if any) to a plain log entry
+                            if log_lines and log_lines[-1][0] == "spinner":
+                                log_lines[-1] = ("log", log_lines[-1][1])
+                            log_lines.append(("spinner", event[1]))
+                        else:
+                            # Promote any trailing spinner before adding the completed msg
+                            if log_lines and log_lines[-1][0] == "spinner":
+                                log_lines[-1] = ("log", log_lines[-1][1])
+                            log_lines.append(("log", event[1]))
+
+                        # Build self-contained HTML with inline CSS.
+                        # Streamlit does NOT share CSS between separate markdown() calls,
+                        # so all styles must be embedded in every render.
+                        _CSS = (
+                            "<style>"
+                            "@keyframes _sp{to{transform:rotate(360deg)}}"
+                            "._lw{background:#0f172a;border:1px solid #1e293b;border-radius:8px;"
+                            "padding:1rem 1.25rem;font-size:.82rem;"
+                            "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;"
+                            "color:#94a3b8;max-height:480px;overflow-y:auto;line-height:1.7}"
+                            "._lw b{color:#e2e8f0;font-weight:600}"
+                            "._lw i{color:#60a5fa}"
+                            "._ld{color:#64748b;font-size:.76rem;line-height:1.55;display:block;"
+                            "margin-top:.15rem;margin-bottom:.35rem}"
+                            "._le{border-left:2px solid #1e3a5f;padding-left:.6rem;margin-bottom:.5rem}"
+                            "._la{border-left:2px solid #00AADD;padding-left:.6rem;"
+                            "margin-bottom:.5rem;display:flex;align-items:flex-start;gap:.55rem}"
+                            "._lr{flex-shrink:0;width:14px;height:14px;margin-top:3px;"
+                            "border:2px solid rgba(0,170,221,.25);border-top-color:#00AADD;"
+                            "border-radius:50%;animation:_sp .8s linear infinite}"
+                            "._lt{flex:1}"
+                            "</style>"
+                        )
+                        html_parts = [_CSS, '<div class="_lw">']
+                        for _kind, _text in log_lines[-14:]:
+                            _t = _text.replace("class='log-detail'", "class='_ld'")
+                            if _kind == "spinner":
+                                html_parts.append(
+                                    f'<div class="_la"><div class="_lr"></div>'
+                                    f'<div class="_lt">{_t}</div></div>'
+                                )
+                            else:
+                                html_parts.append(f'<div class="_le">{_t}</div>')
+                        html_parts.append("</div>")
+                        log_area.markdown("".join(html_parts), unsafe_allow_html=True)
+                    elif etype == "step_done":
+                        pipeline_steps[event[1]] = True
+                        st.session_state["pipeline_steps"] = pipeline_steps
+
+                    elif etype == "slide_data":
+                        st.session_state["slide_data"] = event[1]
+
+                    elif etype == "plan_ready":
+                        st.session_state["plan_slide_data"] = event[1]
+                        st.session_state["plan_mode_active"] = True
+
+                    elif etype == "pptx_bytes_out":
+                        fname = f"SEGA_Analysis_{(game_title_display or 'Report').replace(' ','_').replace(',','_')[:50]}.pptx"
+                        st.session_state["pptx_bytes"]    = event[1]
+                        st.session_state["pptx_filename"] = fname
+
+                    elif etype == "error":
+                        st.error(event[1])
+                        break
+
+            except Exception as ex:
+                st.error(f"Unexpected error: {ex}")
+                import traceback
+                st.code(traceback.format_exc())
+
+        if st.session_state.get("plan_mode_active"):
+            with output_area.container():
+                _render_plan_modal(st.session_state.get("template_upload"))
+
+        if "pptx_bytes" in st.session_state:
+            with download_area.container():
+                st.success("Analysis complete.")
+                st.download_button(
+                    label="⬇️ Download PPTX",
+                    data=st.session_state["pptx_bytes"],
+                    file_name=st.session_state["pptx_filename"],
+                    mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                    use_container_width=True,
+                )
+                if "slide_data" in st.session_state:
+                    with st.expander("Slide outline", expanded=False):
+                        for i, sl in enumerate(st.session_state["slide_data"].get("slides", []), 1):
+                            st.markdown(f"**{i}.** `{sl.get('type','?').upper()}` — {sl.get('title','')}")
+
 st.set_page_config(
     page_title="SEGA PowerPoint Creator",
     page_icon="🎮",
@@ -2947,341 +3285,3 @@ Rules:
 # ─────────────────────────────────────────────────────────────
 
 SLIDE_TYPES = ["title","section","bullets","stats","comparison","recommendation","chart","closing"]
-
-def _render_plan_modal(template_bytes_ref):
-    """
-    Renders the Plan Mode outline editor as a full-page modal overlay.
-    Reads/writes st.session_state["plan_slide_data"].
-    """
-    sd     = st.session_state.get("plan_slide_data", {})
-    slides = sd.get("slides", [])
-
-    st.markdown(
-        "<style>"
-        ".pm-card{background:#1e293b;border:1px solid #334155;border-radius:8px;"
-        "padding:.8rem 1rem;margin-bottom:.5rem}"
-        ".pm-num{color:#60a5fa;font-size:.68rem;font-weight:700;"
-        "text-transform:uppercase;letter-spacing:.07em;margin-bottom:.25rem}"
-        "</style>",
-        unsafe_allow_html=True,
-    )
-
-    hcol, xcol = st.columns([4, 1])
-    with hcol:
-        st.markdown(
-            f"<h3 style='color:#e2e8f0;margin:0'>✏️ Plan Mode &nbsp;·&nbsp; "
-            f"<span style='color:#60a5fa'>{sd.get('title','Presentation')}</span></h3>",
-            unsafe_allow_html=True,
-        )
-        st.caption(f"{len(slides)} slides · Edit titles & content · ⬆⬇ reorder · ➕ add · 🗑 delete")
-    with xcol:
-        if st.button("✕ Close", key="pm_close", use_container_width=True):
-            st.session_state.pop("plan_slide_data", None)
-            st.session_state.pop("plan_mode_active", None)
-            st.rerun()
-
-    st.divider()
-
-    updated_slides = list(slides)
-    move_up = move_down = delete_idx = insert_after = None
-
-    for i, slide in enumerate(slides):
-        stype = slide.get("type", "bullets")
-        with st.expander(
-            f"**{i+1}.** `{stype.upper()}` — {slide.get('title','(untitled)')}",
-            expanded=(i == 0),
-        ):
-            rc1, rc2 = st.columns([2, 1])
-            with rc1:
-                new_type = st.selectbox(
-                    "Type", SLIDE_TYPES,
-                    index=SLIDE_TYPES.index(stype) if stype in SLIDE_TYPES else 1,
-                    key=f"pm_type_{i}", label_visibility="collapsed",
-                )
-            with rc2:
-                b1, b2, b3, b4 = st.columns(4)
-                if b1.button("⬆", key=f"pu_{i}", help="Move up"):    move_up      = i
-                if b2.button("⬇", key=f"pd_{i}", help="Move down"):  move_down    = i
-                if b3.button("➕", key=f"pa_{i}", help="Insert after"): insert_after = i
-                if b4.button("🗑", key=f"px_{i}", help="Delete"):     delete_idx   = i
-
-            new_title    = st.text_input("Title",    slide.get("title",""),    key=f"pm_ti_{i}")
-            new_subtitle = st.text_input("Subtitle", slide.get("subtitle") or slide.get("body",""), key=f"pm_su_{i}")
-
-            new_slide = {**slide, "type": new_type, "title": new_title, "subtitle": new_subtitle}
-
-            # ── Type-specific editors ──────────────────────────────────────
-            if new_type in ("bullets", "recommendation"):
-                raw = st.text_area(
-                    "Bullets (one per line, max 6)",
-                    value="\n".join(slide.get("bullets") or []),
-                    height=150, key=f"pm_bu_{i}",
-                )
-                new_slide["bullets"] = [b.strip() for b in raw.split("\n") if b.strip()][:6]
-
-            elif new_type == "stats":
-                st.caption("Format: value | label | note")
-                raw = st.text_area(
-                    "Stats", height=110, key=f"pm_st_{i}",
-                    label_visibility="collapsed",
-                    value="\n".join(
-                        f"{s.get('value','')} | {s.get('label','')} | {s.get('note','')}"
-                        for s in (slide.get("stats") or [])
-                    ),
-                )
-                new_stats = []
-                for line in raw.split("\n"):
-                    p = [x.strip() for x in line.split("|")]
-                    if any(p):
-                        new_stats.append({"value": p[0] if p else "", "label": p[1] if len(p)>1 else "", "note": p[2] if len(p)>2 else ""})
-                new_slide["stats"] = new_stats[:4]
-
-            elif new_type == "comparison":
-                cmp  = slide.get("comparison") or {}
-                rows = cmp.get("rows") or []
-                cl, cr = st.columns(2)
-                lt = cl.text_input("Left col title",  cmp.get("left_title",""),  key=f"pm_lt_{i}")
-                rt = cr.text_input("Right col title", cmp.get("right_title",""), key=f"pm_rt_{i}")
-                st.caption("Rows: label | left | right | delta")
-                raw = st.text_area("Rows", height=140, key=f"pm_ro_{i}", label_visibility="collapsed",
-                    value="\n".join(
-                        f"{r.get('label','')} | {r.get('left','')} | {r.get('right','')} | {r.get('delta','neutral')}"
-                        for r in rows
-                    ),
-                )
-                new_rows = []
-                for line in raw.split("\n"):
-                    p = [x.strip() for x in line.split("|")]
-                    if len(p) >= 3 and any(p):
-                        new_rows.append({"label":p[0],"left":p[1],"right":p[2],"delta":p[3] if len(p)>3 else "neutral"})
-                new_slide["comparison"] = {"left_title":lt,"right_title":rt,"rows":new_rows[:8]}
-
-            elif new_type == "chart":
-                chart = slide.get("chart") or {}
-                ct_opts = ["bar","line","scatter","pie","horizontal_bar"]
-                ct  = st.selectbox("Chart type", ct_opts,
-                                    index=ct_opts.index(chart.get("chart_type","bar")),
-                                    key=f"pm_ct_{i}")
-                ca, cb = st.columns(2)
-                xl  = ca.text_input("X label", chart.get("x_label",""), key=f"pm_xl_{i}")
-                yl  = cb.text_input("Y label", chart.get("y_label",""), key=f"pm_yl_{i}")
-                cats = st.text_input(
-                    "Categories (comma-separated)",
-                    ", ".join(chart.get("categories") or []), key=f"pm_ca_{i}"
-                )
-                st.caption("Series: label | val1, val2, …  (one per line)")
-                raw = st.text_area("Series", height=100, key=f"pm_se_{i}", label_visibility="collapsed",
-                    value="\n".join(
-                        f"{s.get('label','')} | {', '.join(str(v) for v in s.get('values',[]))}"
-                        for s in (chart.get("series") or [])
-                    ),
-                )
-                new_series = []
-                for line in raw.split("\n"):
-                    p = [x.strip() for x in line.split("|")]
-                    if len(p) >= 2:
-                        try:
-                            vals = [float(v.strip()) for v in p[1].split(",") if v.strip()]
-                        except ValueError:
-                            vals = []
-                        new_series.append({"label": p[0], "values": vals})
-                new_slide["chart"] = {
-                    "chart_type": ct, "x_label": xl, "y_label": yl,
-                    "categories": [c.strip() for c in cats.split(",") if c.strip()],
-                    "series": new_series,
-                }
-
-            updated_slides[i] = new_slide
-
-    # ── Reorder / delete / insert ────────────────────────────────────────────
-    if move_up is not None and move_up > 0:
-        updated_slides[move_up-1], updated_slides[move_up] = updated_slides[move_up], updated_slides[move_up-1]
-        sd["slides"] = updated_slides; st.session_state["plan_slide_data"] = sd; st.rerun()
-    if move_down is not None and move_down < len(updated_slides)-1:
-        updated_slides[move_down], updated_slides[move_down+1] = updated_slides[move_down+1], updated_slides[move_down]
-        sd["slides"] = updated_slides; st.session_state["plan_slide_data"] = sd; st.rerun()
-    if delete_idx is not None and len(updated_slides) > 1:
-        updated_slides.pop(delete_idx)
-        sd["slides"] = updated_slides; st.session_state["plan_slide_data"] = sd; st.rerun()
-    if insert_after is not None:
-        updated_slides.insert(insert_after+1, {"type":"bullets","title":"New Slide","bullets":[]})
-        sd["slides"] = updated_slides; st.session_state["plan_slide_data"] = sd; st.rerun()
-
-    # Always persist live edits
-    sd["slides"] = updated_slides
-    st.session_state["plan_slide_data"] = sd
-
-    st.divider()
-
-    # ── Export ────────────────────────────────────────────────────────────────
-    ec1, ec2, _ = st.columns([1, 1, 1])
-    with ec1:
-        if st.button("🚀 Export to PPTX", key="pm_export", type="primary", use_container_width=True):
-            _tb = None
-            _tf = st.session_state.get("template_upload")
-            if _tf is not None:
-                try:
-                    _tf.seek(0); _tb = _tf.read()
-                except Exception:
-                    pass
-            with st.spinner("Building PPTX…"):
-                try:
-                    pptx_out = generate_pptx(st.session_state["plan_slide_data"], template_bytes=_tb)
-                    _title   = st.session_state["plan_slide_data"].get("title","Plan")
-                    fname    = f"SEGA_Plan_{_title.replace(' ','_')[:40]}.pptx"
-                    st.session_state["pptx_bytes"]    = pptx_out
-                    st.session_state["pptx_filename"] = fname
-                    st.session_state.pop("plan_mode_active", None)
-                    st.success("PPTX ready — close plan to download.")
-                    st.rerun()
-                except Exception as _ex:
-                    st.error(f"Export failed: {_ex}")
-    with ec2:
-        if "pptx_bytes" in st.session_state:
-            st.download_button(
-                "⬇️ Download PPTX",
-                data=st.session_state["pptx_bytes"],
-                file_name=st.session_state.get("pptx_filename","SEGA_Plan.pptx"),
-                mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-                key="pm_dl",
-                use_container_width=True,
-            )
-
-
-# ─────────────────────────────────────────────────────────────
-# RUN BUTTON HANDLER
-# ─────────────────────────────────────────────────────────────
-if run_btn:
-    if not business_question.strip():
-        st.error("Please enter a business question.")
-    else:
-        # Collect data files
-        data_files = st.session_state.get("data_upload") or []
-        if hasattr(data_files, "read"):  # single file — wrap
-            data_files = [data_files]
-
-        # Extract template palette if a file was uploaded
-        _template_bytes = None
-        _template_file = st.session_state.get("template_upload")
-        if _template_file is not None:
-            try:
-                _template_file.seek(0)
-                _template_bytes = _template_file.read()
-            except Exception as _e:
-                st.warning(f"Could not read template file: {_e}. Using default theme.")
-
-        pipeline_steps = {
-            "upload": bool(uploaded_files), "extract": False,
-            "research": False, "analyze": False, "generate": False,
-        }
-        st.session_state["pipeline_steps"] = pipeline_steps
-        log_lines = []
-
-        with output_area.container():
-            st.markdown('<div class="section-label">Pipeline log</div>', unsafe_allow_html=True)
-            log_area = st.empty()
-
-            try:
-                for event in run_pipeline(
-                    model, uploaded_files, game_title, business_question,
-                    audience, theme_preset, web_search_enabled, slide_count,
-                    template_bytes=_template_bytes,
-                    data_files=data_files,
-                    plan_mode=plan_mode,
-                ):
-                    etype = event[0]
-
-                    if etype in ("log", "spinner"):
-                        # "spinner" = active working entry (animated ring at bottom)
-                        # "log"     = completed entry (static, left-border style)
-                        # When a new event arrives, any previous spinner is promoted
-                        # to a plain log entry so only the latest one animates.
-                        if etype == "spinner":
-                            # Promote the last spinner (if any) to a plain log entry
-                            if log_lines and log_lines[-1][0] == "spinner":
-                                log_lines[-1] = ("log", log_lines[-1][1])
-                            log_lines.append(("spinner", event[1]))
-                        else:
-                            # Promote any trailing spinner before adding the completed msg
-                            if log_lines and log_lines[-1][0] == "spinner":
-                                log_lines[-1] = ("log", log_lines[-1][1])
-                            log_lines.append(("log", event[1]))
-
-                        # Build self-contained HTML with inline CSS.
-                        # Streamlit does NOT share CSS between separate markdown() calls,
-                        # so all styles must be embedded in every render.
-                        _CSS = (
-                            "<style>"
-                            "@keyframes _sp{to{transform:rotate(360deg)}}"
-                            "._lw{background:#0f172a;border:1px solid #1e293b;border-radius:8px;"
-                            "padding:1rem 1.25rem;font-size:.82rem;"
-                            "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;"
-                            "color:#94a3b8;max-height:480px;overflow-y:auto;line-height:1.7}"
-                            "._lw b{color:#e2e8f0;font-weight:600}"
-                            "._lw i{color:#60a5fa}"
-                            "._ld{color:#64748b;font-size:.76rem;line-height:1.55;display:block;"
-                            "margin-top:.15rem;margin-bottom:.35rem}"
-                            "._le{border-left:2px solid #1e3a5f;padding-left:.6rem;margin-bottom:.5rem}"
-                            "._la{border-left:2px solid #00AADD;padding-left:.6rem;"
-                            "margin-bottom:.5rem;display:flex;align-items:flex-start;gap:.55rem}"
-                            "._lr{flex-shrink:0;width:14px;height:14px;margin-top:3px;"
-                            "border:2px solid rgba(0,170,221,.25);border-top-color:#00AADD;"
-                            "border-radius:50%;animation:_sp .8s linear infinite}"
-                            "._lt{flex:1}"
-                            "</style>"
-                        )
-                        html_parts = [_CSS, '<div class="_lw">']
-                        for _kind, _text in log_lines[-14:]:
-                            _t = _text.replace("class='log-detail'", "class='_ld'")
-                            if _kind == "spinner":
-                                html_parts.append(
-                                    f'<div class="_la"><div class="_lr"></div>'
-                                    f'<div class="_lt">{_t}</div></div>'
-                                )
-                            else:
-                                html_parts.append(f'<div class="_le">{_t}</div>')
-                        html_parts.append("</div>")
-                        log_area.markdown("".join(html_parts), unsafe_allow_html=True)
-                    elif etype == "step_done":
-                        pipeline_steps[event[1]] = True
-                        st.session_state["pipeline_steps"] = pipeline_steps
-
-                    elif etype == "slide_data":
-                        st.session_state["slide_data"] = event[1]
-
-                    elif etype == "plan_ready":
-                        st.session_state["plan_slide_data"] = event[1]
-                        st.session_state["plan_mode_active"] = True
-
-                    elif etype == "pptx_bytes_out":
-                        fname = f"SEGA_Analysis_{(game_title_display or 'Report').replace(' ','_').replace(',','_')[:50]}.pptx"
-                        st.session_state["pptx_bytes"]    = event[1]
-                        st.session_state["pptx_filename"] = fname
-
-                    elif etype == "error":
-                        st.error(event[1])
-                        break
-
-            except Exception as ex:
-                st.error(f"Unexpected error: {ex}")
-                import traceback
-                st.code(traceback.format_exc())
-
-        if st.session_state.get("plan_mode_active"):
-            with output_area.container():
-                _render_plan_modal(st.session_state.get("template_upload"))
-
-        if "pptx_bytes" in st.session_state:
-            with download_area.container():
-                st.success("Analysis complete.")
-                st.download_button(
-                    label="⬇️ Download PPTX",
-                    data=st.session_state["pptx_bytes"],
-                    file_name=st.session_state["pptx_filename"],
-                    mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-                    use_container_width=True,
-                )
-                if "slide_data" in st.session_state:
-                    with st.expander("Slide outline", expanded=False):
-                        for i, sl in enumerate(st.session_state["slide_data"].get("slides", []), 1):
-                            st.markdown(f"**{i}.** `{sl.get('type','?').upper()}` — {sl.get('title','')}")
