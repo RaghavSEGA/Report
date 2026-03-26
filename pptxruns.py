@@ -2027,6 +2027,25 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
 
         HARD_TIMEOUT = 90   # true wall-clock deadline enforced via thread future
 
+        prompt = (
+            f"Research the video game \"{game_title}\" for an executive competitive analysis presentation. "
+            "Search the web for current information and write a thorough structured report with these sections:\n\n"
+            "OVERVIEW: Developer, publisher, release date, platforms, genre, ESRB/PEGI rating, launch price.\n\n"
+            "CRITICAL RECEPTION: Metacritic score (critic + user), OpenCritic score, "
+            "scores from at least 3-4 named outlets (e.g. IGN, Eurogamer, GameSpot). "
+            "List 4 specific things reviewers praised and 4 specific things they criticised.\n\n"
+            "COMMERCIAL PERFORMANCE: Launch window sales figures, lifetime sales if available, "
+            "any sales milestones or statements from the publisher, chart positions.\n\n"
+            "GAMEPLAY & FEATURES: 6-7 core mechanics explained in 1-2 sentences each. "
+            "Main story length and completionist length. Multiplayer or co-op features.\n\n"
+            "POST-LAUNCH: Each DLC pack — name, price, release date, brief description, reception. "
+            "Major patches or updates.\n\n"
+            "MARKET CONTEXT: The 3-4 biggest competitor titles released in the same window. "
+            "How this game compares to the previous entry in its franchise. "
+            "Any notable controversies or cultural impact.\n\n"
+            "Use real numbers throughout. Aim for 700-900 words total."
+        )
+
         payload = {
             "model": model,
             "max_tokens": 2500,
