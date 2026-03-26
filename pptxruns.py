@@ -1842,7 +1842,10 @@ def _render_plan_modal(template_bytes_ref):
             f"<span style='color:#60a5fa'>{sd.get('title','Presentation')}</span></h3>",
             unsafe_allow_html=True,
         )
-        st.caption(f"{len(slides)} slides · Edit titles & content · ⬆⬇ reorder · ➕ add · 🗑 delete")
+        if "pptx_bytes" in st.session_state:
+            st.success("✅ PPTX exported — click **Download PPTX** below to save it.")
+        else:
+            st.caption(f"{len(slides)} slides · Edit titles & content · ⬆⬇ reorder · ➕ add · 🗑 delete")
     with xcol:
         if st.button("✕ Close", key="pm_close", use_container_width=True):
             st.session_state.pop("plan_slide_data", None)
@@ -2000,8 +2003,7 @@ def _render_plan_modal(template_bytes_ref):
                     fname    = f"SEGA_Plan_{_title.replace(' ','_')[:40]}.pptx"
                     st.session_state["pptx_bytes"]    = pptx_out
                     st.session_state["pptx_filename"] = fname
-                    st.session_state.pop("plan_mode_active", None)
-                    st.success("PPTX ready — close plan to download.")
+                    # Keep plan_mode_active so the modal stays open with the download button visible
                     st.rerun()
                 except Exception as _ex:
                     st.error(f"Export failed: {_ex}")

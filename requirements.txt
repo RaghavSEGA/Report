@@ -10,3 +10,4 @@ boto3>=1.26.0
 extra-streamlit-components>=0.1.60
 numpy>=1.26.0
 plotly>=5.18.0
+matplotlib
