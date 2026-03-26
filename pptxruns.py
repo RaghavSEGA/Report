@@ -2347,61 +2347,43 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
         import httpx
         from concurrent.futures import ThreadPoolExecutor as _TPE, TimeoutError as _FTE
 
-        HARD_TIMEOUT = 90   # true wall-clock seconds — enforced by future.result()
+        HARD_TIMEOUT = 60   # true wall-clock seconds — future.result() fires this hard
 
         prompt = (
-            f"Research the video game \"{title}\" for an executive competitive analysis presentation. "
-            "Search the web for current information and write a concise structured report covering:\n\n"
-            "OVERVIEW: Developer, publisher, release date, platforms, genre, launch price.\n\n"
-            "CRITICAL RECEPTION: Metacritic score (critic + user), scores from 2-3 named outlets. "
-            "3 things reviewers praised and 3 things they criticised.\n\n"
-            "COMMERCIAL PERFORMANCE: Launch sales figures, lifetime sales if available, chart positions.\n\n"
-            "GAMEPLAY & FEATURES: 4-5 core mechanics in 1-2 sentences each.\n\n"
-            "MARKET CONTEXT: 2-3 biggest competitor titles. How it compares to the previous franchise entry.\n\n"
-            "Use real numbers. Aim for 400-600 words total."
+            f"Research the video game \"{title}\" for a competitive analysis. "
+            "Search the web and write a brief report covering:\n\n"
+            "OVERVIEW: Developer, publisher, release date, platforms, price.\n"
+            "CRITICAL RECEPTION: Metacritic score, 2-3 outlet scores, key praise and criticism.\n"
+            "COMMERCIAL PERFORMANCE: Sales figures if available.\n"
+            "GAMEPLAY: 3-4 core mechanics in one sentence each.\n"
+            "MARKET CONTEXT: 1-2 comparable competitor titles.\n\n"
+            "Keep it under 350 words. Use real numbers only."
         )
 
         payload = {
-            "model": model,
-            "max_tokens": 1800,
+            "model": "claude-haiku-4-5-20251001",  # Haiku is faster for web search
+            "max_tokens": 1200,
             "tools": [{"type": "web_search_20250305", "name": "web_search"}],
             "messages": [{"role": "user", "content": prompt}],
         }
 
         def _do_fetch():
-            """Blocking HTTP call — runs in its own daemon thread."""
-            for _attempt in range(_RL_MAX_TRIES):
-                try:
-                    # Large socket timeout — wall-clock enforced by future.result() outside
-                    resp = httpx.post(
-                        "https://api.anthropic.com/v1/messages",
-                        headers=headers,
-                        json=payload,
-                        timeout=httpx.Timeout(300, connect=10),
-                    )
-                    if resp.status_code == 429:
-                        if _attempt == _RL_MAX_TRIES - 1:
-                            return "[Web search rate-limited — using training knowledge.]"
-                        try:
-                            wait = max(float(
-                                resp.headers.get("retry-after") or
-                                _RL_WAIT_BASE * (2 ** _attempt)
-                            ), 1.0)
-                        except (TypeError, ValueError):
-                            wait = _RL_WAIT_BASE * (2 ** _attempt)
-                        time.sleep(wait)
-                        continue
-                    resp.raise_for_status()
-                    blocks = resp.json().get("content", [])
-                    text = "\n".join(b.get("text", "") for b in blocks if b.get("type") == "text")
-                    return text.strip() or f"[No web results for '{title}']"
-                except Exception as e:
-                    err = str(e).lower()
-                    if ("429" in err or "too many requests" in err) and _attempt < _RL_MAX_TRIES - 1:
-                        time.sleep(_RL_WAIT_BASE * (2 ** _attempt))
-                        continue
-                    return f"[Web search error: {e}]"
-            return "[Web search failed after retries — using training knowledge.]"
+            """Single blocking HTTP call — no retries. Wall-clock enforced by future.result() outside."""
+            try:
+                resp = httpx.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers=headers,
+                    json=payload,
+                    timeout=httpx.Timeout(300, connect=10),
+                )
+                if resp.status_code == 429:
+                    return "[Web search rate-limited — using training knowledge.]"
+                resp.raise_for_status()
+                blocks = resp.json().get("content", [])
+                text = "\n".join(b.get("text", "") for b in blocks if b.get("type") == "text")
+                return text.strip() or f"[No web results for '{title}']"
+            except Exception as e:
+                return f"[Web search error: {e}]"
 
         # Run in a single-thread executor so future.result(timeout=N) gives a true
         # wall-clock deadline regardless of socket activity.
@@ -2687,48 +2669,70 @@ Rules:
         import re
         return len(re.findall(r'"type"\s*:\s*"(?:title|section|bullets|stats|comparison|recommendation|closing)"', text))
 
-    def _on_rate_limit(wait_secs, attempt):
-        pass  # handled below via RuntimeError propagation
-
-    # Emit a "waiting for Claude…" heartbeat before the first chunk arrives.
-    # Use a background thread to push ticks into a queue; the main loop drains it.
+    # Run the API stream in a background thread, feeding chunks into a queue.
+    # The main generator polls that queue every 2s, yielding heartbeat ticks
+    # between chunks — this way the UI updates even before the first token arrives.
     import queue as _queue, threading as _threading
 
-    _tick_q    = _queue.Queue()
-    _stop_tick = _threading.Event()
+    _chunk_q   = _queue.Queue()
+    _SENTINEL  = object()   # signals stream is done
+    _stream_err = [None]    # mutable container so thread can write to it
 
-    def _ticker():
-        """Push a tick every 2 s so the UI never goes blank during cold start."""
-        _t = 0
-        while not _stop_tick.wait(2):
-            _t += 2
-            _tick_q.put(_t)
+    def _stream_worker():
+        try:
+            for chunk in _api_stream(
+                headers=headers,
+                payload={
+                    "model": model,
+                    "max_tokens": 8000,
+                    "system": "You are a precise game industry analyst. Return valid JSON only.",
+                    "messages": [{"role": "user", "content": analysis_prompt}],
+                },
+            ):
+                _chunk_q.put(chunk)
+        except Exception as exc:
+            _stream_err[0] = exc
+        finally:
+            _chunk_q.put(_SENTINEL)
 
-    _tick_thread = _threading.Thread(target=_ticker, daemon=True)
-    _tick_thread.start()
-    _first_chunk = True
+    _stream_thread = _threading.Thread(target=_stream_worker, daemon=True)
+    _stream_thread.start()
+
+    _stream_elapsed = 0
+    _first_chunk    = True
+    _done           = False
 
     try:
-        for chunk in _api_stream(
-            headers=headers,
-            payload={
-                "model": model,
-                "max_tokens": 8000,
-                "system": "You are a precise game industry analyst. Return valid JSON only.",
-                "messages": [{"role": "user", "content": analysis_prompt}],
-            },
-        ):
-            # Drain any pending heartbeat ticks before this chunk
-            while not _tick_q.empty():
-                _elapsed = _tick_q.get_nowait()
+        while not _done:
+            # Poll the queue with a 2-second timeout so we can yield heartbeats
+            try:
+                item = _chunk_q.get(timeout=2)
+            except _queue.Empty:
+                # Nothing arrived in 2s — emit a heartbeat tick
+                _stream_elapsed += 2
                 if _first_chunk:
                     yield ("spinner",
-                        f"⏳ <b>Waiting for Claude…</b> {_elapsed}s — model is processing your "
-                        f"{est_input_tokens:,}-token prompt. First tokens typically arrive in 5–15s.")
+                        f"⏳ <b>Waiting for Claude…</b> {_stream_elapsed}s elapsed — "
+                        f"processing ~{est_input_tokens:,} tokens. "
+                        "First tokens usually arrive within 10–20s.")
+                else:
+                    pct = min(int(char_count / (slide_count * 220) * 100), 95)
+                    yield ("spinner",
+                        f"  📝 Generating… {char_count:,} chars written (~{pct}% complete) "
+                        f"— {_stream_elapsed}s elapsed")
+                continue
 
+            if item is _SENTINEL:
+                # Check if the worker raised an error
+                if _stream_err[0] is not None:
+                    raise _stream_err[0]
+                _done = True
+                break
+
+            # Got a real chunk
             _first_chunk = False
-            raw_chunks.append(chunk)
-            char_count += len(chunk)
+            raw_chunks.append(item)
+            char_count += len(item)
 
             # Announce new slides as they appear in the stream
             current_text  = "".join(raw_chunks)
@@ -2747,7 +2751,6 @@ Rules:
                     f"  📝 Generating JSON… {char_count:,} chars (~{pct}% complete)")
 
     except RuntimeError as e:
-        _stop_tick.set()
         err = str(e)
         if "rate limit" in err.lower() or "429" in err:
             yield ("error",
@@ -2761,11 +2764,8 @@ Rules:
             yield ("error", err)
         return
     except Exception as e:
-        _stop_tick.set()
         yield ("error", f"Streaming error: {e}")
         return
-    finally:
-        _stop_tick.set()  # always stop the ticker thread
 
     raw_json = "".join(raw_chunks).strip()
     if raw_json.startswith("```"):
