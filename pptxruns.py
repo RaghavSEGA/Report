@@ -1069,42 +1069,64 @@ def generate_pptx(slide_data: dict, template_bytes: bytes | None = None) -> byte
 def _copy_slide(prs_dest, slide_src):
     """
     Copy a slide from slide_src into prs_dest and return the new slide.
-    Copies all shapes, including images and grouped shapes.
+    Copies all shapes AND migrates image/media relationships so that
+    pictures (logos, artwork, EMF files) actually appear in the output.
     """
-    from pptx.oxml.ns import qn
     import copy
+    from pptx.oxml.ns import qn
 
-    # Add a new slide using the same layout
+    # ── 1. Add blank slide with matching layout ───────────────────────────
     try:
         layout = slide_src.slide_layout
-        # Find the matching layout in dest by name
-        dest_layout = None
-        for l in prs_dest.slide_layouts:
-            if l.name == layout.name:
-                dest_layout = l
-                break
-        if dest_layout is None:
-            dest_layout = prs_dest.slide_layouts[0]
+        dest_layout = next(
+            (l for l in prs_dest.slide_layouts if l.name == layout.name),
+            prs_dest.slide_layouts[0]
+        )
         new_slide = prs_dest.slides.add_slide(dest_layout)
     except Exception:
         new_slide = prs_dest.slides.add_slide(prs_dest.slide_layouts[0])
 
-    # Replace the spTree (shape tree) with a deep copy from the source
-    new_sp_tree  = new_slide.shapes._spTree
-    src_sp_tree  = slide_src.shapes._spTree
+    # ── 2. Migrate image/media parts ─────────────────────────────────────
+    # Build a map: old rId → new rId so we can fix up the XML references
+    SLIDE_IMG_REL = (
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image"
+    )
+    rId_map = {}   # old_rId → new_rId
 
-    # Remove all auto-added shapes from the blank slide
+    src_part  = slide_src.part
+    dest_part = new_slide.part
+
+    for rId, rel in src_part.rels.items():
+        if rel.reltype == SLIDE_IMG_REL:
+            try:
+                img_part   = rel.target_part
+                new_rId    = dest_part.relate_to(img_part, rel.reltype)
+                rId_map[rId] = new_rId
+            except Exception:
+                pass   # if the part can't be related, skip — image won't show but won't crash
+
+    # ── 3. Deep-copy the shape tree ───────────────────────────────────────
+    new_sp_tree = new_slide.shapes._spTree
+    src_sp_tree = slide_src.shapes._spTree
+
     for child in list(new_sp_tree):
         new_sp_tree.remove(child)
 
-    # Copy all elements from source
     for el in src_sp_tree:
-        new_sp_tree.append(copy.deepcopy(el))
+        new_el = copy.deepcopy(el)
+        # Fix any rId references in blip/hlinkClick/etc. within this element
+        for node in new_el.iter():
+            for attr in list(node.attrib):
+                if attr.endswith('}embed') or attr.endswith('}link') or attr.endswith('}id'):
+                    old = node.get(attr)
+                    if old in rId_map:
+                        node.set(attr, rId_map[old])
+        new_sp_tree.append(new_el)
 
-    # Copy slide background if set directly on the slide (not via master)
-    if slide_src._element.find(qn("p:bg")) is not None:
-        bg_copy = copy.deepcopy(slide_src._element.find(qn("p:bg")))
-        new_slide._element.insert(2, bg_copy)
+    # ── 4. Copy slide-level background if explicitly set ─────────────────
+    bg = slide_src._element.find(qn("p:bg"))
+    if bg is not None:
+        new_slide._element.insert(2, copy.deepcopy(bg))
 
     return new_slide
 
@@ -1296,6 +1318,17 @@ def _generate_from_template(slide_data: dict, template_bytes: bytes) -> bytes:
     # Analyse the template
     type_map = _analyse_template(prs_template)
 
+    # Quality check: if fewer than 4 distinct slide indices are mapped,
+    # the template couldn't be classified properly — return a diagnostic error
+    # so the caller can fall back to scratch-build.
+    unique_indices = set(type_map.values())
+    if len(unique_indices) < 4:
+        raise ValueError(
+            f"Template classification failed — only {len(unique_indices)} distinct slide "
+            f"types found (need ≥4). type_map={type_map}. "
+            "Check that the template contains bullet, comparison, and stats slides."
+        )
+
     # Strip existing slides at zip level (only reliable approach in python-pptx)
     # then open the cleaned template as our base.
     import zipfile as _zf2, re as _re2
@@ -1344,62 +1377,114 @@ def _generate_from_template(slide_data: dict, template_bytes: bytes) -> bytes:
         )
 
     def _set_text(shape, text):
-        """Replace text in a shape, preserving run formatting."""
+        """Replace text in a shape preserving run formatting. Auto-shrinks if needed."""
         if not shape.has_text_frame:
             return
         tf = shape.text_frame
-        # Keep formatting from first run of first paragraph
+        tf.auto_size = None   # let the shape constrain text
+        # Clear all paragraphs except first, set first paragraph's first run
         for i, para in enumerate(tf.paragraphs):
             for j, run in enumerate(para.runs):
                 if i == 0 and j == 0:
                     run.text = str(text)
                 else:
                     run.text = ""
-        # If no runs exist, create one
+            if i > 0:
+                # Remove extra paragraphs by clearing their text
+                for run in para.runs:
+                    run.text = ""
         if tf.paragraphs and not tf.paragraphs[0].runs:
             tf.paragraphs[0].add_run().text = str(text)
+
+    # Helper: find the SUBJECT sidebar shape (rotated TextBox 54 / TextBox 23 etc.)
+    def _subject_shape(slide):
+        """Find the rotated subject/sidebar label shape."""
+        for shape in slide.shapes:
+            if not shape.has_text_frame:
+                continue
+            t = shape.text_frame.text.strip()
+            nm = shape.name.lower()
+            if t.upper() == "SUBJECT" or "subject" in nm:
+                return shape
+            # Also detect by rotation — the sidebar is rotated ~270°
+            xfrm = shape._element.find('.//{http://schemas.openxmlformats.org/drawingml/2006/main}xfrm')
+            if xfrm is not None and xfrm.get('rot'):
+                rot = int(xfrm.get('rot', 0))
+                if abs(rot) > 8000000:  # > ~90 degrees in EMUs (60000 per degree)
+                    return shape
+        return None
 
     def _add_slide_from_source(stype, s):
         """Copy the template slide for stype and populate with slide data s."""
         src = _get_source_slide(stype)
         new_slide = _copy_slide(prs_out, src)
-        txbs = _txbs(new_slide)
 
+        # ── TITLE ────────────────────────────────────────────────────────
         if stype == "title":
-            # Template slide 1: TextBox "HEADLINE" + TextBox "SUBJECT"
             for shape in new_slide.shapes:
-                if shape.has_text_frame:
-                    t = shape.text_frame.text.strip()
-                    if t.upper() == "HEADLINE" or ("headline" in shape.name.lower()):
-                        _set_text(shape, s.get("title", ""))
-                    elif t.upper() == "SUBJECT" or ("subject" in shape.name.lower()):
-                        _set_text(shape, s.get("subtitle") or s.get("body") or "")
+                if not shape.has_text_frame:
+                    continue
+                t = shape.text_frame.text.strip()
+                nm = shape.name.lower()
+                if t.upper() == "HEADLINE" or "headline" in nm:
+                    _set_text(shape, s.get("title", ""))
+                elif t.upper() == "SUBJECT" or "subject" in nm:
+                    _set_text(shape, s.get("subtitle") or s.get("body") or "")
 
+        # ── SECTION ──────────────────────────────────────────────────────
         elif stype == "section":
-            # Use title slide pattern — put section title in HEADLINE
-            for shape in new_slide.shapes:
-                if shape.has_text_frame:
-                    t = shape.text_frame.text.strip()
-                    if t.upper() in ("HEADLINE", "SUBJECT") or "headline" in shape.name.lower():
-                        _set_text(shape, s.get("title", ""))
-                        break
+            # This template's section slide is mostly blank — just a rotated
+            # SUBJECT sidebar. Write title into SUBJECT and add a large
+            # title overlay in the center of the white content area.
+            title_text = s.get("title", "")
+            subj = _subject_shape(new_slide)
+            if subj:
+                _set_text(subj, title_text)
 
+            # Add a large centered title text box over the white area
+            from pptx.util import Inches as _In, Pt as _Pt
+            from pptx.dml.color import RGBColor as _RGB
+            txb = new_slide.shapes.add_textbox(
+                _In(1.5), _In(2.5), _In(W - 2.5), _In(2.5)
+            )
+            tf = txb.text_frame
+            tf.word_wrap = True
+            p = tf.paragraphs[0]
+            from pptx.enum.text import PP_ALIGN as _PPA
+            p.alignment = _PPA.LEFT
+            run = p.add_run()
+            run.text = title_text
+            run.font.bold = True
+            run.font.size = _Pt(40)
+            run.font.color.rgb = _RGB(0x11, 0x11, 0x22)   # dark navy — matches template text
+            if s.get("subtitle"):
+                p2 = tf.add_paragraph()
+                p2.alignment = _PPA.LEFT
+                r2 = p2.add_run()
+                r2.text = s["subtitle"]
+                r2.font.size = _Pt(18)
+                r2.font.color.rgb = _RGB(0x44, 0x54, 0x6A)
+
+        # ── BULLETS ──────────────────────────────────────────────────────
         elif stype == "bullets":
             bullets = (s.get("bullets") or [])[:6]
-            # Find the bullet text boxes (those starting with ▸ or at regular y positions)
             bullet_shapes = sorted(
                 [sh for sh in new_slide.shapes
                  if sh.has_text_frame and sh.text_frame.text.strip().startswith("▸")],
                 key=lambda sh: (sh.top or 0)
             )
-            # Also check for a title — HEADLINE shape
+            # This template's bullet slides have no title — write title into
+            # the SUBJECT sidebar (rotated label), clear it if no title
+            subj = _subject_shape(new_slide)
+            if subj:
+                _set_text(subj, s.get("title", ""))
+            # Also check for explicit HEADLINE shape (other templates may have it)
             for shape in new_slide.shapes:
                 if shape.has_text_frame:
                     t = shape.text_frame.text.strip()
-                    if t.upper() == "HEADLINE" or "headline" in shape.name.lower():
+                    nm = shape.name.lower()
+                    if t.upper() == "HEADLINE" or "headline" in nm:
                         _set_text(shape, s.get("title", ""))
-                    elif t.upper() == "SUBJECT" or "subject" in shape.name.lower():
-                        _set_text(shape, s.get("subtitle") or "")
             # Fill bullet slots
             for i, shape in enumerate(bullet_shapes[:len(bullets)]):
                 _set_text(shape, "▸  " + bullets[i])
@@ -1490,25 +1575,53 @@ def _generate_from_template(slide_data: dict, template_bytes: bytes) -> bytes:
                     # Third = note
                     if len(card) > 2: _set_text(card[2], stat.get("note", ""))
 
-        elif stype in ("recommendation", "closing"):
-            # Reuse bullets layout — same shape pattern
+        elif stype == "recommendation":
+            # Same layout as bullets — 6 bullet slots + SUBJECT sidebar for title
             bullets = (s.get("bullets") or [])[:6]
             bullet_shapes = sorted(
                 [sh for sh in new_slide.shapes
                  if sh.has_text_frame and sh.text_frame.text.strip().startswith("▸")],
                 key=lambda sh: sh.top or 0
             )
+            subj = _subject_shape(new_slide)
+            if subj:
+                _set_text(subj, s.get("title", ""))
             for shape in new_slide.shapes:
                 if shape.has_text_frame:
                     t = shape.text_frame.text.strip()
                     if t.upper() == "HEADLINE" or "headline" in shape.name.lower():
                         _set_text(shape, s.get("title", ""))
-                    elif t.upper() in ("SUBJECT", "THANK YOU!") or "subject" in shape.name.lower():
-                        _set_text(shape, s.get("subtitle") or s.get("body") or "")
             for i, shape in enumerate(bullet_shapes[:len(bullets)]):
                 _set_text(shape, "▸  " + bullets[i])
             for shape in bullet_shapes[len(bullets):]:
                 _set_text(shape, "")
+
+        elif stype == "closing":
+            # Closing slide — THANK YOU! box is 72pt in a 9"×2.5" area.
+            # Scale font down for longer titles to prevent overflow.
+            title_text    = s.get("title", "")
+            subtitle_text = s.get("subtitle") or s.get("body") or ""
+            subj = _subject_shape(new_slide)
+            if subj:
+                _set_text(subj, subtitle_text)
+            for shape in new_slide.shapes:
+                if not shape.has_text_frame:
+                    continue
+                t  = shape.text_frame.text.strip()
+                nm = shape.name.lower()
+                if t.upper() in ("THANK YOU!", "HEADLINE") or "headline" in nm:
+                    _set_text(shape, title_text)
+                    # Scale font size down for longer titles
+                    from pptx.util import Pt as _Pt2
+                    nchars = len(title_text)
+                    pt = 72 if nchars <= 15 else 54 if nchars <= 25 else 40 if nchars <= 40 else 30
+                    for para in shape.text_frame.paragraphs:
+                        for run in para.runs:
+                            run.font.size = _Pt2(pt)
+                elif t.upper() == "SUBJECT" or "subject" in nm:
+                    _set_text(shape, subtitle_text)
+                elif t.isdigit() or "presentation template" in t.lower():
+                    _set_text(shape, "")
 
     for s in slides_data:
         stype = (s.get("type") or "bullets").lower()
@@ -1739,27 +1852,56 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
             "messages": [{"role": "user", "content": prompt}],
         }
 
-        try:
-            resp = httpx.post(
-                "https://api.anthropic.com/v1/messages",
-                headers=headers,
-                json=payload,
-                timeout=httpx.Timeout(HARD_TIMEOUT, connect=10),
-            )
-            resp.raise_for_status()
-            blocks = resp.json().get("content", [])
-            text = "\n".join(b.get("text", "") for b in blocks if b.get("type") == "text")
-            return text.strip() or (
-                f"[No web results — analysis will use model knowledge for '{game_title}']"
-            )
-        except httpx.TimeoutException:
-            return (
-                f"[Web search timed out after {HARD_TIMEOUT}s. "
-                f"The analysis will use Claude's training knowledge for '{game_title}' instead. "
-                "This is normal for popular titles with many search results.]"
-            )
-        except Exception as e:
-            return f"[Web search error: {e}]"
+        for _attempt in range(_RL_MAX_TRIES):
+            try:
+                resp = httpx.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers=headers,
+                    json=payload,
+                    timeout=httpx.Timeout(HARD_TIMEOUT, connect=10),
+                )
+
+                # 429 — honour retry-after header then retry
+                if resp.status_code == 429:
+                    if _attempt == _RL_MAX_TRIES - 1:
+                        return (
+                            f"[Web search rate-limited after {_RL_MAX_TRIES} retries. "
+                            "The analysis will use Claude's training knowledge instead.]"
+                        )
+                    try:
+                        wait = max(float(
+                            resp.headers.get("retry-after") or
+                            resp.headers.get("x-ratelimit-reset-requests") or
+                            _RL_WAIT_BASE * (2 ** _attempt)
+                        ), 1.0)
+                    except (TypeError, ValueError):
+                        wait = _RL_WAIT_BASE * (2 ** _attempt)
+                    time.sleep(wait)
+                    continue
+
+                resp.raise_for_status()
+                blocks = resp.json().get("content", [])
+                text = "\n".join(b.get("text", "") for b in blocks if b.get("type") == "text")
+                return text.strip() or (
+                    f"[No web results — analysis will use model knowledge for '{game_title}']"
+                )
+
+            except httpx.TimeoutException:
+                return (
+                    f"[Web search timed out after {HARD_TIMEOUT}s. "
+                    f"The analysis will use Claude's training knowledge for '{game_title}' instead. "
+                    "This is normal for popular titles with many search results.]"
+                )
+            except Exception as e:
+                err = str(e).lower()
+                if "429" in err or "too many requests" in err:
+                    # httpx may raise before we see the status code in some cases
+                    if _attempt < _RL_MAX_TRIES - 1:
+                        time.sleep(_RL_WAIT_BASE * (2 ** _attempt))
+                        continue
+                return f"[Web search error: {e}]"
+
+        return "[Web search failed after retries — using training knowledge.]"
 
     # ── Poll futures with heartbeat so Streamlit never blocks ────────────────
     # as_completed() would block the generator for up to 120 s with no yields,
@@ -2057,6 +2199,15 @@ Rules:
     yield ("slide_data", slide_data)
 
     # ── STAGE 4: PPTX rendering ───────────────────────────────────────────────
+    _template_slide_count = ""
+    if template_bytes:
+        try:
+            from pptx import Presentation as _PrsCheck
+            _t = _PrsCheck(io.BytesIO(template_bytes))
+            _template_slide_count = f" ({len(_t.slides)}-slide template)"
+        except Exception:
+            pass
+
     yield ("spinner", (
         "🖥️ <b>Stage 4 of 4 — Building the PowerPoint file</b><br>"
         "<span class='log-detail'>Rendering {} slides with python-pptx{}. "
@@ -2064,11 +2215,23 @@ Rules:
         "adding chrome footer with page numbers, writing to memory.</span>"
     ).format(
         n_slides,
-        " using your uploaded .pptx as the base (master backgrounds and logos preserved)" if template_bytes else " with SEGA dark theme",
+        f" using your uploaded .pptx{_template_slide_count} as the base" if template_bytes else " with SEGA dark theme",
     ))
 
     try:
         pptx_bytes_out = generate_pptx(slide_data, template_bytes=template_bytes)
+    except ValueError as e:
+        # Template classification failed — fall back to SEGA dark scratch-build
+        err_str = str(e)
+        yield ("log", (
+            f"⚠️ <b>Template could not be used</b> — falling back to SEGA dark theme.<br>"
+            f"<span class='log-detail'>{err_str}</span>"
+        ))
+        try:
+            pptx_bytes_out = generate_pptx(slide_data, template_bytes=None)
+        except Exception as e2:
+            yield ("error", f"PPTX generation error (fallback): {e2}")
+            return
     except Exception as e:
         yield ("error", f"PPTX generation error: {e}")
         return
