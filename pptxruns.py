@@ -2210,7 +2210,13 @@ def _api_stream(headers: dict, payload: dict, timeout: int = 240,
                 "https://api.anthropic.com/v1/messages",
                 headers=stream_headers,
                 json=stream_payload,
-                timeout=httpx.Timeout(timeout, connect=10),
+                timeout=httpx.Timeout(
+                    timeout,          # total wall-clock limit
+                    connect=10,       # connection timeout
+                    read=timeout,     # per-read timeout
+                    write=30,         # write timeout
+                    pool=10,          # pool acquisition timeout
+                ),
             ) as resp:
                 if resp.status_code == 429:
                     if attempt == _RL_MAX_TRIES - 1:
@@ -2350,19 +2356,24 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
         HARD_TIMEOUT = 60   # true wall-clock seconds — future.result() fires this hard
 
         prompt = (
-            f"Research the video game \"{title}\" for a competitive analysis. "
-            "Search the web and write a brief report covering:\n\n"
-            "OVERVIEW: Developer, publisher, release date, platforms, price.\n"
-            "CRITICAL RECEPTION: Metacritic score, 2-3 outlet scores, key praise and criticism.\n"
-            "COMMERCIAL PERFORMANCE: Sales figures if available.\n"
-            "GAMEPLAY: 3-4 core mechanics in one sentence each.\n"
-            "MARKET CONTEXT: 1-2 comparable competitor titles.\n\n"
-            "Keep it under 350 words. Use real numbers only."
+            f"Research the video game \"{title}\" for an executive competitive analysis presentation. "
+            "Search the web for current information and write a structured report covering:\n\n"
+            "OVERVIEW: Developer, publisher, release date, platforms, genre, launch price.\n\n"
+            "CRITICAL RECEPTION: Metacritic score (critic + user), scores from 3-4 named outlets "
+            "(IGN, GameSpot, Eurogamer etc). 4 specific things reviewers praised and 4 they criticised.\n\n"
+            "COMMERCIAL PERFORMANCE: Launch window sales, lifetime sales if available, "
+            "publisher statements, chart positions.\n\n"
+            "GAMEPLAY & FEATURES: 5-6 core mechanics in 1-2 sentences each. "
+            "Story length estimate. Any multiplayer or co-op features.\n\n"
+            "POST-LAUNCH: Notable DLC or updates released.\n\n"
+            "MARKET CONTEXT: 2-3 biggest competitor titles in the same window. "
+            "How it compares to the previous franchise entry.\n\n"
+            "Use real numbers throughout. Aim for 650-750 words total."
         )
 
         payload = {
             "model": "claude-haiku-4-5-20251001",  # Haiku is faster for web search
-            "max_tokens": 1200,
+            "max_tokens": 2000,
             "tools": [{"type": "web_search_20250305", "name": "web_search"}],
             "messages": [{"role": "user", "content": prompt}],
         }
@@ -2701,6 +2712,7 @@ Rules:
     _stream_elapsed = 0
     _first_chunk    = True
     _done           = False
+    _STREAM_TIMEOUT = 300  # hard wall-clock cap on the entire generation phase
 
     try:
         while not _done:
@@ -2710,6 +2722,12 @@ Rules:
             except _queue.Empty:
                 # Nothing arrived in 2s — emit a heartbeat tick
                 _stream_elapsed += 2
+                if _stream_elapsed >= _STREAM_TIMEOUT:
+                    yield ("error",
+                        f"⏱️ <b>Generation timed out after {_STREAM_TIMEOUT}s.</b><br>"
+                        "The API connection stalled. Try again — if it keeps happening, "
+                        "switch to <b>Haiku</b> in the sidebar or reduce uploaded documents.")
+                    return
                 if _first_chunk:
                     yield ("spinner",
                         f"⏳ <b>Waiting for Claude…</b> {_stream_elapsed}s elapsed — "
