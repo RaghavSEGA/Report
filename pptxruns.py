@@ -2301,6 +2301,10 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
         "Content is capped at {:,} characters to stay within API token limits.</span>"
     ).format(_MAX_DOC_CHARS))
 
+    # Parse comma-separated game titles into a clean list
+    game_titles = [g.strip() for g in (game_title or "").split(",") if g.strip()]
+    game_title_display = ", ".join(game_titles) if game_titles else ""
+
     if web_search_en and game_titles:
         _n_games = len(game_titles)
         yield ("spinner", (
@@ -2313,10 +2317,6 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
             game_title_display,
             f"{_n_games} parallel searches running. " if _n_games > 1 else ""
         ))
-
-    # Parse comma-separated game titles into a clean list
-    game_titles = [g.strip() for g in (game_title or "").split(",") if g.strip()]
-    game_title_display = ", ".join(game_titles) if game_titles else ""
 
     combined_docs  = "[No documents uploaded]"
     research_text  = "[No reference game specified]"
