@@ -1187,7 +1187,45 @@ def _analyse_template(prs):
     Uses a scored approach: each candidate heuristic contributes points,
     and the highest scorer wins.  This is much more robust than the
     previous if/elif chain which missed stats slides entirely.
+
+    For "blank branding" templates (≤5 slides, no bullet/content slides),
+    returns a special dict with key "__blank_template__" = True so the
+    caller can switch to the overlay-on-content-slide strategy.
     """
+    # Detect blank branding templates — just title + section + blank + closing
+    n_slides = len(prs.slides)
+    n_bullet_slides = sum(
+        1 for slide in prs.slides
+        if sum(1 for s in slide.shapes
+               if s.has_text_frame and s.text_frame.text.strip().startswith("▸")) >= 3
+    )
+    if n_slides <= 6 and n_bullet_slides == 0:
+        # Find the best "content" slide — the white one with branding sidebar
+        # (typically slide 2 in SEGA templates)
+        content_idx = 0
+        for i, slide in enumerate(prs.slides):
+            texts = [s.text_frame.text.strip().upper() for s in slide.shapes if s.has_text_frame]
+            # Content slide: has SUBJECT but NOT HEADLINE or THANK YOU
+            if any("SUBJECT" in t for t in texts) and not any(t in ("HEADLINE","THANK YOU!") for t in texts):
+                content_idx = i
+                break
+        title_idx = 0
+        closing_idx = max(range(n_slides), key=lambda i: sum(
+            1 for s in prs.slides[i].shapes
+            if s.has_text_frame and "thank" in s.text_frame.text.lower()
+        ))
+        return {
+            "__blank_template__": True,
+            "title":          0,
+            "section":        content_idx,
+            "bullets":        content_idx,
+            "stats":          content_idx,
+            "comparison":     content_idx,
+            "recommendation": content_idx,
+            "closing":        closing_idx,
+            "__content_idx__": content_idx,
+        }
+
     type_map = {}
 
     for i, slide in enumerate(prs.slides):
@@ -1321,8 +1359,10 @@ def _generate_from_template(slide_data: dict, template_bytes: bytes) -> bytes:
     # Quality check: if fewer than 4 distinct slide indices are mapped,
     # the template couldn't be classified properly — return a diagnostic error
     # so the caller can fall back to scratch-build.
-    unique_indices = set(type_map.values())
-    if len(unique_indices) < 4:
+    is_blank_template = type_map.get("__blank_template__", False)
+    unique_indices = set(v for k, v in type_map.items() if not k.startswith("__"))
+
+    if not is_blank_template and len(unique_indices) < 4:
         raise ValueError(
             f"Template classification failed — only {len(unique_indices)} distinct slide "
             f"types found (need ≥4). type_map={type_map}. "
@@ -1418,6 +1458,169 @@ def _generate_from_template(slide_data: dict, template_bytes: bytes) -> bytes:
         """Copy the template slide for stype and populate with slide data s."""
         src = _get_source_slide(stype)
         new_slide = _copy_slide(prs_out, src)
+
+        # ── BLANK TEMPLATE OVERLAY PATH ──────────────────────────────────
+        # For blank branding templates (no pre-built content slides),
+        # the content slide is the white slide with sidebar/logo only.
+        # We write all content as fresh text boxes using the template's
+        # colour palette, overlaid on the clean branded background.
+        if is_blank_template and stype not in ("title", "closing"):
+            from pptx.util import Inches as _In, Pt as _Pt
+            from pptx.dml.color import RGBColor as _RGB
+            from pptx.enum.text import PP_ALIGN as _PPA
+
+            # Extract palette from template theme
+            tp = extract_template_palette(template_bytes)
+            TEXT   = tp.get("white", "111122")    # primary text (dark on light bg)
+            MUTED  = tp.get("midgray", "556677")  # secondary text
+            ACCENT = tp.get("accent",  "00337E")  # template accent colour
+            FONT   = tp.get("body_font", "Calibri")
+
+            def _rgb3(h):
+                h = h.lstrip('#').upper().ljust(6,'0')[:6]
+                return _RGB(int(h[0:2],16), int(h[2:4],16), int(h[4:6],16))
+
+            # Content area: left edge ~0.9", top ~0.5", right to slide edge
+            CX = 0.95   # content x start
+            CW = W - CX - 0.15  # content width
+            CY = 0.45
+
+            # Write title/subject into the SUBJECT sidebar if present
+            subj = _subject_shape(new_slide)
+            if subj:
+                _set_text(subj, s.get("title", ""))
+
+            if stype in ("bullets", "recommendation", "section"):
+                # Section header line
+                hdr = new_slide.shapes.add_textbox(_In(CX), _In(CY), _In(CW), _In(0.55))
+                hdr.text_frame.word_wrap = False
+                p = hdr.text_frame.paragraphs[0]
+                r = p.add_run()
+                r.text = s.get("title", "")
+                r.font.bold = True
+                r.font.size = _Pt(22)
+                r.font.color.rgb = _rgb3(ACCENT)
+                r.font.name = FONT
+                # Thin rule under header
+                try:
+                    from pptx.util import Emu as _Emu
+                    rule = new_slide.shapes.add_shape(1, _In(CX), _In(CY+0.58), _In(CW), _Emu(18000))
+                    rule.fill.solid(); rule.fill.fore_color.rgb = _rgb3(ACCENT)
+                    rule.line.fill.background()
+                except Exception: pass
+
+                bullets = (s.get("bullets") or [])[:6]
+                for bi, bullet in enumerate(bullets):
+                    y = CY + 0.75 + bi * 0.72
+                    tb = new_slide.shapes.add_textbox(_In(CX), _In(y), _In(CW), _In(0.65))
+                    tf = tb.text_frame; tf.word_wrap = True
+                    p = tf.paragraphs[0]
+                    r = p.add_run()
+                    r.text = f"▸  {bullet}"
+                    r.font.size = _Pt(13)
+                    r.font.color.rgb = _rgb3(TEXT)
+                    r.font.name = FONT
+                if s.get("body"):
+                    tb = new_slide.shapes.add_textbox(_In(CX), _In(H-1.1), _In(CW), _In(0.5))
+                    r = tb.text_frame.paragraphs[0].add_run()
+                    r.text = s["body"]; r.font.size = _Pt(10); r.font.italic = True
+                    r.font.color.rgb = _rgb3(MUTED); r.font.name = FONT
+
+            elif stype == "stats":
+                hdr = new_slide.shapes.add_textbox(_In(CX), _In(CY), _In(CW), _In(0.5))
+                r = hdr.text_frame.paragraphs[0].add_run()
+                r.text = s.get("title",""); r.font.bold = True; r.font.size = _Pt(20)
+                r.font.color.rgb = _rgb3(ACCENT); r.font.name = FONT
+
+                stats = (s.get("stats") or [])[:4]
+                card_w = (CW - 0.15 * (len(stats)-1)) / max(len(stats), 1)
+                for si, stat in enumerate(stats):
+                    cx = CX + si * (card_w + 0.15)
+                    # Card background
+                    try:
+                        card = new_slide.shapes.add_shape(1, _In(cx), _In(CY+0.6), _In(card_w), _In(H-CY-0.9))
+                        card.fill.solid()
+                        h_bg = tp.get("subtle","EEF2FF") if tp.get("is_dark") else "EEF2FF"
+                        card.fill.fore_color.rgb = _rgb3(h_bg)
+                        card.line.fill.background()
+                    except Exception: pass
+                    # Value
+                    vb = new_slide.shapes.add_textbox(_In(cx+0.1), _In(CY+0.75), _In(card_w-0.2), _In(1.3))
+                    vb.text_frame.paragraphs[0].alignment = PP_ALIGN.CENTER
+                    r = vb.text_frame.paragraphs[0].add_run()
+                    r.text = stat.get("value",""); r.font.bold = True; r.font.size = _Pt(36)
+                    r.font.color.rgb = _rgb3(ACCENT); r.font.name = FONT
+                    # Label
+                    lb = new_slide.shapes.add_textbox(_In(cx+0.1), _In(CY+2.1), _In(card_w-0.2), _In(0.55))
+                    lb.text_frame.paragraphs[0].alignment = PP_ALIGN.CENTER
+                    r2 = lb.text_frame.paragraphs[0].add_run()
+                    r2.text = stat.get("label",""); r2.font.bold = True; r2.font.size = _Pt(12)
+                    r2.font.color.rgb = _rgb3(TEXT); r2.font.name = FONT
+                    # Note
+                    nb = new_slide.shapes.add_textbox(_In(cx+0.1), _In(CY+2.7), _In(card_w-0.2), _In(0.4))
+                    nb.text_frame.paragraphs[0].alignment = PP_ALIGN.CENTER
+                    r3 = nb.text_frame.paragraphs[0].add_run()
+                    r3.text = stat.get("note",""); r3.font.size = _Pt(10)
+                    r3.font.color.rgb = _rgb3(MUTED); r3.font.name = FONT
+
+            elif stype == "comparison":
+                hdr = new_slide.shapes.add_textbox(_In(CX), _In(CY), _In(CW), _In(0.5))
+                r = hdr.text_frame.paragraphs[0].add_run()
+                r.text = s.get("title",""); r.font.bold = True; r.font.size = _Pt(20)
+                r.font.color.rgb = _rgb3(ACCENT); r.font.name = FONT
+
+                cmp   = s.get("comparison") or {}
+                rows  = (cmp.get("rows") or [])[:8]
+                lbl_w = CW * 0.30
+                col_w = CW * 0.33
+
+                # Column headers
+                for ci, title in enumerate([cmp.get("left_title","Left"), cmp.get("right_title","Right")]):
+                    hx = CX + lbl_w + ci*col_w
+                    hb = new_slide.shapes.add_textbox(_In(hx), _In(CY+0.55), _In(col_w-0.05), _In(0.38))
+                    hb.text_frame.paragraphs[0].alignment = PP_ALIGN.CENTER
+                    try:
+                        hb._element.find('.//{http://schemas.openxmlformats.org/drawingml/2006/main}solidFill')
+                        bg_shape = new_slide.shapes.add_shape(1, _In(hx), _In(CY+0.55), _In(col_w-0.05), _In(0.38))
+                        bg_col = ACCENT if ci == 0 else "ED7D31"
+                        bg_shape.fill.solid(); bg_shape.fill.fore_color.rgb = _rgb3(bg_col)
+                        bg_shape.line.fill.background()
+                    except Exception: pass
+                    r = hb.text_frame.paragraphs[0].add_run()
+                    r.text = title; r.font.bold = True; r.font.size = _Pt(10)
+                    r.font.color.rgb = _RGB(255,255,255); r.font.name = FONT
+
+                for ri, row in enumerate(rows):
+                    ry = CY + 1.0 + ri * 0.48
+                    row_bg = "EEF2FF" if ri % 2 == 0 else "F8F9FF"
+                    try:
+                        bg = new_slide.shapes.add_shape(1, _In(CX), _In(ry), _In(CW), _In(0.42))
+                        bg.fill.solid(); bg.fill.fore_color.rgb = _rgb3(row_bg)
+                        bg.line.fill.background()
+                    except Exception: pass
+                    # Label
+                    lb = new_slide.shapes.add_textbox(_In(CX+0.05), _In(ry+0.03), _In(lbl_w-0.1), _In(0.36))
+                    r = lb.text_frame.paragraphs[0].add_run()
+                    r.text = row.get("label",""); r.font.bold = True; r.font.size = _Pt(9)
+                    r.font.color.rgb = _rgb3(MUTED); r.font.name = FONT
+                    # Left value
+                    lv = new_slide.shapes.add_textbox(_In(CX+lbl_w), _In(ry+0.03), _In(col_w-0.1), _In(0.36))
+                    lv.text_frame.paragraphs[0].alignment = PP_ALIGN.CENTER
+                    r2 = lv.text_frame.paragraphs[0].add_run()
+                    r2.text = row.get("left",""); r2.font.size = _Pt(9)
+                    r2.font.color.rgb = _rgb3(TEXT); r2.font.name = FONT
+                    # Right value with delta colour
+                    delta = row.get("delta","neutral")
+                    dc = "22AA66" if delta=="positive" else "CC2244" if delta=="negative" else MUTED
+                    rv = new_slide.shapes.add_textbox(_In(CX+lbl_w+col_w), _In(ry+0.03), _In(col_w-0.1), _In(0.36))
+                    rv.text_frame.paragraphs[0].alignment = PP_ALIGN.CENTER
+                    r3 = rv.text_frame.paragraphs[0].add_run()
+                    r3.text = row.get("right",""); r3.font.size = _Pt(9)
+                    r3.font.color.rgb = _rgb3(dc); r3.font.name = FONT
+
+            return new_slide
+
+
 
         # ── TITLE ────────────────────────────────────────────────────────
         if stype == "title":
@@ -1790,7 +1993,7 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
             "simultaneously searching the web for <i>{}</i>. "
             "Two focused searches run in sequence: first critical reception &amp; sales data, "
             "then gameplay mechanics &amp; market context. "
-            "Single focused search with a 110s hard timeout — falls back to model knowledge if it times out.</span>"
+            "Single focused search with a 90s wall-clock deadline — falls back to model knowledge if it times out.</span>"
         ).format(game_title))
 
     combined_docs  = "[No documents uploaded]"
@@ -1822,28 +2025,7 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
 
         import httpx
 
-        HARD_TIMEOUT = 110  # httpx enforces this as a true wall-clock deadline
-
-        prompt = (
-            f"Research the video game \"{game_title}\" for an executive competitive analysis presentation. "
-            "Search the web for current information and write a thorough structured report with these sections:\n\n"
-            "OVERVIEW: Developer, publisher, release date, platforms, genre, ESRB/PEGI rating, launch price.\n\n"
-            "CRITICAL RECEPTION: Metacritic score (critic + user), OpenCritic score, "
-            "scores from at least 3-4 named outlets (e.g. IGN, Eurogamer, GameSpot). "
-            "List 4 specific things reviewers praised and 4 specific things they criticised — "
-            "be precise (e.g. 'combat depth', 'open world size', 'performance issues on Switch').\n\n"
-            "COMMERCIAL PERFORMANCE: Launch window sales figures, lifetime sales if available, "
-            "any sales milestones or statements from the publisher, chart positions.\n\n"
-            "GAMEPLAY & FEATURES: 6-7 core mechanics explained in 1-2 sentences each. "
-            "Main story length and completionist length. Multiplayer or co-op features. "
-            "Accessibility options.\n\n"
-            "POST-LAUNCH: Each DLC pack — name, price, release date, brief description, reception. "
-            "Major patches or updates. Current player activity signals.\n\n"
-            "MARKET CONTEXT: The 3-4 biggest competitor titles released in the same window. "
-            "How this game compares to the previous entry in its franchise. "
-            "Any notable controversies, marketing moments, or cultural impact.\n\n"
-            "Use real numbers throughout. Aim for 700-900 words total."
-        )
+        HARD_TIMEOUT = 90   # true wall-clock deadline enforced via thread future
 
         payload = {
             "model": model,
@@ -1852,54 +2034,65 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
             "messages": [{"role": "user", "content": prompt}],
         }
 
-        for _attempt in range(_RL_MAX_TRIES):
-            try:
-                resp = httpx.post(
-                    "https://api.anthropic.com/v1/messages",
-                    headers=headers,
-                    json=payload,
-                    timeout=httpx.Timeout(HARD_TIMEOUT, connect=10),
-                )
+        import httpx
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutTimeout
 
-                # 429 — honour retry-after header then retry
-                if resp.status_code == 429:
-                    if _attempt == _RL_MAX_TRIES - 1:
-                        return (
-                            f"[Web search rate-limited after {_RL_MAX_TRIES} retries. "
-                            "The analysis will use Claude's training knowledge instead.]"
-                        )
-                    try:
-                        wait = max(float(
-                            resp.headers.get("retry-after") or
-                            resp.headers.get("x-ratelimit-reset-requests") or
-                            _RL_WAIT_BASE * (2 ** _attempt)
-                        ), 1.0)
-                    except (TypeError, ValueError):
-                        wait = _RL_WAIT_BASE * (2 ** _attempt)
-                    time.sleep(wait)
-                    continue
-
-                resp.raise_for_status()
-                blocks = resp.json().get("content", [])
-                text = "\n".join(b.get("text", "") for b in blocks if b.get("type") == "text")
-                return text.strip() or (
-                    f"[No web results — analysis will use model knowledge for '{game_title}']"
-                )
-
-            except httpx.TimeoutException:
-                return (
-                    f"[Web search timed out after {HARD_TIMEOUT}s. "
-                    f"The analysis will use Claude's training knowledge for '{game_title}' instead. "
-                    "This is normal for popular titles with many search results.]"
-                )
-            except Exception as e:
-                err = str(e).lower()
-                if "429" in err or "too many requests" in err:
-                    # httpx may raise before we see the status code in some cases
-                    if _attempt < _RL_MAX_TRIES - 1:
+        def _do_request():
+            """Runs in a background thread; may be abandoned after HARD_TIMEOUT."""
+            for _attempt in range(_RL_MAX_TRIES):
+                try:
+                    # Large socket timeout — wall-clock is enforced by future.result()
+                    resp = httpx.post(
+                        "https://api.anthropic.com/v1/messages",
+                        headers=headers,
+                        json=payload,
+                        timeout=httpx.Timeout(300, connect=10),
+                    )
+                    if resp.status_code == 429:
+                        if _attempt == _RL_MAX_TRIES - 1:
+                            return ("[Web search rate-limited. "
+                                    "The analysis will use Claude's training knowledge instead.]")
+                        try:
+                            wait = max(float(
+                                resp.headers.get("retry-after") or
+                                _RL_WAIT_BASE * (2 ** _attempt)
+                            ), 1.0)
+                        except (TypeError, ValueError):
+                            wait = _RL_WAIT_BASE * (2 ** _attempt)
+                        time.sleep(wait)
+                        continue
+                    resp.raise_for_status()
+                    blocks = resp.json().get("content", [])
+                    text = "\n".join(b.get("text","") for b in blocks if b.get("type")=="text")
+                    return text.strip() or f"[No web results for '{game_title}']"
+                except Exception as e:
+                    err = str(e).lower()
+                    if ("429" in err or "too many requests" in err) and _attempt < _RL_MAX_TRIES - 1:
                         time.sleep(_RL_WAIT_BASE * (2 ** _attempt))
                         continue
-                return f"[Web search error: {e}]"
+                    return f"[Web search error: {e}]"
+            return "[Web search failed after retries]"
+
+        # Submit to a single-thread executor and impose a hard wall-clock limit.
+        # future.result(timeout=N) raises TimeoutError in THIS thread after N seconds
+        # regardless of what the background thread is doing — it doesn't block.
+        _ex  = ThreadPoolExecutor(max_workers=1)
+        _fut = _ex.submit(_do_request)
+        try:
+            return _fut.result(timeout=HARD_TIMEOUT)
+        except _FutTimeout:
+            # Background thread keeps running but we move on immediately
+            _ex.shutdown(wait=False)
+            return (
+                f"[Web search timed out after {HARD_TIMEOUT}s. "
+                f"The analysis will use Claude's training knowledge for '{game_title}' instead. "
+                "This is normal for popular titles with many search results.]"
+            )
+        except Exception as e:
+            _ex.shutdown(wait=False)
+            return f"[Web search error: {e}]"
+        finally:
+            _ex.shutdown(wait=False)
 
         return "[Web search failed after retries — using training knowledge.]"
 
@@ -1985,7 +2178,7 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
                 if still_doing:
                     yield ("spinner", (
                         "⏳ <b>Still working…</b> " + " &amp; ".join(still_doing) + "<br>"
-                        "<span class='log-detail'>Web search has a 110s hard limit — if it times out, "
+                        "<span class='log-detail'>Web search has a 90s wall-clock deadline — if it times out, "
                         "the analysis will automatically use Claude's training knowledge instead. "
                         "The pipeline will not hang.</span>"
                     ))
