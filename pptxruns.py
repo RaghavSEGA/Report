@@ -480,6 +480,7 @@ with st.sidebar:
 
     st.markdown('<span class="sidebar-section">Options</span>', unsafe_allow_html=True)
     web_search_enabled = st.checkbox("Web search for reference game", value=True)
+    plan_mode          = st.checkbox("✏️ Plan mode — review outline before exporting", value=False)
     slide_count        = st.slider("Target slides", 6, 20, 10)
 
     st.markdown('<span class="sidebar-section">Theme</span>', unsafe_allow_html=True)
@@ -540,6 +541,18 @@ with col_left:
     if uploaded_files:
         st.caption(f"{len(uploaded_files)} file(s): " + ", ".join(f.name for f in uploaded_files))
 
+    st.markdown('<div class="section-label" style="margin-top:.75rem;">Data for charts (optional)</div>', unsafe_allow_html=True)
+    data_files = st.file_uploader(
+        "Upload data files for chart generation",
+        type=["xlsx", "xls", "csv"],
+        accept_multiple_files=True,
+        label_visibility="hidden",
+        key="data_upload",
+        help="Upload Excel or CSV files. Mention specific charts in the Business Question field.",
+    )
+    if data_files:
+        st.caption(f"📊 {len(data_files)} data file(s): " + ", ".join(f.name for f in data_files))
+
     st.markdown('<div class="section-label">Analysis inputs</div>', unsafe_allow_html=True)
 
     game_title = st.text_input(
@@ -566,7 +579,10 @@ with col_right:
     output_area   = st.empty()
     download_area = st.empty()
 
-    if not run_btn and "pptx_bytes" not in st.session_state:
+    if st.session_state.get("plan_mode_active") and not run_btn:
+        with output_area.container():
+            _render_plan_modal(st.session_state.get("template_upload"))
+    elif not run_btn and "pptx_bytes" not in st.session_state:
         output_area.markdown("""
 <div class="status-card">
 <div class="status-card-label">Ready</div>
@@ -987,6 +1003,279 @@ def extract_template_palette(pptx_bytes: bytes) -> dict:
     }
 
 
+def _render_chart_png(chart_spec: dict, width_px=860, height_px=480) -> bytes:
+    """
+    Render a chart spec to PNG bytes using matplotlib.
+    chart_spec keys:
+      chart_type : bar | line | scatter | pie | horizontal_bar
+      title      : str
+      x_label    : str
+      y_label    : str
+      series     : [{"label": str, "values": [num, ...]}]
+      categories : [str, ...]   (x-axis labels / pie slices)
+      colors     : [hex, ...]   optional
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.ticker as mticker
+    import numpy as np
+
+    spec        = chart_spec or {}
+    ctype       = spec.get("chart_type", "bar").lower()
+    title       = spec.get("title", "")
+    x_label     = spec.get("x_label", "")
+    y_label     = spec.get("y_label", "")
+    categories  = spec.get("categories") or []
+    series      = spec.get("series") or []
+    colors      = spec.get("colors") or ["#003D7A","#ED7D31","#22AA66","#CC2244","#8B5CF6","#0EA5E9"]
+
+    # Normalize colors — ensure they have # prefix for matplotlib
+    colors = [(c if c.startswith('#') else f'#{c}') for c in colors]
+
+    dpi = 120
+    fw  = width_px  / dpi
+    fh  = height_px / dpi
+
+    # SEGA-branded style
+    bg      = "#FFFFFF"
+    grid_c  = "#E2E8F0"
+    text_c  = "#1E293B"
+    plt.rcParams.update({
+        "font.family":     "DejaVu Sans",
+        "font.size":       9,
+        "axes.labelcolor": text_c,
+        "xtick.color":     text_c,
+        "ytick.color":     text_c,
+        "text.color":      text_c,
+        "axes.edgecolor":  grid_c,
+        "axes.facecolor":  bg,
+        "figure.facecolor":bg,
+    })
+
+    fig, ax = plt.subplots(figsize=(fw, fh), dpi=dpi)
+    ax.set_facecolor(bg)
+    ax.grid(axis="y", color=grid_c, linewidth=0.6, zorder=0)
+    ax.set_axisbelow(True)
+    for spine in ax.spines.values():
+        spine.set_color(grid_c)
+
+    if ctype == "pie":
+        vals   = series[0]["values"] if series else []
+        labels = categories or [s["label"] for s in series]
+        wedge_colors = [colors[i % len(colors)] for i in range(len(vals))]
+        ax.pie(vals, labels=labels, autopct="%1.1f%%", colors=wedge_colors,
+               textprops={"fontsize": 8}, startangle=140)
+        ax.axis("equal")
+
+    elif ctype in ("line", "scatter"):
+        x = list(range(len(categories))) if categories else []
+        for si, s in enumerate(series):
+            vals = [float(v) for v in (s.get("values") or [])]
+            col  = colors[si % len(colors)]
+            xs   = x[:len(vals)] if x else list(range(len(vals)))
+            if ctype == "line":
+                ax.plot(xs, vals, marker="o", color=col, linewidth=2,
+                        markersize=5, label=s.get("label",""))
+            else:
+                ax.scatter(xs, vals, color=col, s=40, label=s.get("label",""))
+        if categories:
+            ax.set_xticks(x)
+            ax.set_xticklabels(categories, rotation=25, ha="right", fontsize=8)
+        if len(series) > 1:
+            ax.legend(fontsize=8, framealpha=0.7)
+        if x_label: ax.set_xlabel(x_label, fontsize=8)
+        if y_label: ax.set_ylabel(y_label, fontsize=8)
+
+    elif ctype == "horizontal_bar":
+        cats = categories or [s["label"] for s in series]
+        vals = series[0]["values"] if series else [s.get("values",[0])[0] for s in series]
+        vals = [float(v) for v in vals]
+        y    = np.arange(len(cats))
+        bar_colors = [colors[i % len(colors)] for i in range(len(cats))]
+        bars = ax.barh(y, vals, color=bar_colors, height=0.6, zorder=3)
+        ax.set_yticks(y)
+        ax.set_yticklabels(cats, fontsize=8)
+        ax.bar_label(bars, fmt="%.1f", padding=4, fontsize=7.5, color=text_c)
+        ax.invert_yaxis()
+        ax.grid(axis="x", color=grid_c, linewidth=0.6, zorder=0)
+        if x_label: ax.set_xlabel(x_label, fontsize=8)
+
+    else:  # default: grouped bar
+        cats  = categories or []
+        n_ser = len(series)
+        x     = np.arange(len(cats)) if cats else np.arange(
+                    max(len(s.get("values", [])) for s in series) if series else 1)
+        width = min(0.7 / max(n_ser, 1), 0.35)
+        offsets = np.linspace(-(n_ser-1)*width/2, (n_ser-1)*width/2, n_ser) if n_ser > 1 else [0]
+        for si, s in enumerate(series):
+            vals = [float(v) for v in (s.get("values") or [])]
+            # Single series: use one color per category for visual clarity
+            if n_ser == 1:
+                bar_cols = [colors[i % len(colors)] for i in range(len(vals))]
+            else:
+                bar_cols = colors[si % len(colors)]
+            bars = ax.bar(x[:len(vals)] + offsets[si], vals, width,
+                          label=s.get("label",""), color=bar_cols, zorder=3)
+            ax.bar_label(bars, fmt="%.1f", padding=2, fontsize=7, color=text_c)
+        if cats:
+            ax.set_xticks(x)
+            ax.set_xticklabels(cats, rotation=25, ha="right", fontsize=8)
+        if n_ser > 1:
+            ax.legend(fontsize=8, framealpha=0.7)
+        if x_label: ax.set_xlabel(x_label, fontsize=8)
+        if y_label: ax.set_ylabel(y_label, fontsize=8)
+
+    if title:
+        ax.set_title(title, fontsize=11, fontweight="bold", color=text_c, pad=10)
+
+    fig.tight_layout(pad=1.2)
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight",
+                facecolor=bg, edgecolor="none")
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
+
+
+def _slide_chart(prs, s: dict, C: dict):
+    """
+    Chart slide: title bar + full-width chart image + optional caption.
+    Adds its own slide to prs and returns it.
+    """
+    from pptx.util import Inches, Pt
+    from pptx.dml.color import RGBColor
+    import io as _io
+
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    _set_bg(slide, C.get("bg", "040A1C"))
+
+    title_text   = s.get("title", "Chart")
+    caption_text = s.get("body") or s.get("subtitle") or ""
+    chart_spec   = s.get("chart") or {}
+
+    white  = RGBColor(0xFF, 0xFF, 0xFF)
+    accent = _rgb(C.get("accent", "00AADD"))
+
+    # Title
+    title_box = slide.shapes.add_textbox(Inches(0.4), Inches(0.1), Inches(W_IN-0.8), Inches(0.55))
+    tf = title_box.text_frame
+    r = tf.paragraphs[0].add_run()
+    r.text = title_text; r.font.bold = True; r.font.size = Pt(22)
+    r.font.color.rgb = white
+    _lock_txb(title_box)
+    # Rule
+    _rect(slide, 0.4, 0.67, W_IN-0.8, 0.03, C.get("accent", "00AADD"))
+
+    chart_top = 0.78
+    chart_h   = H_IN - chart_top - (0.55 if caption_text else 0.25)
+
+    try:
+        png_bytes  = _render_chart_png(chart_spec,
+                                        width_px=int((W_IN-0.6)*96),
+                                        height_px=int(chart_h*96))
+        slide.shapes.add_picture(_io.BytesIO(png_bytes),
+                                  Inches(0.3), Inches(chart_top),
+                                  Inches(W_IN-0.6), Inches(chart_h))
+    except Exception as e:
+        err_box = slide.shapes.add_textbox(Inches(1), Inches(2), Inches(W_IN-2), Inches(1.5))
+        err_box.text_frame.paragraphs[0].add_run().text = f"Chart render error: {e}"
+
+    if caption_text:
+        cap_box = slide.shapes.add_textbox(
+            Inches(0.4), Inches(H_IN-0.62), Inches(W_IN-0.8), Inches(0.5))
+        cap_tf = cap_box.text_frame; cap_tf.word_wrap = True
+        cap_r = cap_tf.paragraphs[0].add_run()
+        cap_r.text = caption_text; cap_r.font.size = Pt(9.5); cap_r.font.italic = True
+        cap_r.font.color.rgb = RGBColor(0x94, 0xA3, 0xB8)
+
+    return slide
+
+
+
+    """
+    Build a PPTX from slide_data.
+
+    Two modes:
+    - template_bytes provided → open the template as the Presentation base,
+      map slide types to the template's own layouts, fill title/body
+      placeholders, and draw extra shapes (stats, comparison tables) on top.
+      All master backgrounds, logos, fonts, and decorative elements are
+      preserved exactly as they appear in the template.
+    - No template → scratch-build with the SEGA dark palette (unchanged).
+    """
+    from pptx.util import Inches, Emu
+
+    if template_bytes:
+        return _generate_from_template(slide_data, template_bytes)
+
+    # ── SCRATCH-BUILD PATH (SEGA dark palette) ────────────────────────────
+
+    theme = slide_data.get("theme", {})
+
+    def _safe_dark_hex(val, fallback):
+        if not val or not isinstance(val, str): return fallback
+        h = val.lstrip("#").upper()
+        if len(h) != 6: return fallback
+        try: int(h, 16)
+        except ValueError: return fallback
+        r, g, b = int(h[0:2],16), int(h[2:4],16), int(h[4:6],16)
+        lum = (0.299*r + 0.587*g + 0.114*b) / 255
+        return h if 0.04 < lum < 0.82 else fallback
+
+    C = {
+        "bg":        "040A1C",
+        "subtle":    "1A2A4A",
+        "header_bg": "0033AA",
+        "white":     "FFFFFF",
+        "light":     "D0E4FF",
+        "midgray":   "8899BB",
+        "neutral":   "AABBCC",
+        "gold":      "F5C242",
+        "green":     "22DD88",
+        "red":       "EE3355",
+        "dark":      "040A1C",
+        "primary":   _safe_dark_hex(theme.get("primary"), "0055AA"),
+        "accent":    _safe_dark_hex(theme.get("accent"),  "00AADD"),
+        "heading_font": "Calibri",
+        "body_font":    "Calibri",
+    }
+
+    prs = Presentation()
+    prs.slide_width  = Inches(W_IN)
+    prs.slide_height = Inches(H_IN)
+    blank_layout = prs.slide_layouts[6]
+
+    slides_data = slide_data.get("slides", [])
+    total       = len(slides_data)
+
+    RENDERERS = {
+        "title":          _slide_title,
+        "section":        _slide_section,
+        "bullets":        _slide_bullets,
+        "stats":          _slide_stats,
+        "comparison":     _slide_comparison,
+        "recommendation": _slide_recommendation,
+        "closing":        _slide_closing,
+        "chart":          _slide_chart,
+    }
+
+    for idx, s in enumerate(slides_data, start=1):
+        slide    = prs.slides.add_slide(blank_layout)
+        stype    = (s.get("type") or "bullets").lower()
+        renderer = RENDERERS.get(stype, _slide_bullets)
+        # chart slides manage their own slide creation
+        if stype == "chart":
+            renderer(prs, s, C)
+        else:
+            renderer(slide, s, idx, total, C)
+
+    buf = io.BytesIO()
+    prs.save(buf)
+    buf.seek(0)
+    return _patch_theme(buf.read())
+
+
 def generate_pptx(slide_data: dict, template_bytes: bytes | None = None) -> bytes:
     """
     Build a PPTX from slide_data.
@@ -1052,13 +1341,17 @@ def generate_pptx(slide_data: dict, template_bytes: bytes | None = None) -> byte
         "comparison":     _slide_comparison,
         "recommendation": _slide_recommendation,
         "closing":        _slide_closing,
+        "chart":          _slide_chart,
     }
 
     for idx, s in enumerate(slides_data, start=1):
         slide    = prs.slides.add_slide(blank_layout)
         stype    = (s.get("type") or "bullets").lower()
         renderer = RENDERERS.get(stype, _slide_bullets)
-        renderer(slide, s, idx, total, C)
+        if stype == "chart":
+            renderer(prs, s, C)
+        else:
+            renderer(slide, s, idx, total, C)
 
     buf = io.BytesIO()
     prs.save(buf)
@@ -1446,13 +1739,57 @@ def _generate_from_template(slide_data: dict, template_bytes: bytes) -> bytes:
             nm = shape.name.lower()
             if t.upper() == "SUBJECT" or "subject" in nm:
                 return shape
-            # Also detect by rotation — the sidebar is rotated ~270°
             xfrm = shape._element.find('.//{http://schemas.openxmlformats.org/drawingml/2006/main}xfrm')
             if xfrm is not None and xfrm.get('rot'):
                 rot = int(xfrm.get('rot', 0))
-                if abs(rot) > 8000000:  # > ~90 degrees in EMUs (60000 per degree)
+                if abs(rot) > 8000000:
                     return shape
         return None
+
+    # Shared palette + layout helpers (used by both blank-template overlay and chart slides)
+    from pptx.util import Inches as _In, Pt as _Pt, Emu as _Emu
+    from pptx.dml.color import RGBColor as _RGB
+    from pptx.enum.text import PP_ALIGN as _PPA
+    import io as _ioC
+
+    tp     = extract_template_palette(template_bytes)
+    TEXT   = tp.get("white", "111122")
+    MUTED  = tp.get("midgray", "556677")
+    ACCENT = tp.get("accent",  "00337E")
+    FONT   = tp.get("body_font", "Calibri")
+    CX     = 0.95
+    CW     = W - CX - 0.15
+    CY     = 0.45
+
+    def _rgb3(h):
+        h = (h or "111122").lstrip('#').upper().ljust(6,'0')[:6]
+        return _RGB(int(h[0:2],16), int(h[2:4],16), int(h[4:6],16))
+
+    def _txb(slide_ref, x, y, w, h, text, size=12, bold=False, color=None,
+             align=None, italic=False):
+        """Add a text box to slide_ref."""
+        tb = slide_ref.shapes.add_textbox(_In(x), _In(y), _In(w), _In(h))
+        tf = tb.text_frame
+        tf.word_wrap = True
+        p = tf.paragraphs[0]
+        if align:
+            p.alignment = align
+        run = p.add_run()
+        run.text = str(text)
+        run.font.size = _Pt(size)
+        run.font.bold = bold
+        run.font.italic = italic
+        run.font.name = FONT
+        run.font.color.rgb = _rgb3(color or TEXT)
+        return tb
+
+    def _rect(slide_ref, x, y, w, h, fill_hex):
+        """Add a filled rectangle to slide_ref."""
+        shp = slide_ref.shapes.add_shape(1, _In(x), _In(y), _In(w), _In(h))
+        shp.fill.solid()
+        shp.fill.fore_color.rgb = _rgb3(fill_hex)
+        shp.line.fill.background()
+        return shp
 
     def _add_slide_from_source(stype, s):
         """Copy the template slide for stype and populate with slide data s."""
@@ -1460,59 +1797,7 @@ def _generate_from_template(slide_data: dict, template_bytes: bytes) -> bytes:
         new_slide = _copy_slide(prs_out, src)
 
         # ── BLANK TEMPLATE OVERLAY PATH ──────────────────────────────────
-        # For blank branding templates (no pre-built content slides),
-        # the content slide is the white slide with sidebar/logo only.
-        # We write all content as fresh text boxes using the template's
-        # colour palette, overlaid on the clean branded background.
-        # IMPORTANT: always add background shapes BEFORE text boxes so
-        # text is not covered (PPTX z-order = insertion order).
-        if is_blank_template and stype not in ("title", "closing"):
-            from pptx.util import Inches as _In, Pt as _Pt, Emu as _Emu
-            from pptx.dml.color import RGBColor as _RGB
-            from pptx.enum.text import PP_ALIGN as _PPA
-
-            # Extract palette from template theme
-            tp = extract_template_palette(template_bytes)
-            TEXT   = tp.get("white", "111122")
-            MUTED  = tp.get("midgray", "556677")
-            ACCENT = tp.get("accent",  "00337E")
-            FONT   = tp.get("body_font", "Calibri")
-
-            def _rgb3(h):
-                h = (h or "111122").lstrip('#').upper().ljust(6,'0')[:6]
-                return _RGB(int(h[0:2],16), int(h[2:4],16), int(h[4:6],16))
-
-            def _txb(x, y, w, h, text, size=12, bold=False, color=None,
-                     align=None, italic=False):
-                """Add a text box; returns the shape."""
-                tb = new_slide.shapes.add_textbox(_In(x), _In(y), _In(w), _In(h))
-                tf = tb.text_frame
-                tf.word_wrap = True
-                p = tf.paragraphs[0]
-                if align:
-                    p.alignment = align
-                run = p.add_run()
-                run.text = str(text)
-                run.font.size = _Pt(size)
-                run.font.bold = bold
-                run.font.italic = italic
-                run.font.name = FONT
-                run.font.color.rgb = _rgb3(color or TEXT)
-                return tb
-
-            def _rect(x, y, w, h, fill_hex, line=False):
-                """Add a filled rectangle (background layer)."""
-                shp = new_slide.shapes.add_shape(1, _In(x), _In(y), _In(w), _In(h))
-                shp.fill.solid()
-                shp.fill.fore_color.rgb = _rgb3(fill_hex)
-                if not line:
-                    shp.line.fill.background()
-                return shp
-
-            # Content area
-            CX = 0.95          # left edge (after sidebar)
-            CW = W - CX - 0.15 # content width
-            CY = 0.45          # top edge
+        if is_blank_template and stype not in ("title", "closing", "chart"):
 
             # Write title into SUBJECT sidebar — truncate to prevent overflow
             subj = _subject_shape(new_slide)
@@ -1524,20 +1809,20 @@ def _generate_from_template(slide_data: dict, template_bytes: bytes) -> bytes:
 
             if stype in ("bullets", "recommendation", "section"):
                 # Section header + rule (add rule BEFORE bullets — it's a background element)
-                _txb(CX, CY, CW, 0.5, s.get("title",""),
+                _txb(new_slide, CX, CY, CW, 0.5, s.get("title",""),
                      size=22, bold=True, color=ACCENT)
-                _rect(CX, CY+0.58, CW, 0.02, ACCENT)  # thin rule
+                _rect(new_slide, CX, CY+0.58, CW, 0.02, ACCENT)  # thin rule
 
                 bullets = (s.get("bullets") or [])[:6]
                 for bi, bullet in enumerate(bullets):
                     y = CY + 0.75 + bi * 0.72
-                    _txb(CX, y, CW, 0.65, f"▸  {bullet}", size=13, color=TEXT)
+                    _txb(new_slide, CX, y, CW, 0.65, f"▸  {bullet}", size=13, color=TEXT)
                 if s.get("body"):
                     # Place body text as a subtitle line under the title, not at the bottom
-                    _txb(CX, CY + 0.65, CW, 0.55, s["body"], size=11, italic=True, color=MUTED)
+                    _txb(new_slide, CX, CY + 0.65, CW, 0.55, s["body"], size=11, italic=True, color=MUTED)
 
             elif stype == "stats":
-                _txb(CX, CY, CW, 0.5, s.get("title",""),
+                _txb(new_slide, CX, CY, CW, 0.5, s.get("title",""),
                      size=20, bold=True, color=ACCENT)
 
                 stats = (s.get("stats") or [])[:4]
@@ -1546,20 +1831,20 @@ def _generate_from_template(slide_data: dict, template_bytes: bytes) -> bytes:
                 for si, stat in enumerate(stats):
                     cx = CX + si * (card_w + 0.12)
                     # Background card first
-                    _rect(cx, CY+0.62, card_w, H-CY-0.82, "EEF2FF")
+                    _rect(new_slide, cx, CY+0.62, card_w, H-CY-0.82, "EEF2FF")
                     # Then text on top
-                    _txb(cx+0.1, CY+0.78, card_w-0.2, 1.2,
+                    _txb(new_slide, cx+0.1, CY+0.78, card_w-0.2, 1.2,
                          stat.get("value",""), size=36, bold=True,
                          color=ACCENT, align=_PPA.CENTER)
-                    _txb(cx+0.1, CY+2.05, card_w-0.2, 0.5,
+                    _txb(new_slide, cx+0.1, CY+2.05, card_w-0.2, 0.5,
                          stat.get("label",""), size=12, bold=True,
                          color=TEXT, align=_PPA.CENTER)
-                    _txb(cx+0.1, CY+2.62, card_w-0.2, 0.4,
+                    _txb(new_slide, cx+0.1, CY+2.62, card_w-0.2, 0.4,
                          stat.get("note",""), size=10,
                          color=MUTED, align=_PPA.CENTER)
 
             elif stype == "comparison":
-                _txb(CX, CY, CW, 0.5, s.get("title",""),
+                _txb(new_slide, CX, CY, CW, 0.5, s.get("title",""),
                      size=20, bold=True, color=ACCENT)
 
                 cmp   = s.get("comparison") or {}
@@ -1569,36 +1854,70 @@ def _generate_from_template(slide_data: dict, template_bytes: bytes) -> bytes:
 
                 # Draw ALL backgrounds first, then ALL text on top
                 # Header backgrounds
-                _rect(CX + lbl_w,           CY+0.57, col_w-0.04, 0.38, ACCENT)
-                _rect(CX + lbl_w + col_w,   CY+0.57, col_w-0.04, 0.38, "ED7D31")
+                _rect(new_slide, CX + lbl_w,           CY+0.57, col_w-0.04, 0.38, ACCENT)
+                _rect(new_slide, CX + lbl_w + col_w,   CY+0.57, col_w-0.04, 0.38, "ED7D31")
 
                 # Row backgrounds
                 for ri in range(len(rows)):
                     ry = CY + 1.02 + ri * 0.46
-                    _rect(CX, ry, CW, 0.40, "EEF2FF" if ri % 2 == 0 else "F5F7FF")
+                    _rect(new_slide, CX, ry, CW, 0.40, "EEF2FF" if ri % 2 == 0 else "F5F7FF")
 
                 # Now header text (on top of header backgrounds)
-                _txb(CX + lbl_w,           CY+0.60, col_w-0.04, 0.32,
+                _txb(new_slide, CX + lbl_w,           CY+0.60, col_w-0.04, 0.32,
                      cmp.get("left_title","Left"), size=10, bold=True,
                      color="FFFFFF", align=_PPA.CENTER)
-                _txb(CX + lbl_w + col_w,   CY+0.60, col_w-0.04, 0.32,
+                _txb(new_slide, CX + lbl_w + col_w,   CY+0.60, col_w-0.04, 0.32,
                      cmp.get("right_title","Right"), size=10, bold=True,
                      color="FFFFFF", align=_PPA.CENTER)
 
                 # Row text (on top of row backgrounds)
                 for ri, row in enumerate(rows):
                     ry = CY + 1.02 + ri * 0.46
-                    _txb(CX+0.05,               ry+0.04, lbl_w-0.1, 0.34,
+                    _txb(new_slide, CX+0.05,               ry+0.04, lbl_w-0.1, 0.34,
                          row.get("label",""), size=9, bold=True, color=MUTED)
-                    _txb(CX+lbl_w,              ry+0.04, col_w-0.08, 0.34,
+                    _txb(new_slide, CX+lbl_w,              ry+0.04, col_w-0.08, 0.34,
                          row.get("left",""), size=9, color=TEXT, align=_PPA.CENTER)
                     delta = row.get("delta","neutral")
                     dc = "22AA66" if delta=="positive" else "CC2244" if delta=="negative" else MUTED
-                    _txb(CX+lbl_w+col_w,        ry+0.04, col_w-0.08, 0.34,
+                    _txb(new_slide, CX+lbl_w+col_w,        ry+0.04, col_w-0.08, 0.34,
                          row.get("right",""), size=9, color=dc, align=_PPA.CENTER)
 
             return new_slide
 
+
+        # ── CHART (both template paths) ───────────────────────────────────
+        if stype == "chart":
+            chart_spec   = s.get("chart") or {}
+            title_text   = s.get("title", "Chart")
+            caption_text = s.get("body") or s.get("subtitle") or ""
+
+            subj = _subject_shape(new_slide)
+            if subj:
+                _set_text(subj, title_text[:26]+"…" if len(title_text)>28 else title_text)
+
+            # Title + rule — pass slide_ref=new_slide since closure would grab a stale ref
+            _txb(new_slide, CX, 0.1, CW+0.1, 0.55, title_text, size=22, bold=True,
+                 color=ACCENT)
+            _rect(new_slide, CX, 0.67, CW, 0.02, ACCENT)
+
+            chart_top = 0.78
+            chart_h   = H - chart_top - (0.60 if caption_text else 0.25)
+            try:
+                png_bytes = _render_chart_png(chart_spec,
+                                               width_px=int(CW*96),
+                                               height_px=int(chart_h*96))
+                new_slide.shapes.add_picture(
+                    _ioC.BytesIO(png_bytes),
+                    _In(CX), _In(chart_top), _In(CW), _In(chart_h)
+                )
+            except Exception as _ce:
+                eb = new_slide.shapes.add_textbox(_In(CX), _In(2), _In(CW), _In(1.5))
+                eb.text_frame.paragraphs[0].add_run().text = f"Chart render error: {_ce}"
+
+            if caption_text:
+                _txb(new_slide, CX, H-0.65, CW, 0.5, caption_text, size=9, italic=True,
+                     color=MUTED)
+            return new_slide
 
         # ── TITLE ────────────────────────────────────────────────────────
         if stype == "title":
@@ -1623,15 +1942,12 @@ def _generate_from_template(slide_data: dict, template_bytes: bytes) -> bytes:
                 _set_text(subj, title_text)
 
             # Add a large centered title text box over the white area
-            from pptx.util import Inches as _In, Pt as _Pt
-            from pptx.dml.color import RGBColor as _RGB
             txb = new_slide.shapes.add_textbox(
                 _In(1.5), _In(2.5), _In(W - 2.5), _In(2.5)
             )
             tf = txb.text_frame
             tf.word_wrap = True
             p = tf.paragraphs[0]
-            from pptx.enum.text import PP_ALIGN as _PPA
             p.alignment = _PPA.LEFT
             run = p.add_run()
             run.text = title_text
@@ -1805,20 +2121,17 @@ def _generate_from_template(slide_data: dict, template_bytes: bytes) -> bytes:
                     _set_text(shape, "")
             # Add subtitle as a visible overlay on the blue content area
             if subtitle_text:
-                from pptx.util import Inches as _InC, Pt as _PtC
-                from pptx.dml.color import RGBColor as _RGBC
                 stb = new_slide.shapes.add_textbox(
-                    _InC(1.3), _InC(H * 0.62), _InC(W - 2.0), _InC(0.6)
+                    _In(1.3), _In(H * 0.62), _In(W - 2.0), _In(0.6)
                 )
                 stf = stb.text_frame
                 stf.word_wrap = True
                 sp = stf.paragraphs[0]
-                from pptx.enum.text import PP_ALIGN as _PPAC
-                sp.alignment = _PPAC.CENTER
+                sp.alignment = _PPA.CENTER
                 sr = sp.add_run()
                 sr.text = subtitle_text
-                sr.font.size = _PtC(18)
-                sr.font.color.rgb = _RGBC(0xFF, 0xFF, 0xFF)
+                sr.font.size = _Pt(18)
+                sr.font.color.rgb = _RGB(0xFF, 0xFF, 0xFF)
                 sr.font.bold = False
 
     for s in slides_data:
@@ -1954,7 +2267,8 @@ _MAX_DOC_CHARS = 8_000
 
 
 def run_pipeline(model, uploaded_files, game_title, business_question, audience,
-                 theme_preset, web_search_en, slide_count, template_bytes=None):
+                 theme_preset, web_search_en, slide_count, template_bytes=None,
+                 data_files=None, plan_mode=False):
     """
     Generator yielding (event_type, payload) tuples consumed by the run-button
     handler.  Produces rich narrative log messages so users understand exactly
@@ -2218,7 +2532,36 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
         "SEGA Sonic — High Energy":        "Vibrant SEGA blue with gold accents, high energy.",
     }.get(theme_preset, "SEGA corporate blue")
 
-    analysis_prompt = f"""You are a senior game industry analyst at SEGA.
+    # ── DATA FILES: summarise uploaded Excel/CSV for chart context ──────────
+    data_summary = ""
+    if data_files:
+        import pandas as _pd
+        data_parts = []
+        for _df_file in (data_files or []):
+            try:
+                _df_file.seek(0)
+                _dname = _df_file.name.lower()
+                if _dname.endswith(".csv"):
+                    _df = _pd.read_csv(_df_file)
+                else:
+                    _df = _pd.read_excel(_df_file)
+                _summary_rows = _df.head(20).to_csv(index=False)
+                _num_cols = _df.select_dtypes(include="number").columns.tolist()
+                data_parts.append(
+                    f"FILE: {_df_file.name}\n"
+                    f"Rows: {len(_df)}, Columns: {list(_df.columns)}\n"
+                    f"Numeric columns: {_num_cols}\n"
+                    f"First 20 rows:\n{_summary_rows}"
+                )
+            except Exception as _de:
+                data_parts.append(f"FILE: {_df_file.name} — could not read: {_de}")
+        if data_parts:
+            data_summary = "\n\n".join(data_parts)
+            yield ("log", (
+                f"📊 <b>Data loaded</b> — {len(data_files)} file(s) summarised for chart generation"
+            ))
+
+        analysis_prompt = f"""You are a senior game industry analyst at SEGA.
 Analyse the following and produce a JSON object for a {slide_count}-slide executive presentation.
 
 ## INTERNAL GAME DOCUMENTS:
@@ -2232,19 +2575,29 @@ Analyse the following and produce a JSON object for a {slide_count}-slide execut
 
 ## AUDIENCE: {audience}
 
+## UPLOADED DATA FOR CHARTS:
+{data_summary if data_summary else "(no data files uploaded)"}
+
 Output a single JSON object. Schema:
 {{
   "title":"...", "subtitle":"...",
   "theme":{{"primary":"hex (dark-to-mid blue for SEGA branding, e.g. 0055AA)","accent":"hex (vivid cyan or teal, e.g. 00AADD)"}},
   "slides":[
     {{
-      "type":"title|section|comparison|bullets|stats|recommendation|closing",
+      "type":"title|section|comparison|bullets|stats|recommendation|closing|chart",
       "title":"...","subtitle":"...","body":"...",
       "bullets":["..."],
       "stats":[{{"label":"...","value":"...","note":"..."}}],
       "comparison":{{
         "left_title":"Internal Game","right_title":"{game_title}",
         "rows":[{{"label":"...","left":"...","right":"...","delta":"positive|negative|neutral"}}]
+      }},
+      "chart":{{
+        "chart_type":"bar|line|scatter|pie|horizontal_bar",
+        "title":"...","x_label":"...","y_label":"...",
+        "categories":["..."],
+        "series":[{{"label":"...","values":[0.0]}}],
+        "colors":["hex"]
       }},
       "speaker_notes":"..."
     }}
@@ -2260,6 +2613,7 @@ Rules:
 - Keep speaker_notes to 1-2 sentences maximum — they are brief presenter cues, not essays
 - Bullets: max 6 per slide, each under 15 words
 - Comparison rows: max 8 per slide
+- Use "chart" type when the business question or uploaded data suggests a chart would be clearer than a table. Populate chart.series with real numeric data extracted from documents or research.
 - Return ONLY valid JSON — no markdown fences, no explanation"""
 
     raw_chunks   = []
@@ -2405,6 +2759,11 @@ Rules:
     ))
     yield ("slide_data", slide_data)
 
+    # ── PLAN MODE: stop here and let user edit the outline ────────────────────
+    if plan_mode:
+        yield ("plan_ready", slide_data)
+        return
+
     # ── STAGE 4: PPTX rendering ───────────────────────────────────────────────
     _template_slide_count = ""
     if template_bytes:
@@ -2453,6 +2812,213 @@ Rules:
     yield ("pptx_bytes_out", pptx_bytes_out)
 
 
+
+# ─────────────────────────────────────────────────────────────
+# PLAN MODE — OUTLINE EDITOR (modal dialog)
+# ─────────────────────────────────────────────────────────────
+
+SLIDE_TYPES = ["title","section","bullets","stats","comparison","recommendation","chart","closing"]
+
+def _render_plan_modal(template_bytes_ref):
+    """
+    Renders the Plan Mode outline editor as a full-page modal overlay.
+    Reads/writes st.session_state["plan_slide_data"].
+    """
+    sd     = st.session_state.get("plan_slide_data", {})
+    slides = sd.get("slides", [])
+
+    st.markdown(
+        "<style>"
+        ".pm-card{background:#1e293b;border:1px solid #334155;border-radius:8px;"
+        "padding:.8rem 1rem;margin-bottom:.5rem}"
+        ".pm-num{color:#60a5fa;font-size:.68rem;font-weight:700;"
+        "text-transform:uppercase;letter-spacing:.07em;margin-bottom:.25rem}"
+        "</style>",
+        unsafe_allow_html=True,
+    )
+
+    hcol, xcol = st.columns([4, 1])
+    with hcol:
+        st.markdown(
+            f"<h3 style='color:#e2e8f0;margin:0'>✏️ Plan Mode &nbsp;·&nbsp; "
+            f"<span style='color:#60a5fa'>{sd.get('title','Presentation')}</span></h3>",
+            unsafe_allow_html=True,
+        )
+        st.caption(f"{len(slides)} slides · Edit titles & content · ⬆⬇ reorder · ➕ add · 🗑 delete")
+    with xcol:
+        if st.button("✕ Close", key="pm_close", use_container_width=True):
+            st.session_state.pop("plan_slide_data", None)
+            st.session_state.pop("plan_mode_active", None)
+            st.rerun()
+
+    st.divider()
+
+    updated_slides = list(slides)
+    move_up = move_down = delete_idx = insert_after = None
+
+    for i, slide in enumerate(slides):
+        stype = slide.get("type", "bullets")
+        with st.expander(
+            f"**{i+1}.** `{stype.upper()}` — {slide.get('title','(untitled)')}",
+            expanded=(i == 0),
+        ):
+            rc1, rc2 = st.columns([2, 1])
+            with rc1:
+                new_type = st.selectbox(
+                    "Type", SLIDE_TYPES,
+                    index=SLIDE_TYPES.index(stype) if stype in SLIDE_TYPES else 1,
+                    key=f"pm_type_{i}", label_visibility="collapsed",
+                )
+            with rc2:
+                b1, b2, b3, b4 = st.columns(4)
+                if b1.button("⬆", key=f"pu_{i}", help="Move up"):    move_up      = i
+                if b2.button("⬇", key=f"pd_{i}", help="Move down"):  move_down    = i
+                if b3.button("➕", key=f"pa_{i}", help="Insert after"): insert_after = i
+                if b4.button("🗑", key=f"px_{i}", help="Delete"):     delete_idx   = i
+
+            new_title    = st.text_input("Title",    slide.get("title",""),    key=f"pm_ti_{i}")
+            new_subtitle = st.text_input("Subtitle", slide.get("subtitle") or slide.get("body",""), key=f"pm_su_{i}")
+
+            new_slide = {**slide, "type": new_type, "title": new_title, "subtitle": new_subtitle}
+
+            # ── Type-specific editors ──────────────────────────────────────
+            if new_type in ("bullets", "recommendation"):
+                raw = st.text_area(
+                    "Bullets (one per line, max 6)",
+                    value="\n".join(slide.get("bullets") or []),
+                    height=150, key=f"pm_bu_{i}",
+                )
+                new_slide["bullets"] = [b.strip() for b in raw.split("\n") if b.strip()][:6]
+
+            elif new_type == "stats":
+                st.caption("Format: value | label | note")
+                raw = st.text_area(
+                    "Stats", height=110, key=f"pm_st_{i}",
+                    label_visibility="collapsed",
+                    value="\n".join(
+                        f"{s.get('value','')} | {s.get('label','')} | {s.get('note','')}"
+                        for s in (slide.get("stats") or [])
+                    ),
+                )
+                new_stats = []
+                for line in raw.split("\n"):
+                    p = [x.strip() for x in line.split("|")]
+                    if any(p):
+                        new_stats.append({"value": p[0] if p else "", "label": p[1] if len(p)>1 else "", "note": p[2] if len(p)>2 else ""})
+                new_slide["stats"] = new_stats[:4]
+
+            elif new_type == "comparison":
+                cmp  = slide.get("comparison") or {}
+                rows = cmp.get("rows") or []
+                cl, cr = st.columns(2)
+                lt = cl.text_input("Left col title",  cmp.get("left_title",""),  key=f"pm_lt_{i}")
+                rt = cr.text_input("Right col title", cmp.get("right_title",""), key=f"pm_rt_{i}")
+                st.caption("Rows: label | left | right | delta")
+                raw = st.text_area("Rows", height=140, key=f"pm_ro_{i}", label_visibility="collapsed",
+                    value="\n".join(
+                        f"{r.get('label','')} | {r.get('left','')} | {r.get('right','')} | {r.get('delta','neutral')}"
+                        for r in rows
+                    ),
+                )
+                new_rows = []
+                for line in raw.split("\n"):
+                    p = [x.strip() for x in line.split("|")]
+                    if len(p) >= 3 and any(p):
+                        new_rows.append({"label":p[0],"left":p[1],"right":p[2],"delta":p[3] if len(p)>3 else "neutral"})
+                new_slide["comparison"] = {"left_title":lt,"right_title":rt,"rows":new_rows[:8]}
+
+            elif new_type == "chart":
+                chart = slide.get("chart") or {}
+                ct_opts = ["bar","line","scatter","pie","horizontal_bar"]
+                ct  = st.selectbox("Chart type", ct_opts,
+                                    index=ct_opts.index(chart.get("chart_type","bar")),
+                                    key=f"pm_ct_{i}")
+                ca, cb = st.columns(2)
+                xl  = ca.text_input("X label", chart.get("x_label",""), key=f"pm_xl_{i}")
+                yl  = cb.text_input("Y label", chart.get("y_label",""), key=f"pm_yl_{i}")
+                cats = st.text_input(
+                    "Categories (comma-separated)",
+                    ", ".join(chart.get("categories") or []), key=f"pm_ca_{i}"
+                )
+                st.caption("Series: label | val1, val2, …  (one per line)")
+                raw = st.text_area("Series", height=100, key=f"pm_se_{i}", label_visibility="collapsed",
+                    value="\n".join(
+                        f"{s.get('label','')} | {', '.join(str(v) for v in s.get('values',[]))}"
+                        for s in (chart.get("series") or [])
+                    ),
+                )
+                new_series = []
+                for line in raw.split("\n"):
+                    p = [x.strip() for x in line.split("|")]
+                    if len(p) >= 2:
+                        try:
+                            vals = [float(v.strip()) for v in p[1].split(",") if v.strip()]
+                        except ValueError:
+                            vals = []
+                        new_series.append({"label": p[0], "values": vals})
+                new_slide["chart"] = {
+                    "chart_type": ct, "x_label": xl, "y_label": yl,
+                    "categories": [c.strip() for c in cats.split(",") if c.strip()],
+                    "series": new_series,
+                }
+
+            updated_slides[i] = new_slide
+
+    # ── Reorder / delete / insert ────────────────────────────────────────────
+    if move_up is not None and move_up > 0:
+        updated_slides[move_up-1], updated_slides[move_up] = updated_slides[move_up], updated_slides[move_up-1]
+        sd["slides"] = updated_slides; st.session_state["plan_slide_data"] = sd; st.rerun()
+    if move_down is not None and move_down < len(updated_slides)-1:
+        updated_slides[move_down], updated_slides[move_down+1] = updated_slides[move_down+1], updated_slides[move_down]
+        sd["slides"] = updated_slides; st.session_state["plan_slide_data"] = sd; st.rerun()
+    if delete_idx is not None and len(updated_slides) > 1:
+        updated_slides.pop(delete_idx)
+        sd["slides"] = updated_slides; st.session_state["plan_slide_data"] = sd; st.rerun()
+    if insert_after is not None:
+        updated_slides.insert(insert_after+1, {"type":"bullets","title":"New Slide","bullets":[]})
+        sd["slides"] = updated_slides; st.session_state["plan_slide_data"] = sd; st.rerun()
+
+    # Always persist live edits
+    sd["slides"] = updated_slides
+    st.session_state["plan_slide_data"] = sd
+
+    st.divider()
+
+    # ── Export ────────────────────────────────────────────────────────────────
+    ec1, ec2, _ = st.columns([1, 1, 1])
+    with ec1:
+        if st.button("🚀 Export to PPTX", key="pm_export", type="primary", use_container_width=True):
+            _tb = None
+            _tf = st.session_state.get("template_upload")
+            if _tf is not None:
+                try:
+                    _tf.seek(0); _tb = _tf.read()
+                except Exception:
+                    pass
+            with st.spinner("Building PPTX…"):
+                try:
+                    pptx_out = generate_pptx(st.session_state["plan_slide_data"], template_bytes=_tb)
+                    _title   = st.session_state["plan_slide_data"].get("title","Plan")
+                    fname    = f"SEGA_Plan_{_title.replace(' ','_')[:40]}.pptx"
+                    st.session_state["pptx_bytes"]    = pptx_out
+                    st.session_state["pptx_filename"] = fname
+                    st.session_state.pop("plan_mode_active", None)
+                    st.success("PPTX ready — close plan to download.")
+                    st.rerun()
+                except Exception as _ex:
+                    st.error(f"Export failed: {_ex}")
+    with ec2:
+        if "pptx_bytes" in st.session_state:
+            st.download_button(
+                "⬇️ Download PPTX",
+                data=st.session_state["pptx_bytes"],
+                file_name=st.session_state.get("pptx_filename","SEGA_Plan.pptx"),
+                mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                key="pm_dl",
+                use_container_width=True,
+            )
+
+
 # ─────────────────────────────────────────────────────────────
 # RUN BUTTON HANDLER
 # ─────────────────────────────────────────────────────────────
@@ -2460,6 +3026,11 @@ if run_btn:
     if not business_question.strip():
         st.error("Please enter a business question.")
     else:
+        # Collect data files
+        data_files = st.session_state.get("data_upload") or []
+        if hasattr(data_files, "read"):  # single file — wrap
+            data_files = [data_files]
+
         # Extract template palette if a file was uploaded
         _template_bytes = None
         _template_file = st.session_state.get("template_upload")
@@ -2486,6 +3057,8 @@ if run_btn:
                     model, uploaded_files, game_title, business_question,
                     audience, theme_preset, web_search_enabled, slide_count,
                     template_bytes=_template_bytes,
+                    data_files=data_files,
+                    plan_mode=plan_mode,
                 ):
                     etype = event[0]
 
@@ -2547,6 +3120,10 @@ if run_btn:
                     elif etype == "slide_data":
                         st.session_state["slide_data"] = event[1]
 
+                    elif etype == "plan_ready":
+                        st.session_state["plan_slide_data"] = event[1]
+                        st.session_state["plan_mode_active"] = True
+
                     elif etype == "pptx_bytes_out":
                         fname = f"SEGA_Analysis_{(game_title or 'Report').replace(' ','_')}.pptx"
                         st.session_state["pptx_bytes"]    = event[1]
@@ -2560,6 +3137,10 @@ if run_btn:
                 st.error(f"Unexpected error: {ex}")
                 import traceback
                 st.code(traceback.format_exc())
+
+        if st.session_state.get("plan_mode_active"):
+            with output_area.container():
+                _render_plan_modal(st.session_state.get("template_upload"))
 
         if "pptx_bytes" in st.session_state:
             with download_area.container():
