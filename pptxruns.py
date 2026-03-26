@@ -1062,284 +1062,461 @@ def generate_pptx(slide_data: dict, template_bytes: bytes | None = None) -> byte
 
     buf = io.BytesIO()
     prs.save(buf)
+    buf.seek(0)
     return _patch_theme(buf.read())
 
 
-def _get_layout_map(prs):
-    """Map our 7 slide types to the best matching layout in the template."""
-    layouts = {i: l.name.lower() for i, l in enumerate(prs.slide_layouts)}
-
-    def best(*prefs):
-        for pref in prefs:
-            for i, name in layouts.items():
-                if pref in name:
-                    return i
-        # Last resort: layout with fewest non-footer placeholders
-        return min(
-            range(len(prs.slide_layouts)),
-            key=lambda i: len([p for p in prs.slide_layouts[i].placeholders
-                                if p.placeholder_format.idx < 10])
-        )
-
-    return {
-        "title":          best("title slide", "title,"),
-        "section":        best("section header", "section", "title only"),
-        "bullets":        best("title and content", "content"),
-        "stats":          best("blank", "title only", "content"),
-        "comparison":     best("comparison", "two content", "blank"),
-        "recommendation": best("title and content", "content"),
-        "closing":        best("title slide", "title,", "blank"),
-    }
-
-
-def _get_ph(slide, idx):
-    """Return placeholder by index, or None."""
-    for ph in slide.placeholders:
-        if ph.placeholder_format.idx == idx:
-            return ph
-    return None
-
-
-def _fill_ph(ph, text, size=None, bold=None, italic=None, color=None, font=None):
-    """Set a placeholder's text and optionally override run-level formatting."""
-    if not ph or not text:
-        return
-    ph.text_frame.text = str(text)
-    for para in ph.text_frame.paragraphs:
-        for run in para.runs:
-            if size  is not None: run.font.size   = _pt(size)
-            if bold  is not None: run.font.bold   = bold
-            if italic is not None: run.font.italic = italic
-            if color is not None: run.font.color.rgb = _rgb(color)
-            if font  is not None: run.font.name   = font
-
-
-def _fill_bullets_ph(ph, bullets, size=None, font=None):
-    """Fill a content placeholder with bullet text items."""
-    if not ph or not bullets:
-        return
-    tf = ph.text_frame
-    tf.clear()
-    for i, b in enumerate(bullets):
-        para = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
-        para.text  = str(b)
-        para.level = 0
-        for run in para.runs:
-            if size: run.font.size = _pt(size)
-            if font: run.font.name = font
-
-
-def _template_palette(prs):
+def _copy_slide(prs_dest, slide_src):
     """
-    Pull accent, text, card-fill colours from the template's theme for
-    use in any added shapes (stat cards, comparison tables).
-    Returns a simple dict with safe hex strings.
+    Copy a slide from slide_src into prs_dest and return the new slide.
+    Copies all shapes, including images and grouped shapes.
     """
-    import zipfile as _zf, xml.etree.ElementTree as ET
-    buf = io.BytesIO()
-    prs.save(buf)
-    zf  = _zf.ZipFile(io.BytesIO(buf.getvalue()))
-    ns  = {'a': 'http://schemas.openxmlformats.org/drawingml/2006/main'}
-    colors = {}
-    for fname in zf.namelist():
-        if 'ppt/theme/theme' in fname and fname.endswith('.xml'):
-            tree = ET.fromstring(zf.read(fname))
-            clr  = tree.find('.//a:clrScheme', ns)
-            if clr is not None:
-                for child in clr:
-                    tag = child.tag.split('}')[-1]
-                    for cel in child:
-                        if cel.tag.split('}')[-1] == 'srgbClr':
-                            val = cel.get('val','').upper()
-                            if len(val) == 6:
-                                colors[tag] = val
-            break
+    from pptx.oxml.ns import qn
+    import copy
 
-    def lum(h):
-        h = (h or '').upper()
-        if len(h) != 6: return 0.5
-        r,g,b = int(h[0:2],16),int(h[2:4],16),int(h[4:6],16)
-        return (0.299*r+0.587*g+0.114*b)/255
+    # Add a new slide using the same layout
+    try:
+        layout = slide_src.slide_layout
+        # Find the matching layout in dest by name
+        dest_layout = None
+        for l in prs_dest.slide_layouts:
+            if l.name == layout.name:
+                dest_layout = l
+                break
+        if dest_layout is None:
+            dest_layout = prs_dest.slide_layouts[0]
+        new_slide = prs_dest.slides.add_slide(dest_layout)
+    except Exception:
+        new_slide = prs_dest.slides.add_slide(prs_dest.slide_layouts[0])
 
-    bg      = colors.get('lt1', 'FFFFFF')
-    is_dark = lum(bg) < 0.4
-    text    = 'FFFFFF' if is_dark else '111122'
-    muted   = '9999AA' if is_dark else '556677'
-    accent  = colors.get('dk2') or colors.get('accent1') or '0055AA'
-    card    = '1A2A4A' if is_dark else 'EEF2FF'
-    gold    = colors.get('accent2') or 'E8A800'
-    green   = '22AA66'
-    red     = 'CC2244'
-    return dict(text=text, muted=muted, accent=accent,
-                card=card, gold=gold, green=green, red=red,
-                is_dark=is_dark)
+    # Replace the spTree (shape tree) with a deep copy from the source
+    new_sp_tree  = new_slide.shapes._spTree
+    src_sp_tree  = slide_src.shapes._spTree
+
+    # Remove all auto-added shapes from the blank slide
+    for child in list(new_sp_tree):
+        new_sp_tree.remove(child)
+
+    # Copy all elements from source
+    for el in src_sp_tree:
+        new_sp_tree.append(copy.deepcopy(el))
+
+    # Copy slide background if set directly on the slide (not via master)
+    if slide_src._element.find(qn("p:bg")) is not None:
+        bg_copy = copy.deepcopy(slide_src._element.find(qn("p:bg")))
+        new_slide._element.insert(2, bg_copy)
+
+    return new_slide
 
 
-def _add_shape(slide, x, y, w, h, fill_hex):
-    shape = slide.shapes.add_shape(1, _in(x), _in(y), _in(w), _in(h))
-    shape.fill.solid()
-    shape.fill.fore_color.rgb = _rgb(fill_hex)
-    shape.line.fill.background()
-    return shape
+def _set_txb_text(slide, shape_name, text, size_pt=None, bold=None, color_hex=None):
+    """Find a shape by name on a slide and replace its text."""
+    for shape in slide.shapes:
+        if shape.name == shape_name and shape.has_text_frame:
+            tf = shape.text_frame
+            # Preserve first run's formatting, replace text
+            for para in tf.paragraphs:
+                for run in para.runs:
+                    run.text = ""
+            if tf.paragraphs:
+                p = tf.paragraphs[0]
+                if p.runs:
+                    run = p.runs[0]
+                else:
+                    run = p.add_run()
+                run.text = str(text)
+                if size_pt:
+                    from pptx.util import Pt
+                    run.font.size = Pt(size_pt)
+                if bold is not None:
+                    run.font.bold = bold
+                if color_hex:
+                    from pptx.dml.color import RGBColor
+                    h = color_hex.lstrip("#")
+                    run.font.color.rgb = RGBColor(int(h[0:2],16), int(h[2:4],16), int(h[4:6],16))
+            return True
+    return False
 
 
-def _add_label(slide, text, x, y, w, h, size=11, bold=False, italic=False,
-               color="111111", align=PP_ALIGN.LEFT, font="Calibri"):
-    """Add a plain text box — used for shapes added on top of template layouts."""
-    if not text:
-        return
-    txb = slide.shapes.add_textbox(_in(x), _in(y), _in(w), _in(h))
-    txb.text_frame.word_wrap = True
-    p   = txb.text_frame.paragraphs[0]
-    p.alignment = align
-    run = p.add_run()
-    run.text        = str(text)
-    run.font.size   = _pt(size)
-    run.font.bold   = bold
-    run.font.italic = italic
-    run.font.color.rgb = _rgb(color)
-    run.font.name   = font
+def _find_slide_by_pattern(prs, patterns):
+    """
+    Return the first slide whose shape names/text match any of the given patterns.
+    patterns is a list of strings to look for in shape names or text.
+    Falls back to slide index 0 if nothing matches.
+    """
+    for slide in prs.slides:
+        names = {s.name.lower() for s in slide.shapes}
+        texts = set()
+        for s in slide.shapes:
+            if s.has_text_frame:
+                texts.add(s.text_frame.text.lower()[:30])
+        for pat in patterns:
+            pat_l = pat.lower()
+            if any(pat_l in n for n in names) or any(pat_l in t for t in texts):
+                return slide
+    return prs.slides[0]
+
+
+def _analyse_template(prs):
+    """
+    Classify each slide in the template into one of our 7 content types
+    and return a type → slide_index mapping.
+
+    Uses a scored approach: each candidate heuristic contributes points,
+    and the highest scorer wins.  This is much more robust than the
+    previous if/elif chain which missed stats slides entirely.
+    """
+    type_map = {}
+
+    for i, slide in enumerate(prs.slides):
+        shapes     = list(slide.shapes)
+        n_shapes   = len(shapes)
+        texts_raw  = [s.text_frame.text for s in shapes if s.has_text_frame]
+        texts      = [t.lower().strip() for t in texts_raw]
+        texts_full = " ".join(texts)
+
+        bullet_shapes  = [t for t in texts_raw if t.strip().startswith("▸")]
+        n_bullets      = len(bullet_shapes)
+        n_text_shapes  = len([t for t in texts_raw if t.strip()])
+        n_rects        = len([s for s in shapes
+                               if s.shape_type == 1  # MSO_SHAPE_TYPE.AUTO_SHAPE
+                               and not s.has_text_frame])
+
+        # Column balance — computed here so both stats and comparison can use it
+        mid_x       = (prs.slide_width / 914400) / 2
+        left_count  = sum(1 for s in shapes
+                          if s.has_text_frame and s.text_frame.text.strip()
+                          and (s.left or 0)/914400 < mid_x * 0.8)
+        right_count = sum(1 for s in shapes
+                          if s.has_text_frame and s.text_frame.text.strip()
+                          and (s.left or 0)/914400 > mid_x * 1.1)
+
+        scores = {t: 0 for t in
+                  ("title","section","bullets","stats","comparison","recommendation","closing")}
+
+        # ── TITLE: has HEADLINE and SUBJECT placeholder text ──────────────
+        if any("headline" in t for t in texts):   scores["title"] += 5
+        if any("subject"  in t for t in texts):   scores["title"] += 3
+        # Penalise if it also has lots of bullets (probably not a title)
+        if n_bullets >= 3: scores["title"] -= 4
+
+        # ── CLOSING: thank-you text or subject-only (no headline) ─────────
+        if any("thank you" in t for t in texts):  scores["closing"] += 6
+        if (any("subject" in t for t in texts) and
+                not any("headline" in t for t in texts)):
+            scores["closing"] += 3
+        if n_text_shapes <= 3:                    scores["closing"] += 1
+
+        # ── BULLETS: 4+ bullet (▸) shapes ────────────────────────────────
+        if n_bullets >= 6:  scores["bullets"] += 6
+        elif n_bullets >= 4: scores["bullets"] += 4
+        elif n_bullets >= 2: scores["bullets"] += 1
+
+        # ── RECOMMENDATION: second-priority bullets slide ─────────────────
+        # scored same as bullets; de-duplication happens in fallback below
+
+        # ── STATS: card layout — values & labels in X-grouped columns ────
+        import re as _re2
+        number_texts = [t for t in texts_raw if _re2.search(r'\d+\.?\d*[MmKk%$]?', t.strip()) and
+                        len(t.strip()) < 25 and not t.strip().startswith("▸")]
+        if len(number_texts) >= 3:       scores["stats"] += 4
+        if len(number_texts) >= 6:       scores["stats"] += 2
+        if n_bullets == 0:               scores["stats"] += 2
+        if 10 <= n_shapes <= 24:         scores["stats"] += 1
+        if n_rects >= 2:                 scores["stats"] += 2
+        # Penalise if left/right columns are balanced (that's a comparison slide)
+        if left_count >= 4 and right_count >= 4:
+            balance = min(left_count, right_count) / max(left_count, right_count)
+            if balance > 0.5:            scores["stats"] -= 5  # strong column symmetry = comparison
+        # Bonus if shapes cluster in clear X columns with ~3-4 cols (card grid)
+        if n_text_shapes >= 8:
+            x_vals = sorted((s.left or 0)/914400 for s in shapes
+                            if s.has_text_frame and s.text_frame.text.strip())
+            if x_vals:
+                x_range = x_vals[-1] - x_vals[0]
+                # Cards spread across the full width
+                if x_range > 7.0:        scores["stats"] += 3
+
+        # ── COMPARISON: two column headers + rows of label/left/right ─────
+        if n_text_shapes >= 6 and n_bullets == 0:
+            if left_count >= 3 and right_count >= 3:
+                scores["comparison"] += 5
+            if n_text_shapes >= 10:  scores["comparison"] += 2
+            if n_text_shapes >= 16:  scores["comparison"] += 2
+
+        # ── SECTION: sparse, large text, no bullets ───────────────────────
+        if n_text_shapes <= 2 and n_bullets == 0:  scores["section"] += 3
+        if n_shapes <= 4:                          scores["section"] += 2
+
+        # Determine best type for this slide
+        best_type  = max(scores, key=lambda t: scores[t])
+        best_score = scores[best_type]
+
+        if best_score < 2:
+            continue   # too ambiguous, skip
+
+        # Store first occurrence of each type; bullets → recommendation if bullets taken
+        if best_type == "bullets" and "bullets" in type_map and "recommendation" not in type_map:
+            type_map["recommendation"] = i
+        elif best_type not in type_map:
+            type_map[best_type] = i
+
+    # Fill missing types with best fallback
+    fallback_order = ["bullets","title","comparison","stats","recommendation","section","closing"]
+    first_available = next(
+        (type_map[t] for t in fallback_order if t in type_map), 0
+    )
+    for t in ["title","section","bullets","stats","comparison","recommendation","closing"]:
+        if t not in type_map:
+            type_map[t] = first_available
+
+    return type_map
 
 
 def _generate_from_template(slide_data: dict, template_bytes: bytes) -> bytes:
     """
-    Build a PPTX using the uploaded template as the Presentation base.
-    Uses the template's slide layouts and masters so all branding
-    (backgrounds, logos, colour schemes, fonts) is inherited automatically.
+    Build a PPTX using the uploaded template as the actual presentation base.
 
-    For each of our 7 slide types we pick the best matching layout, fill
-    its title/body placeholders, then draw extra shapes on top for any
-    content that doesn't map to a standard placeholder (stats cards,
-    comparison tables, numbered recommendation rows).
+    Approach:
+    1. Load the template, analyse which slides match which content types
+    2. For each output slide, copy the best-matching template slide
+    3. Replace text box content in-place, preserving all styling/positioning
+
+    This means ALL template branding — backgrounds, logos, fonts, colours,
+    decorative shapes — is preserved exactly. We only change text values.
     """
-    prs = Presentation(io.BytesIO(template_bytes))
+    import copy
+    from pptx.util import Inches, Pt
+    from pptx.dml.color import RGBColor
 
-    # Preserve the template's slide dimensions; if it's 4:3, keep it.
-    # Only override if the template is the Office default (10 x 7.5).
-    if abs(prs.slide_width - Inches(10)) < 10000 and abs(prs.slide_height - Inches(7.5)) < 10000:
-        prs.slide_width  = Inches(W_IN)
-        prs.slide_height = Inches(H_IN)
+    prs_template = Presentation(io.BytesIO(template_bytes))
+    W = prs_template.slide_width.inches
+    H = prs_template.slide_height.inches
 
-    W = prs.slide_width  / 914400   # EMU → inches
-    H = prs.slide_height / 914400
+    # Analyse the template
+    type_map = _analyse_template(prs_template)
 
-    layout_map = _get_layout_map(prs)
-    pal        = _template_palette(prs)
-    T = pal["text"];   A = pal["accent"]; MU = pal["muted"]
-    CA = pal["card"];  G = pal["gold"];   GR = pal["green"]; RE = pal["red"]
+    # Strip existing slides at zip level (only reliable approach in python-pptx)
+    # then open the cleaned template as our base.
+    import zipfile as _zf2, re as _re2
+    _src2 = _zf2.ZipFile(io.BytesIO(template_bytes))
+    _out2 = io.BytesIO()
+    _dst2 = _zf2.ZipFile(_out2, "w", _zf2.ZIP_DEFLATED)
+    _spat = _re2.compile(r"^ppt/slides/slide\d+\.xml(\.rels)?$")
+    for _item in _src2.infolist():
+        if _spat.match(_item.filename): continue
+        _data = _src2.read(_item.filename)
+        if _item.filename == "[Content_Types].xml":
+            _t = etree.fromstring(_data)
+            _ct  = "http://schemas.openxmlformats.org/package/2006/content-types"
+            _sct = "application/vnd.openxmlformats-officedocument.presentationml.slide+xml"
+            for _o in _t.findall(f"{{{_ct}}}Override"):
+                if _o.get("ContentType") == _sct: _t.remove(_o)
+            _data = etree.tostring(_t, xml_declaration=True, encoding="UTF-8", standalone=True)
+        elif _item.filename == "ppt/presentation.xml":
+            _t = etree.fromstring(_data)
+            _pns = "http://schemas.openxmlformats.org/presentationml/2006/main"
+            _lst = _t.find(f"{{{_pns}}}sldIdLst")
+            if _lst is not None:
+                for _el in list(_lst): _lst.remove(_el)
+            _data = etree.tostring(_t, xml_declaration=True, encoding="UTF-8", standalone=True)
+        elif _item.filename == "ppt/_rels/presentation.xml.rels":
+            _t = etree.fromstring(_data)
+            _sr = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide"
+            for _el in list(_t):
+                if _el.get("Type") == _sr: _t.remove(_el)
+            _data = etree.tostring(_t, xml_declaration=True, encoding="UTF-8", standalone=True)
+        _dst2.writestr(_item, _data)
+    _dst2.close()
+    prs_out = Presentation(io.BytesIO(_out2.getvalue()))
 
     slides_data = slide_data.get("slides", [])
 
-    for s in slides_data:
-        stype  = (s.get("type") or "bullets").lower()
-        layout = prs.slide_layouts[layout_map.get(stype, layout_map["bullets"])]
-        slide  = prs.slides.add_slide(layout)
+    def _get_source_slide(stype):
+        idx = type_map.get(stype, type_map.get("bullets", 0))
+        return prs_template.slides[idx]
 
-        title_ph = _get_ph(slide, 0)
-        body_ph  = _get_ph(slide, 1)
+    def _txbs(slide):
+        """Return all text-bearing shapes on a slide, sorted top-to-bottom."""
+        return sorted(
+            [s for s in slide.shapes if s.has_text_frame and s.text_frame.text.strip()],
+            key=lambda s: (s.top or 0)
+        )
 
-        # ── TITLE ────────────────────────────────────────────────────────
-        if stype == "title":
-            _fill_ph(title_ph, s.get("title",""))
-            _fill_ph(body_ph,  s.get("subtitle","") or s.get("body",""))
-
-        # ── SECTION ──────────────────────────────────────────────────────
-        elif stype == "section":
-            _fill_ph(title_ph, s.get("title",""))
-            _fill_ph(body_ph,  s.get("subtitle",""))
-
-        # ── BULLETS / RECOMMENDATION ─────────────────────────────────────
-        elif stype in ("bullets", "recommendation"):
-            _fill_ph(title_ph, s.get("title",""))
-            bullets = s.get("bullets") or []
-            if bullets:
-                if body_ph:
-                    _fill_bullets_ph(body_ph, bullets)
+    def _set_text(shape, text):
+        """Replace text in a shape, preserving run formatting."""
+        if not shape.has_text_frame:
+            return
+        tf = shape.text_frame
+        # Keep formatting from first run of first paragraph
+        for i, para in enumerate(tf.paragraphs):
+            for j, run in enumerate(para.runs):
+                if i == 0 and j == 0:
+                    run.text = str(text)
                 else:
-                    # No body placeholder — draw bullets as text boxes
-                    y0 = 1.4
-                    for i, b in enumerate(bullets[:7]):
-                        _add_label(slide, f"▸  {b}", 0.5, y0 + i*0.65,
-                                   W-1.0, 0.58, size=14, color=T)
-            elif s.get("body"):
-                _fill_ph(body_ph, s.get("body",""))
+                    run.text = ""
+        # If no runs exist, create one
+        if tf.paragraphs and not tf.paragraphs[0].runs:
+            tf.paragraphs[0].add_run().text = str(text)
 
-        # ── STATS ────────────────────────────────────────────────────────
-        elif stype == "stats":
-            _fill_ph(title_ph, s.get("title",""))
-            stats = s.get("stats") or []
-            n  = min(len(stats), 4)
-            if n:
-                bw  = (W - 1.2) / n
-                top = 1.55
-                for i, stat in enumerate(stats[:4]):
-                    x = 0.6 + i * (bw + 0.1)
-                    _add_shape(slide, x, top, bw, 2.9, CA)
-                    _add_label(slide, stat.get("value","—"),
-                               x+0.1, top+0.25, bw-0.2, 1.1,
-                               size=36, bold=True, color=A,
-                               align=PP_ALIGN.CENTER)
-                    _add_label(slide, stat.get("label",""),
-                               x+0.1, top+1.45, bw-0.2, 0.65,
-                               size=12, bold=True, color=T,
-                               align=PP_ALIGN.CENTER)
-                    if stat.get("note"):
-                        _add_label(slide, stat["note"],
-                                   x+0.1, top+2.18, bw-0.2, 0.42,
-                                   size=9, color=MU, align=PP_ALIGN.CENTER)
+    def _add_slide_from_source(stype, s):
+        """Copy the template slide for stype and populate with slide data s."""
+        src = _get_source_slide(stype)
+        new_slide = _copy_slide(prs_out, src)
+        txbs = _txbs(new_slide)
 
-        # ── COMPARISON ───────────────────────────────────────────────────
+        if stype == "title":
+            # Template slide 1: TextBox "HEADLINE" + TextBox "SUBJECT"
+            for shape in new_slide.shapes:
+                if shape.has_text_frame:
+                    t = shape.text_frame.text.strip()
+                    if t.upper() == "HEADLINE" or ("headline" in shape.name.lower()):
+                        _set_text(shape, s.get("title", ""))
+                    elif t.upper() == "SUBJECT" or ("subject" in shape.name.lower()):
+                        _set_text(shape, s.get("subtitle") or s.get("body") or "")
+
+        elif stype == "section":
+            # Use title slide pattern — put section title in HEADLINE
+            for shape in new_slide.shapes:
+                if shape.has_text_frame:
+                    t = shape.text_frame.text.strip()
+                    if t.upper() in ("HEADLINE", "SUBJECT") or "headline" in shape.name.lower():
+                        _set_text(shape, s.get("title", ""))
+                        break
+
+        elif stype == "bullets":
+            bullets = (s.get("bullets") or [])[:6]
+            # Find the bullet text boxes (those starting with ▸ or at regular y positions)
+            bullet_shapes = sorted(
+                [sh for sh in new_slide.shapes
+                 if sh.has_text_frame and sh.text_frame.text.strip().startswith("▸")],
+                key=lambda sh: (sh.top or 0)
+            )
+            # Also check for a title — HEADLINE shape
+            for shape in new_slide.shapes:
+                if shape.has_text_frame:
+                    t = shape.text_frame.text.strip()
+                    if t.upper() == "HEADLINE" or "headline" in shape.name.lower():
+                        _set_text(shape, s.get("title", ""))
+                    elif t.upper() == "SUBJECT" or "subject" in shape.name.lower():
+                        _set_text(shape, s.get("subtitle") or "")
+            # Fill bullet slots
+            for i, shape in enumerate(bullet_shapes[:len(bullets)]):
+                _set_text(shape, "▸  " + bullets[i])
+            # Clear unused bullet slots
+            for shape in bullet_shapes[len(bullets):]:
+                _set_text(shape, "")
+
         elif stype == "comparison":
-            _fill_ph(title_ph, s.get("title",""))
-            cmp  = s.get("comparison") or {}
-            rows = cmp.get("rows") or []
-            lw   = (W - 1.0) / 2 - 1.35
-            lx   = 0.5 + 2.75 + 0.05
-            rx   = lx + lw + 0.05
-            sy   = 1.4
-            rh   = 0.42
-            _add_shape(slide, lx,   sy, lw, rh, A)
-            _add_shape(slide, rx,   sy, lw, rh, G)
-            _add_label(slide, cmp.get("left_title","Internal"),
-                       lx+0.05, sy, lw-0.1, rh,
-                       size=10, bold=True, color="FFFFFF",
-                       align=PP_ALIGN.CENTER)
-            _add_label(slide, cmp.get("right_title","Reference"),
-                       rx+0.05, sy, lw-0.1, rh,
-                       size=10, bold=True, color="FFFFFF",
-                       align=PP_ALIGN.CENTER)
-            for ri, row in enumerate(rows[:10]):
-                y   = sy + rh + ri * rh
-                bg  = CA if ri % 2 == 0 else ("1E3050" if pal["is_dark"] else "FFFFFF")
-                _add_shape(slide, 0.5, y, W-1.0, rh-0.03, bg)
-                _add_label(slide, row.get("label",""),
-                           0.58, y, 2.65, rh, size=9, bold=True, color=MU)
-                _add_label(slide, row.get("left","—"),
-                           lx+0.05, y, lw-0.1, rh, size=9, color=T,
-                           align=PP_ALIGN.CENTER)
-                delta = (row.get("delta","") or "").lower()
-                dc = GR if delta=="positive" else RE if delta=="negative" else MU
-                _add_label(slide, row.get("right","—"),
-                           rx+0.05, y, lw-0.1, rh, size=9, color=dc,
-                           align=PP_ALIGN.CENTER)
+            cmp   = s.get("comparison") or {}
+            rows  = (cmp.get("rows") or [])[:8]
+            # Find column header boxes — first two non-label text boxes near top
+            # and the row label/value boxes pattern
+            all_txbs = sorted(
+                [sh for sh in new_slide.shapes if sh.has_text_frame and sh.text_frame.text.strip()],
+                key=lambda sh: ((sh.top or 0), (sh.left or 0))
+            )
+            # Detect column positions from existing shapes
+            # The template has 3 columns: label, left-value, right-value
+            # Find by x-position clustering
+            x_positions = sorted(set(
+                round((sh.left or 0) / 914400 / 0.5) * 0.5   # round to 0.5"
+                for sh in all_txbs if (sh.left or 0) > 0
+            ))
+            # Column x groups: label ~0.5", left ~3.3", right ~8.2"
+            label_x = min(x_positions) if x_positions else 0.5
+            remaining_x = [x for x in x_positions if x > label_x + 0.5]
+            left_x  = remaining_x[0] if len(remaining_x) > 0 else 3.3
+            right_x = remaining_x[1] if len(remaining_x) > 1 else 8.2
 
-        # ── CLOSING ──────────────────────────────────────────────────────
-        elif stype == "closing":
-            _fill_ph(title_ph, s.get("title",""))
-            _fill_ph(body_ph,  s.get("subtitle","") or s.get("body",""))
+            def x_group(shape, target, tol=0.8):
+                return abs((shape.left or 0)/914400 - target) < tol
 
-        # Speaker notes
-        if s.get("speaker_notes"):
-            slide.notes_slide.notes_text_frame.text = s["speaker_notes"]
+            header_row = sorted(
+                [sh for sh in all_txbs
+                 if x_group(sh, left_x) or x_group(sh, right_x)],
+                key=lambda sh: (sh.top or 0)
+            )
+            # First shapes at left_x and right_x are column headers
+            left_headers  = [sh for sh in header_row if x_group(sh, left_x)]
+            right_headers = [sh for sh in header_row if x_group(sh, right_x)]
+            if left_headers:  _set_text(left_headers[0],  cmp.get("left_title",  "Internal"))
+            if right_headers: _set_text(right_headers[0], cmp.get("right_title", "Reference"))
+
+            # Row data: label, left_val, right_val in y order
+            label_shapes = sorted(
+                [sh for sh in all_txbs if x_group(sh, label_x) and sh not in left_headers[:1]],
+                key=lambda sh: sh.top or 0
+            )
+            left_shapes = left_headers[1:] if len(left_headers) > 1 else []
+            right_shapes = right_headers[1:] if len(right_headers) > 1 else []
+
+            for i, row in enumerate(rows):
+                if i < len(label_shapes): _set_text(label_shapes[i], row.get("label", ""))
+                if i < len(left_shapes):  _set_text(left_shapes[i],  row.get("left", ""))
+                if i < len(right_shapes): _set_text(right_shapes[i], row.get("right", ""))
+            # Clear unused rows
+            for i in range(len(rows), max(len(label_shapes), len(left_shapes), len(right_shapes))):
+                if i < len(label_shapes): _set_text(label_shapes[i], "")
+                if i < len(left_shapes):  _set_text(left_shapes[i],  "")
+                if i < len(right_shapes): _set_text(right_shapes[i], "")
+
+        elif stype == "stats":
+            stats = (s.get("stats") or [])[:4]
+            # Stats cards: groups of 3 stacked text boxes (value, label, note)
+            # Each group is above a filled rectangle
+            # Sort all non-empty txbs by (left, top) to find card groups
+            all_txbs_l = sorted(
+                [sh for sh in new_slide.shapes if sh.has_text_frame and sh.text_frame.text.strip()],
+                key=lambda sh: ((sh.left or 0), (sh.top or 0))
+            )
+            # Group by x-position (card columns)
+            from itertools import groupby
+            def x_col(sh):
+                return round((sh.left or 0) / 914400 / 3.5)  # group into ~3.5" wide buckets
+            cards = []
+            for _, grp in groupby(all_txbs_l, key=x_col):
+                card_shapes = sorted(list(grp), key=lambda sh: sh.top or 0)
+                if len(card_shapes) >= 2:
+                    cards.append(card_shapes)
+
+            for i, stat in enumerate(stats):
+                if i < len(cards):
+                    card = cards[i]
+                    # First shape (top) = big value
+                    if len(card) > 0: _set_text(card[0], stat.get("value", ""))
+                    # Second = label
+                    if len(card) > 1: _set_text(card[1], stat.get("label", ""))
+                    # Third = note
+                    if len(card) > 2: _set_text(card[2], stat.get("note", ""))
+
+        elif stype in ("recommendation", "closing"):
+            # Reuse bullets layout — same shape pattern
+            bullets = (s.get("bullets") or [])[:6]
+            bullet_shapes = sorted(
+                [sh for sh in new_slide.shapes
+                 if sh.has_text_frame and sh.text_frame.text.strip().startswith("▸")],
+                key=lambda sh: sh.top or 0
+            )
+            for shape in new_slide.shapes:
+                if shape.has_text_frame:
+                    t = shape.text_frame.text.strip()
+                    if t.upper() == "HEADLINE" or "headline" in shape.name.lower():
+                        _set_text(shape, s.get("title", ""))
+                    elif t.upper() in ("SUBJECT", "THANK YOU!") or "subject" in shape.name.lower():
+                        _set_text(shape, s.get("subtitle") or s.get("body") or "")
+            for i, shape in enumerate(bullet_shapes[:len(bullets)]):
+                _set_text(shape, "▸  " + bullets[i])
+            for shape in bullet_shapes[len(bullets):]:
+                _set_text(shape, "")
+
+    for s in slides_data:
+        stype = (s.get("type") or "bullets").lower()
+        _add_slide_from_source(stype, s)
 
     buf = io.BytesIO()
-    prs.save(buf)
+    prs_out.save(buf)
     return buf.getvalue()
-
-
-
-_RL_WAIT_BASE = 20   # seconds to wait on first 429
-_RL_MAX_TRIES = 5    # max retries before giving up
 
 
 def _api_post(headers: dict, payload: dict, timeout: int = 90,
