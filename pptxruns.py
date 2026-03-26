@@ -1464,162 +1464,136 @@ def _generate_from_template(slide_data: dict, template_bytes: bytes) -> bytes:
         # the content slide is the white slide with sidebar/logo only.
         # We write all content as fresh text boxes using the template's
         # colour palette, overlaid on the clean branded background.
+        # IMPORTANT: always add background shapes BEFORE text boxes so
+        # text is not covered (PPTX z-order = insertion order).
         if is_blank_template and stype not in ("title", "closing"):
-            from pptx.util import Inches as _In, Pt as _Pt
+            from pptx.util import Inches as _In, Pt as _Pt, Emu as _Emu
             from pptx.dml.color import RGBColor as _RGB
             from pptx.enum.text import PP_ALIGN as _PPA
 
             # Extract palette from template theme
             tp = extract_template_palette(template_bytes)
-            TEXT   = tp.get("white", "111122")    # primary text (dark on light bg)
-            MUTED  = tp.get("midgray", "556677")  # secondary text
-            ACCENT = tp.get("accent",  "00337E")  # template accent colour
+            TEXT   = tp.get("white", "111122")
+            MUTED  = tp.get("midgray", "556677")
+            ACCENT = tp.get("accent",  "00337E")
             FONT   = tp.get("body_font", "Calibri")
 
             def _rgb3(h):
-                h = h.lstrip('#').upper().ljust(6,'0')[:6]
+                h = (h or "111122").lstrip('#').upper().ljust(6,'0')[:6]
                 return _RGB(int(h[0:2],16), int(h[2:4],16), int(h[4:6],16))
 
-            # Content area: left edge ~0.9", top ~0.5", right to slide edge
-            CX = 0.95   # content x start
-            CW = W - CX - 0.15  # content width
-            CY = 0.45
+            def _txb(x, y, w, h, text, size=12, bold=False, color=None,
+                     align=None, italic=False):
+                """Add a text box; returns the shape."""
+                tb = new_slide.shapes.add_textbox(_In(x), _In(y), _In(w), _In(h))
+                tf = tb.text_frame
+                tf.word_wrap = True
+                p = tf.paragraphs[0]
+                if align:
+                    p.alignment = align
+                run = p.add_run()
+                run.text = str(text)
+                run.font.size = _Pt(size)
+                run.font.bold = bold
+                run.font.italic = italic
+                run.font.name = FONT
+                run.font.color.rgb = _rgb3(color or TEXT)
+                return tb
 
-            # Write title/subject into the SUBJECT sidebar if present
+            def _rect(x, y, w, h, fill_hex, line=False):
+                """Add a filled rectangle (background layer)."""
+                shp = new_slide.shapes.add_shape(1, _In(x), _In(y), _In(w), _In(h))
+                shp.fill.solid()
+                shp.fill.fore_color.rgb = _rgb3(fill_hex)
+                if not line:
+                    shp.line.fill.background()
+                return shp
+
+            # Content area
+            CX = 0.95          # left edge (after sidebar)
+            CW = W - CX - 0.15 # content width
+            CY = 0.45          # top edge
+
+            # Write title into SUBJECT sidebar
             subj = _subject_shape(new_slide)
             if subj:
                 _set_text(subj, s.get("title", ""))
 
             if stype in ("bullets", "recommendation", "section"):
-                # Section header line
-                hdr = new_slide.shapes.add_textbox(_In(CX), _In(CY), _In(CW), _In(0.55))
-                hdr.text_frame.word_wrap = False
-                p = hdr.text_frame.paragraphs[0]
-                r = p.add_run()
-                r.text = s.get("title", "")
-                r.font.bold = True
-                r.font.size = _Pt(22)
-                r.font.color.rgb = _rgb3(ACCENT)
-                r.font.name = FONT
-                # Thin rule under header
-                try:
-                    from pptx.util import Emu as _Emu
-                    rule = new_slide.shapes.add_shape(1, _In(CX), _In(CY+0.58), _In(CW), _Emu(18000))
-                    rule.fill.solid(); rule.fill.fore_color.rgb = _rgb3(ACCENT)
-                    rule.line.fill.background()
-                except Exception: pass
+                # Section header + rule (add rule BEFORE bullets — it's a background element)
+                _txb(CX, CY, CW, 0.5, s.get("title",""),
+                     size=22, bold=True, color=ACCENT)
+                _rect(CX, CY+0.58, CW, 0.02, ACCENT)  # thin rule
 
                 bullets = (s.get("bullets") or [])[:6]
                 for bi, bullet in enumerate(bullets):
                     y = CY + 0.75 + bi * 0.72
-                    tb = new_slide.shapes.add_textbox(_In(CX), _In(y), _In(CW), _In(0.65))
-                    tf = tb.text_frame; tf.word_wrap = True
-                    p = tf.paragraphs[0]
-                    r = p.add_run()
-                    r.text = f"▸  {bullet}"
-                    r.font.size = _Pt(13)
-                    r.font.color.rgb = _rgb3(TEXT)
-                    r.font.name = FONT
+                    _txb(CX, y, CW, 0.65, f"▸  {bullet}", size=13, color=TEXT)
                 if s.get("body"):
-                    tb = new_slide.shapes.add_textbox(_In(CX), _In(H-1.1), _In(CW), _In(0.5))
-                    r = tb.text_frame.paragraphs[0].add_run()
-                    r.text = s["body"]; r.font.size = _Pt(10); r.font.italic = True
-                    r.font.color.rgb = _rgb3(MUTED); r.font.name = FONT
+                    _txb(CX, H-1.1, CW, 0.5, s["body"], size=10, italic=True, color=MUTED)
 
             elif stype == "stats":
-                hdr = new_slide.shapes.add_textbox(_In(CX), _In(CY), _In(CW), _In(0.5))
-                r = hdr.text_frame.paragraphs[0].add_run()
-                r.text = s.get("title",""); r.font.bold = True; r.font.size = _Pt(20)
-                r.font.color.rgb = _rgb3(ACCENT); r.font.name = FONT
+                _txb(CX, CY, CW, 0.5, s.get("title",""),
+                     size=20, bold=True, color=ACCENT)
 
                 stats = (s.get("stats") or [])[:4]
-                card_w = (CW - 0.15 * (len(stats)-1)) / max(len(stats), 1)
+                n = max(len(stats), 1)
+                card_w = (CW - 0.12 * (n-1)) / n
                 for si, stat in enumerate(stats):
-                    cx = CX + si * (card_w + 0.15)
-                    # Card background
-                    try:
-                        card = new_slide.shapes.add_shape(1, _In(cx), _In(CY+0.6), _In(card_w), _In(H-CY-0.9))
-                        card.fill.solid()
-                        h_bg = tp.get("subtle","EEF2FF") if tp.get("is_dark") else "EEF2FF"
-                        card.fill.fore_color.rgb = _rgb3(h_bg)
-                        card.line.fill.background()
-                    except Exception: pass
-                    # Value
-                    vb = new_slide.shapes.add_textbox(_In(cx+0.1), _In(CY+0.75), _In(card_w-0.2), _In(1.3))
-                    vb.text_frame.paragraphs[0].alignment = PP_ALIGN.CENTER
-                    r = vb.text_frame.paragraphs[0].add_run()
-                    r.text = stat.get("value",""); r.font.bold = True; r.font.size = _Pt(36)
-                    r.font.color.rgb = _rgb3(ACCENT); r.font.name = FONT
-                    # Label
-                    lb = new_slide.shapes.add_textbox(_In(cx+0.1), _In(CY+2.1), _In(card_w-0.2), _In(0.55))
-                    lb.text_frame.paragraphs[0].alignment = PP_ALIGN.CENTER
-                    r2 = lb.text_frame.paragraphs[0].add_run()
-                    r2.text = stat.get("label",""); r2.font.bold = True; r2.font.size = _Pt(12)
-                    r2.font.color.rgb = _rgb3(TEXT); r2.font.name = FONT
-                    # Note
-                    nb = new_slide.shapes.add_textbox(_In(cx+0.1), _In(CY+2.7), _In(card_w-0.2), _In(0.4))
-                    nb.text_frame.paragraphs[0].alignment = PP_ALIGN.CENTER
-                    r3 = nb.text_frame.paragraphs[0].add_run()
-                    r3.text = stat.get("note",""); r3.font.size = _Pt(10)
-                    r3.font.color.rgb = _rgb3(MUTED); r3.font.name = FONT
+                    cx = CX + si * (card_w + 0.12)
+                    # Background card first
+                    _rect(cx, CY+0.62, card_w, H-CY-0.82, "EEF2FF")
+                    # Then text on top
+                    _txb(cx+0.1, CY+0.78, card_w-0.2, 1.2,
+                         stat.get("value",""), size=36, bold=True,
+                         color=ACCENT, align=_PPA.CENTER)
+                    _txb(cx+0.1, CY+2.05, card_w-0.2, 0.5,
+                         stat.get("label",""), size=12, bold=True,
+                         color=TEXT, align=_PPA.CENTER)
+                    _txb(cx+0.1, CY+2.62, card_w-0.2, 0.4,
+                         stat.get("note",""), size=10,
+                         color=MUTED, align=_PPA.CENTER)
 
             elif stype == "comparison":
-                hdr = new_slide.shapes.add_textbox(_In(CX), _In(CY), _In(CW), _In(0.5))
-                r = hdr.text_frame.paragraphs[0].add_run()
-                r.text = s.get("title",""); r.font.bold = True; r.font.size = _Pt(20)
-                r.font.color.rgb = _rgb3(ACCENT); r.font.name = FONT
+                _txb(CX, CY, CW, 0.5, s.get("title",""),
+                     size=20, bold=True, color=ACCENT)
 
                 cmp   = s.get("comparison") or {}
                 rows  = (cmp.get("rows") or [])[:8]
-                lbl_w = CW * 0.30
-                col_w = CW * 0.33
+                lbl_w = CW * 0.28
+                col_w = (CW - lbl_w) / 2
 
-                # Column headers
-                for ci, title in enumerate([cmp.get("left_title","Left"), cmp.get("right_title","Right")]):
-                    hx = CX + lbl_w + ci*col_w
-                    hb = new_slide.shapes.add_textbox(_In(hx), _In(CY+0.55), _In(col_w-0.05), _In(0.38))
-                    hb.text_frame.paragraphs[0].alignment = PP_ALIGN.CENTER
-                    try:
-                        hb._element.find('.//{http://schemas.openxmlformats.org/drawingml/2006/main}solidFill')
-                        bg_shape = new_slide.shapes.add_shape(1, _In(hx), _In(CY+0.55), _In(col_w-0.05), _In(0.38))
-                        bg_col = ACCENT if ci == 0 else "ED7D31"
-                        bg_shape.fill.solid(); bg_shape.fill.fore_color.rgb = _rgb3(bg_col)
-                        bg_shape.line.fill.background()
-                    except Exception: pass
-                    r = hb.text_frame.paragraphs[0].add_run()
-                    r.text = title; r.font.bold = True; r.font.size = _Pt(10)
-                    r.font.color.rgb = _RGB(255,255,255); r.font.name = FONT
+                # Draw ALL backgrounds first, then ALL text on top
+                # Header backgrounds
+                _rect(CX + lbl_w,           CY+0.57, col_w-0.04, 0.38, ACCENT)
+                _rect(CX + lbl_w + col_w,   CY+0.57, col_w-0.04, 0.38, "ED7D31")
 
+                # Row backgrounds
+                for ri in range(len(rows)):
+                    ry = CY + 1.02 + ri * 0.46
+                    _rect(CX, ry, CW, 0.40, "EEF2FF" if ri % 2 == 0 else "F5F7FF")
+
+                # Now header text (on top of header backgrounds)
+                _txb(CX + lbl_w,           CY+0.60, col_w-0.04, 0.32,
+                     cmp.get("left_title","Left"), size=10, bold=True,
+                     color="FFFFFF", align=_PPA.CENTER)
+                _txb(CX + lbl_w + col_w,   CY+0.60, col_w-0.04, 0.32,
+                     cmp.get("right_title","Right"), size=10, bold=True,
+                     color="FFFFFF", align=_PPA.CENTER)
+
+                # Row text (on top of row backgrounds)
                 for ri, row in enumerate(rows):
-                    ry = CY + 1.0 + ri * 0.48
-                    row_bg = "EEF2FF" if ri % 2 == 0 else "F8F9FF"
-                    try:
-                        bg = new_slide.shapes.add_shape(1, _In(CX), _In(ry), _In(CW), _In(0.42))
-                        bg.fill.solid(); bg.fill.fore_color.rgb = _rgb3(row_bg)
-                        bg.line.fill.background()
-                    except Exception: pass
-                    # Label
-                    lb = new_slide.shapes.add_textbox(_In(CX+0.05), _In(ry+0.03), _In(lbl_w-0.1), _In(0.36))
-                    r = lb.text_frame.paragraphs[0].add_run()
-                    r.text = row.get("label",""); r.font.bold = True; r.font.size = _Pt(9)
-                    r.font.color.rgb = _rgb3(MUTED); r.font.name = FONT
-                    # Left value
-                    lv = new_slide.shapes.add_textbox(_In(CX+lbl_w), _In(ry+0.03), _In(col_w-0.1), _In(0.36))
-                    lv.text_frame.paragraphs[0].alignment = PP_ALIGN.CENTER
-                    r2 = lv.text_frame.paragraphs[0].add_run()
-                    r2.text = row.get("left",""); r2.font.size = _Pt(9)
-                    r2.font.color.rgb = _rgb3(TEXT); r2.font.name = FONT
-                    # Right value with delta colour
+                    ry = CY + 1.02 + ri * 0.46
+                    _txb(CX+0.05,               ry+0.04, lbl_w-0.1, 0.34,
+                         row.get("label",""), size=9, bold=True, color=MUTED)
+                    _txb(CX+lbl_w,              ry+0.04, col_w-0.08, 0.34,
+                         row.get("left",""), size=9, color=TEXT, align=_PPA.CENTER)
                     delta = row.get("delta","neutral")
                     dc = "22AA66" if delta=="positive" else "CC2244" if delta=="negative" else MUTED
-                    rv = new_slide.shapes.add_textbox(_In(CX+lbl_w+col_w), _In(ry+0.03), _In(col_w-0.1), _In(0.36))
-                    rv.text_frame.paragraphs[0].alignment = PP_ALIGN.CENTER
-                    r3 = rv.text_frame.paragraphs[0].add_run()
-                    r3.text = row.get("right",""); r3.font.size = _Pt(9)
-                    r3.font.color.rgb = _rgb3(dc); r3.font.name = FONT
+                    _txb(CX+lbl_w+col_w,        ry+0.04, col_w-0.08, 0.34,
+                         row.get("right",""), size=9, color=dc, align=_PPA.CENTER)
 
             return new_slide
-
 
 
         # ── TITLE ────────────────────────────────────────────────────────
