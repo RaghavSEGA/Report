@@ -128,9 +128,10 @@ def _lock_txb(txb):
     etree.SubElement(ln, qn("a:noFill"))
 
 
-# Safe defaults — widgets defined later in the sidebar.
+# Safe defaults and constants used inside _render_plan_modal.
 run_btn           = False
 business_question = ""
+SLIDE_TYPES = ["title","section","bullets","stats","comparison","recommendation","chart","closing"]
 
 def _render_plan_modal(template_bytes_ref):
     """
@@ -3288,5 +3289,3 @@ Rules:
 # ─────────────────────────────────────────────────────────────
 # PLAN MODE — OUTLINE EDITOR (modal dialog)
 # ─────────────────────────────────────────────────────────────
-
-SLIDE_TYPES = ["title","section","bullets","stats","comparison","recommendation","chart","closing"]
