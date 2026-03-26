@@ -2545,34 +2545,63 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
         "SEGA Sonic — High Energy":        "Vibrant SEGA blue with gold accents, high energy.",
     }.get(theme_preset, "SEGA corporate blue")
 
-    # ── DATA FILES: summarise uploaded Excel/CSV for chart context ──────────
+    # ── DATA FILES: extract full data for chart context ──────────────────────
+    # Send the complete dataset (all rows, all sheets) up to a token-safe cap.
+    # Claude uses these exact numbers to populate chart.series values.
+    _DATA_CHAR_CAP = 40_000  # ~10k tokens — enough for large sheets
     data_summary = ""
     if data_files:
         import pandas as _pd
         data_parts = []
+        total_chars = 0
         for _df_file in (data_files or []):
+            if total_chars >= _DATA_CHAR_CAP:
+                data_parts.append(f"FILE: {_df_file.name} — skipped (data cap reached)")
+                continue
             try:
                 _df_file.seek(0)
                 _dname = _df_file.name.lower()
+                file_parts = []
                 if _dname.endswith(".csv"):
                     _df = _pd.read_csv(_df_file)
+                    _full_csv = _df.to_csv(index=False)
+                    # Cap per-file if huge
+                    if len(_full_csv) > _DATA_CHAR_CAP - total_chars:
+                        _full_csv = _df.head(200).to_csv(index=False)
+                        _full_csv += f"\n[...truncated — showing first 200 of {len(_df)} rows]"
+                    file_parts.append(
+                        f"Sheet: (csv)\n"
+                        f"Rows: {len(_df)} | Columns: {list(_df.columns)}\n"
+                        f"Numeric columns: {_df.select_dtypes(include='number').columns.tolist()}\n"
+                        f"Full data:\n{_full_csv}"
+                    )
                 else:
-                    _df = _pd.read_excel(_df_file)
-                _summary_rows = _df.head(20).to_csv(index=False)
-                _num_cols = _df.select_dtypes(include="number").columns.tolist()
-                data_parts.append(
-                    f"FILE: {_df_file.name}\n"
-                    f"Rows: {len(_df)}, Columns: {list(_df.columns)}\n"
-                    f"Numeric columns: {_num_cols}\n"
-                    f"First 20 rows:\n{_summary_rows}"
-                )
+                    # Excel — read every sheet
+                    _sheets = _pd.read_excel(_df_file, sheet_name=None)
+                    for _sheet_name, _df in _sheets.items():
+                        _full_csv = _df.to_csv(index=False)
+                        if len(_full_csv) > (_DATA_CHAR_CAP - total_chars) // max(len(_sheets), 1):
+                            _full_csv = _df.head(200).to_csv(index=False)
+                            _full_csv += f"\n[...truncated — showing first 200 of {len(_df)} rows]"
+                        file_parts.append(
+                            f"Sheet: {_sheet_name}\n"
+                            f"Rows: {len(_df)} | Columns: {list(_df.columns)}\n"
+                            f"Numeric columns: {_df.select_dtypes(include='number').columns.tolist()}\n"
+                            f"Full data:\n{_full_csv}"
+                        )
+                sheet_block = "\n\n".join(file_parts)
+                total_chars += len(sheet_block)
+                data_parts.append(f"FILE: {_df_file.name}\n{sheet_block}")
             except Exception as _de:
                 data_parts.append(f"FILE: {_df_file.name} — could not read: {_de}")
         if data_parts:
             data_summary = "\n\n".join(data_parts)
+            total_rows = data_summary.count("\n")
             yield ("log", (
-                f"📊 <b>Data loaded</b> — {len(data_files)} file(s) summarised for chart generation"
+                f"📊 <b>Data loaded</b> — {len(data_files)} file(s), "
+                f"{len(data_summary):,} characters of exact data sent to Claude for chart generation"
             ))
+
 
         analysis_prompt = f"""You are a senior game industry analyst at SEGA.
 Analyse the following and produce a JSON object for a {slide_count}-slide executive presentation.
@@ -2634,8 +2663,7 @@ Rules:
     char_count   = 0
     last_tick_at = 0
 
-    # Slide detection: watch for "title": patterns in the accumulating JSON
-    # so we can announce each slide as it is written
+    # Slide detection: watch for "type": patterns in the accumulating JSON
     slides_announced = 0
 
     def _count_slides_so_far(text):
@@ -2644,9 +2672,25 @@ Rules:
         return len(re.findall(r'"type"\s*:\s*"(?:title|section|bullets|stats|comparison|recommendation|closing)"', text))
 
     def _on_rate_limit(wait_secs, attempt):
-        # This runs in the main thread during the stream retry sleep;
-        # we can't yield from here, so we just log via a mutable flag
         pass  # handled below via RuntimeError propagation
+
+    # Emit a "waiting for Claude…" heartbeat before the first chunk arrives.
+    # Use a background thread to push ticks into a queue; the main loop drains it.
+    import queue as _queue, threading as _threading
+
+    _tick_q    = _queue.Queue()
+    _stop_tick = _threading.Event()
+
+    def _ticker():
+        """Push a tick every 2 s so the UI never goes blank during cold start."""
+        _t = 0
+        while not _stop_tick.wait(2):
+            _t += 2
+            _tick_q.put(_t)
+
+    _tick_thread = _threading.Thread(target=_ticker, daemon=True)
+    _tick_thread.start()
+    _first_chunk = True
 
     try:
         for chunk in _api_stream(
@@ -2658,6 +2702,15 @@ Rules:
                 "messages": [{"role": "user", "content": analysis_prompt}],
             },
         ):
+            # Drain any pending heartbeat ticks before this chunk
+            while not _tick_q.empty():
+                _elapsed = _tick_q.get_nowait()
+                if _first_chunk:
+                    yield ("spinner",
+                        f"⏳ <b>Waiting for Claude…</b> {_elapsed}s — model is processing your "
+                        f"{est_input_tokens:,}-token prompt. First tokens typically arrive in 5–15s.")
+
+            _first_chunk = False
             raw_chunks.append(chunk)
             char_count += len(chunk)
 
@@ -2667,19 +2720,18 @@ Rules:
             if slides_so_far > slides_announced:
                 for _ in range(slides_so_far - slides_announced):
                     slides_announced += 1
-                    yield ("spinner", (
-                        f"  ✏️ Writing slide {slides_announced} of {slide_count}…"
-                    ))
+                    yield ("spinner",
+                        f"  ✏️ Writing slide {slides_announced} of {slide_count}…")
 
             # Periodic byte-count tick every ~600 chars
             if char_count - last_tick_at >= 600:
                 last_tick_at = char_count
                 pct = min(int(char_count / (slide_count * 220) * 100), 95)
-                yield ("spinner", (
-                    f"  📝 Generating JSON… {char_count:,} chars written (~{pct}% complete)"
-                ))
+                yield ("spinner",
+                    f"  📝 Generating JSON… {char_count:,} chars (~{pct}% complete)")
 
     except RuntimeError as e:
+        _stop_tick.set()
         err = str(e)
         if "rate limit" in err.lower() or "429" in err:
             yield ("error",
@@ -2693,8 +2745,11 @@ Rules:
             yield ("error", err)
         return
     except Exception as e:
+        _stop_tick.set()
         yield ("error", f"Streaming error: {e}")
         return
+    finally:
+        _stop_tick.set()  # always stop the ticker thread
 
     raw_json = "".join(raw_chunks).strip()
     if raw_json.startswith("```"):
