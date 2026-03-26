@@ -1985,6 +1985,138 @@ def _render_plan_modal(template_bytes_ref):
 
     st.divider()
 
+    # ── Chat with Claude ──────────────────────────────────────────────────────
+    st.markdown(
+        "<p style='font-size:.8rem;font-weight:700;letter-spacing:.08em;"
+        "text-transform:uppercase;color:#60a5fa;margin-bottom:.4rem'>"
+        "💬 Ask Claude to modify the outline</p>",
+        unsafe_allow_html=True,
+    )
+
+    # Initialise chat history in session state
+    if "plan_chat" not in st.session_state:
+        st.session_state["plan_chat"] = []
+
+    # Show chat history
+    for msg in st.session_state["plan_chat"]:
+        role_color = "#60a5fa" if msg["role"] == "assistant" else "#94a3b8"
+        role_label = "Claude" if msg["role"] == "assistant" else "You"
+        st.markdown(
+            f"<div style='margin-bottom:.5rem'>"
+            f"<span style='font-size:.7rem;font-weight:700;color:{role_color};"
+            f"text-transform:uppercase;letter-spacing:.06em'>{role_label}</span><br>"
+            f"<span style='font-size:.88rem;color:#cbd5e1'>{msg['content']}</span>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+    # Chat input + send
+    chat_col, btn_col = st.columns([5, 1])
+    with chat_col:
+        chat_input = st.text_input(
+            "chat_input", label_visibility="collapsed",
+            placeholder="e.g. Add a chart slide comparing Year 1 sales, make slide 3 a comparison table…",
+            key="plan_chat_input",
+        )
+    with btn_col:
+        send_btn = st.button("Send", key="plan_chat_send", use_container_width=True, type="primary")
+
+    if send_btn and chat_input.strip():
+        import httpx as _hx, json as _json
+
+        _api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
+        _current_slides = _json.dumps(
+            st.session_state["plan_slide_data"].get("slides", []),
+            indent=2
+        )
+
+        # Build conversation: system + history + new user message
+        _system = (
+            "You are helping edit a PowerPoint presentation outline. "
+            "The user will ask you to modify slides. "
+            "You MUST respond with a JSON object in this exact format:\n"
+            '{"action": "update", "slides": [<full updated slides array>]}\n'
+            "OR if clarification is needed with no slide changes:\n"
+            '{"action": "message", "text": "your reply here"}\n\n'
+            "Slide types available: title, section, bullets, stats, comparison, recommendation, chart, closing.\n"
+            "Always return the COMPLETE slides array, not just changed slides.\n"
+            "Return ONLY valid JSON, no markdown fences."
+        )
+
+        _messages = []
+        for _m in st.session_state["plan_chat"]:
+            _messages.append({"role": _m["role"], "content": _m["content"]})
+        _messages.append({
+            "role": "user",
+            "content": (
+                f"Current outline ({len(st.session_state['plan_slide_data'].get('slides',[]))} slides):\n"
+                f"```json\n{_current_slides}\n```\n\n"
+                f"Request: {chat_input.strip()}"
+            )
+        })
+
+        with st.spinner("Claude is updating the outline…"):
+            try:
+                _resp = _hx.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={
+                        "x-api-key": _api_key,
+                        "anthropic-version": "2023-06-01",
+                        "content-type": "application/json",
+                    },
+                    json={
+                        "model": "claude-sonnet-4-5",
+                        "max_tokens": 4000,
+                        "system": _system,
+                        "messages": _messages,
+                    },
+                    timeout=_hx.Timeout(120, connect=10),
+                )
+                _resp.raise_for_status()
+                _raw = ""
+                for _block in _resp.json().get("content", []):
+                    if _block.get("type") == "text":
+                        _raw += _block.get("text", "")
+
+                # Strip markdown fences if present
+                _raw = _raw.strip()
+                if _raw.startswith("```"):
+                    _raw = _raw.split("\n", 1)[1] if "\n" in _raw else _raw[3:]
+                    _raw = _raw.rsplit("```", 1)[0].strip()
+
+                _parsed = _json.loads(_raw)
+
+                if _parsed.get("action") == "update":
+                    # Apply updated slides
+                    _new_slides = _parsed.get("slides", [])
+                    sd_updated = dict(st.session_state["plan_slide_data"])
+                    sd_updated["slides"] = _new_slides
+                    st.session_state["plan_slide_data"] = sd_updated
+                    _reply = f"Done — updated outline to {len(_new_slides)} slides."
+                else:
+                    _reply = _parsed.get("text", "No changes made.")
+
+                # Add to chat history
+                st.session_state["plan_chat"].append({"role": "user",      "content": chat_input.strip()})
+                st.session_state["plan_chat"].append({"role": "assistant", "content": _reply})
+                st.rerun()
+
+            except _json.JSONDecodeError:
+                # Claude replied with plain text — show it but don't modify outline
+                st.session_state["plan_chat"].append({"role": "user",      "content": chat_input.strip()})
+                st.session_state["plan_chat"].append({"role": "assistant", "content": _raw or "Could not parse response."})
+                st.rerun()
+            except Exception as _ce:
+                st.error(f"Chat error: {_ce}")
+
+    # Clear chat history button
+    if st.session_state.get("plan_chat"):
+        if st.button("🗑 Clear chat history", key="plan_chat_clear", use_container_width=False):
+            st.session_state["plan_chat"] = []
+            st.rerun()
+
+    st.divider()
+
     # ── Export ────────────────────────────────────────────────────────────────
     ec1, ec2, _ = st.columns([1, 1, 1])
     with ec1:
