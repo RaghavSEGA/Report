@@ -842,6 +842,8 @@ def _slide_chart(prs, s: dict, C: dict):
     prs.save(buf)
     buf.seek(0)
     return _patch_theme(buf.read())
+W_IN, H_IN = 13.3, 7.5  # slide dimensions in inches
+
 def generate_pptx(slide_data: dict, template_bytes: bytes | None = None) -> bytes:
     """
     Build a PPTX from slide_data.
@@ -1824,15 +1826,11 @@ def _render_plan_modal(template_bytes_ref):
         "padding:.8rem 1rem;margin-bottom:.5rem}"
         ".pm-num{color:#60a5fa;font-size:.68rem;font-weight:700;"
         "text-transform:uppercase;letter-spacing:.07em;margin-bottom:.25rem}"
-        ".pm-icon-row [data-testid='stBaseButton-secondary']{"
-        "padding:0 !important;"
-        "display:flex !important;"
-        "align-items:center !important;"
-        "justify-content:center !important;"
-        "font-size:1.1rem !important;"
-        "line-height:1 !important;"
-        "min-height:2rem !important;"
-        "}"
+        "button[data-testid='stBaseButton-secondary'] p{"
+        "width:100%;text-align:center !important;margin:0 !important;"
+        "display:block !important;font-size:1.05rem !important;line-height:1 !important}"
+        "button[data-testid='stBaseButton-secondary']{"
+        "padding:0.2rem 0 !important}"
         "</style>",
         unsafe_allow_html=True,
     )
@@ -1870,13 +1868,11 @@ def _render_plan_modal(template_bytes_ref):
                     key=f"pm_type_{i}", label_visibility="collapsed",
                 )
             with rc2:
-                st.markdown('<div class="pm-icon-row">', unsafe_allow_html=True)
                 b1, b2, b3, b4 = st.columns(4)
-                if b1.button("⬆", key=f"pu_{i}", help="Move up"):    move_up      = i
-                if b2.button("⬇", key=f"pd_{i}", help="Move down"):  move_down    = i
-                if b3.button("➕", key=f"pa_{i}", help="Insert after"): insert_after = i
-                if b4.button("🗑", key=f"px_{i}", help="Delete"):     delete_idx   = i
-                st.markdown('</div>', unsafe_allow_html=True)
+                if b1.button("⬆", key=f"pu_{i}", help="Move up",      use_container_width=True): move_up      = i
+                if b2.button("⬇", key=f"pd_{i}", help="Move down",    use_container_width=True): move_down    = i
+                if b3.button("➕", key=f"pa_{i}", help="Insert after", use_container_width=True): insert_after = i
+                if b4.button("🗑", key=f"px_{i}", help="Delete",       use_container_width=True): delete_idx   = i
 
             new_title    = st.text_input("Title",    slide.get("title",""),    key=f"pm_ti_{i}")
             new_subtitle = st.text_input("Subtitle", slide.get("subtitle") or slide.get("body",""), key=f"pm_su_{i}")
@@ -3100,7 +3096,6 @@ The pipeline will:<br>
 
 
 # Slide canvas: 13.3 × 7.5 inches (LAYOUT_WIDE)
-W_IN, H_IN = 13.3, 7.5
 
 
 
