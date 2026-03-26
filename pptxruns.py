@@ -1519,6 +1519,14 @@ def _generate_from_template(slide_data: dict, template_bytes: bytes) -> bytes:
     return buf.getvalue()
 
 
+# ─────────────────────────────────────────────────────────────
+# API HELPERS  (with rate-limit retry + back-off)
+# ─────────────────────────────────────────────────────────────
+
+_RL_WAIT_BASE = 20   # seconds to wait on first 429
+_RL_MAX_TRIES = 5    # max retries before giving up
+
+
 def _api_post(headers: dict, payload: dict, timeout: int = 90,
               on_wait=None) -> dict:
     """
