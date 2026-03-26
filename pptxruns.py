@@ -2690,17 +2690,43 @@ Rules:
     _stream_err = [None]    # mutable container so thread can write to it
 
     def _stream_worker():
+        """
+        Makes a regular blocking POST (no SSE streaming) in a background thread.
+        Puts the full response text as a single chunk, then the sentinel.
+        This avoids httpx.stream() context manager issues in background threads.
+        """
+        import httpx
         try:
-            for chunk in _api_stream(
-                headers=headers,
-                payload={
+            # Use regular non-streaming POST — simpler and works reliably from threads
+            resp = httpx.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={**headers, "Content-Type": "application/json"},
+                json={
                     "model": model,
                     "max_tokens": 8000,
+                    "stream": False,
                     "system": "You are a precise game industry analyst. Return valid JSON only.",
                     "messages": [{"role": "user", "content": analysis_prompt}],
                 },
-            ):
-                _chunk_q.put(chunk)
+                timeout=httpx.Timeout(300, connect=15),
+            )
+            if resp.status_code == 429:
+                _stream_err[0] = RuntimeError(
+                    "Rate limited. Switch to Haiku in the sidebar or wait a minute.")
+                return
+            if resp.status_code != 200:
+                _stream_err[0] = RuntimeError(
+                    f"API error {resp.status_code}: {resp.text[:400]}")
+                return
+            data = resp.json()
+            text = ""
+            for block in data.get("content", []):
+                if block.get("type") == "text":
+                    text += block.get("text", "")
+            # Feed in small chunks so the progress counter updates as it "arrives"
+            chunk_size = 120
+            for i in range(0, len(text), chunk_size):
+                _chunk_q.put(text[i:i+chunk_size])
         except Exception as exc:
             _stream_err[0] = exc
         finally:
@@ -2731,8 +2757,8 @@ Rules:
                 if _first_chunk:
                     yield ("spinner",
                         f"⏳ <b>Waiting for Claude…</b> {_stream_elapsed}s elapsed — "
-                        f"processing ~{est_input_tokens:,} tokens. "
-                        "First tokens usually arrive within 10–20s.")
+                        f"generating ~{slide_count} slides from {est_input_tokens:,} tokens. "
+                        "Typically takes 20–60s depending on model and load.")
                 else:
                     pct = min(int(char_count / (slide_count * 220) * 100), 95)
                     yield ("spinner",
