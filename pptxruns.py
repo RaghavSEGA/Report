@@ -556,8 +556,8 @@ with col_left:
     st.markdown('<div class="section-label">Analysis inputs</div>', unsafe_allow_html=True)
 
     game_title = st.text_input(
-        "Reference / competitor game title",
-        placeholder="e.g. Sonic Frontiers, Metaphor: ReFantazio, Persona 5…",
+        "Reference / competitor game titles (comma-separated for multiple)",
+        placeholder="e.g. Mario Odyssey, Astro Bot, Hollow Knight — separate multiple with commas",
     )
     business_question = st.text_area(
         "Business question",
@@ -2202,6 +2202,8 @@ def _api_stream(headers: dict, payload: dict, timeout: int = 240,
         stream_payload = {**payload, "stream": True}
         stream_headers = {**headers, "Accept": "text/event-stream"}
 
+        _retry_after = None  # set inside the with-block, acted on outside
+
         try:
             with httpx.stream(
                 "POST",
@@ -2217,38 +2219,36 @@ def _api_stream(headers: dict, payload: dict, timeout: int = 240,
                             "Switch to Haiku in the sidebar or wait a minute."
                         )
                     try:
-                        wait = max(float(
+                        _retry_after = max(float(
                             resp.headers.get("retry-after") or
                             _RL_WAIT_BASE * (2 ** attempt)
                         ), 1.0)
                     except (TypeError, ValueError):
-                        wait = _RL_WAIT_BASE * (2 ** attempt)
-                    if on_rate_limit:
-                        on_rate_limit(wait, attempt + 1)
-                    time.sleep(wait)
-                    continue
-
-                if resp.status_code != 200:
+                        _retry_after = _RL_WAIT_BASE * (2 ** attempt)
+                    # Must exit the with-block before sleeping and retrying
+                elif resp.status_code != 200:
+                    # Must call read() before accessing .text in a stream context
+                    resp.read()
                     raise RuntimeError(
                         f"API error {resp.status_code}: {resp.text[:400]}"
                     )
-
-                for raw_line in resp.iter_lines():
-                    line = raw_line.strip()
-                    if not line or not line.startswith("data: "):
-                        continue
-                    payload_str = line[6:].strip()
-                    if payload_str == "[DONE]":
-                        return
-                    try:
-                        evt = json.loads(payload_str)
-                    except json.JSONDecodeError:
-                        continue
-                    if evt.get("type") == "content_block_delta":
-                        delta = evt.get("delta", {})
-                        if delta.get("type") == "text_delta":
-                            yield delta.get("text", "")
-                return  # clean exit
+                else:
+                    for raw_line in resp.iter_lines():
+                        line = raw_line.strip()
+                        if not line or not line.startswith("data: "):
+                            continue
+                        payload_str = line[6:].strip()
+                        if payload_str == "[DONE]":
+                            return
+                        try:
+                            evt = json.loads(payload_str)
+                        except json.JSONDecodeError:
+                            continue
+                        if evt.get("type") == "content_block_delta":
+                            delta = evt.get("delta", {})
+                            if delta.get("type") == "text_delta":
+                                yield delta.get("text", "")
+                    return  # clean exit
 
         except httpx.TimeoutException:
             raise RuntimeError(
@@ -2256,6 +2256,11 @@ def _api_stream(headers: dict, payload: dict, timeout: int = 240,
                 "Try reducing the slide count or switching to Haiku in the sidebar."
             )
 
+        # Handle 429 retry outside the with-block
+        if _retry_after is not None:
+            if on_rate_limit:
+                on_rate_limit(_retry_after, attempt + 1)
+            time.sleep(_retry_after)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -2296,15 +2301,22 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
         "Content is capped at {:,} characters to stay within API token limits.</span>"
     ).format(_MAX_DOC_CHARS))
 
-    if web_search_en and game_title:
+    if web_search_en and game_titles:
+        _n_games = len(game_titles)
         yield ("spinner", (
             "🔍 <b>Stage 2 of 4 — Web research running in parallel</b><br>"
             "<span class='log-detail'>While your documents are being extracted, Claude is "
             "simultaneously searching the web for <i>{}</i>. "
-            "Two focused searches run in sequence: first critical reception &amp; sales data, "
-            "then gameplay mechanics &amp; market context. "
-            "Single focused search with a 90s wall-clock deadline — falls back to model knowledge if it times out.</span>"
-        ).format(game_title))
+            "{}"
+            "Each search has a 90s wall-clock deadline — falls back to model knowledge if it times out.</span>"
+        ).format(
+            game_title_display,
+            f"{_n_games} parallel searches running. " if _n_games > 1 else ""
+        ))
+
+    # Parse comma-separated game titles into a clean list
+    game_titles = [g.strip() for g in (game_title or "").split(",") if g.strip()]
+    game_title_display = ", ".join(game_titles) if game_titles else ""
 
     combined_docs  = "[No documents uploaded]"
     research_text  = "[No reference game specified]"
@@ -2322,23 +2334,20 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
             full = full[:_MAX_DOC_CHARS] + "\n\n[... document content trimmed to fit token budget ...]"
         return full
 
-    def _web_research():
+    def _web_research_one(title: str) -> str:
         """
-        Fetch competitive intel via Anthropic web-search tool.
-        Uses httpx with a true wall-clock timeout so the call CANNOT
-        run longer than HARD_TIMEOUT seconds regardless of socket behaviour.
+        Fetch competitive intel for a single game title.
+        Uses a thread future for a hard 90s wall-clock deadline.
         """
-        if not (web_search_en and game_title):
-            if game_title:
-                return f"[Web search disabled — using model knowledge for '{game_title}']"
-            return "[No reference game specified]"
+        if not web_search_en:
+            return f"[Web search disabled — using model knowledge for '{title}']"
 
         import httpx
 
         HARD_TIMEOUT = 90   # true wall-clock deadline enforced via thread future
 
         prompt = (
-            f"Research the video game \"{game_title}\" for an executive competitive analysis presentation. "
+            f"Research the video game \"{title}\" for an executive competitive analysis presentation. "
             "Search the web for current information and write a thorough structured report with these sections:\n\n"
             "OVERVIEW: Developer, publisher, release date, platforms, genre, ESRB/PEGI rating, launch price.\n\n"
             "CRITICAL RECEPTION: Metacritic score (critic + user), OpenCritic score, "
@@ -2393,7 +2402,7 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
                     resp.raise_for_status()
                     blocks = resp.json().get("content", [])
                     text = "\n".join(b.get("text","") for b in blocks if b.get("type")=="text")
-                    return text.strip() or f"[No web results for '{game_title}']"
+                    return text.strip() or f"[No web results for '{title}']"
                 except Exception as e:
                     err = str(e).lower()
                     if ("429" in err or "too many requests" in err) and _attempt < _RL_MAX_TRIES - 1:
@@ -2414,7 +2423,7 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
             _ex.shutdown(wait=False)
             return (
                 f"[Web search timed out after {HARD_TIMEOUT}s. "
-                f"The analysis will use Claude's training knowledge for '{game_title}' instead. "
+                f"The analysis will use Claude's training knowledge for '{title}' instead. "
                 "This is normal for popular titles with many search results.]"
             )
         except Exception as e:
@@ -2426,29 +2435,27 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
         return "[Web search failed after retries — using training knowledge.]"
 
     # ── Poll futures with heartbeat so Streamlit never blocks ────────────────
-    # as_completed() would block the generator for up to 120 s with no yields,
-    # freezing the UI.  Instead we poll every 3 s and emit a spinner tick so
-    # Streamlit keeps receiving events and the log stays alive.
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        fut_docs     = pool.submit(_extract_docs)
-        fut_research = pool.submit(_web_research)
+    # One future per game title (parallel searches) + one for doc extraction.
+    # Poll every 3 s to keep Streamlit alive with heartbeat spinner ticks.
+    _n_workers = 1 + max(len(game_titles), 1)
+    with ThreadPoolExecutor(max_workers=_n_workers) as pool:
+        fut_docs   = pool.submit(_extract_docs)
+        game_futs  = {pool.submit(_web_research_one, t): t for t in game_titles}
 
-        pending      = {fut_docs: "docs", fut_research: "research"}
-        docs_done    = False
-        research_done = False
+        pending       = {fut_docs: "__docs__"}
+        pending.update(game_futs)
+        docs_done     = False
+        research_done = not bool(game_titles)
+        game_results  = {}   # title -> research text
         elapsed       = 0
-        TICK          = 3   # seconds between heartbeat yields
+        TICK          = 3
 
         while pending:
-            # Check each pending future without blocking
-            resolved = []
-            for fut, label in list(pending.items()):
-                if fut.done():
-                    resolved.append((fut, label))
+            resolved = [(f, l) for f, l in list(pending.items()) if f.done()]
 
             for fut, label in resolved:
                 del pending[fut]
-                if label == "docs":
+                if label == "__docs__":
                     docs_done     = True
                     combined_docs = fut.result()
                     n_files = len(uploaded_files)
@@ -2460,57 +2467,62 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
                     ).format(n_files, "s" if n_files != 1 else "", n_chars))
                     yield ("step_done", "extract")
                 else:
-                    research_done = True
+                    # label is the game title string
                     res = fut.result()
-                    is_error   = "[Web search error" in res
-                    is_timeout = "timed out after" in res
+                    game_results[label] = res
+                    is_error    = "[Web search error" in res
+                    is_timeout  = "timed out after" in res
                     is_fallback = any(x in res for x in (
                         "[Web search disabled", "[No reference", "[No web results",
                         "timed out after", "[No results"
                     ))
                     if is_error and not is_timeout:
-                        research_text = res
-                        yield ("log", f"⚠️ <b>Web research error</b> — {res}<br>"
-                               "<span class='log-detail'>The analysis will proceed using "
-                               "Claude's training knowledge for this title.</span>")
+                        yield ("log",
+                            f"⚠️ <b>Web research error for <i>{label}</i></b><br>"
+                            "<span class='log-detail'>Will use Claude's training knowledge instead.</span>")
                     elif is_fallback:
-                        research_text = res
-                        yield ("log", (
-                            "⚠️ <b>Web search timed out</b> — falling back to model training knowledge "
-                            f"for <i>{game_title}</i><br>"
+                        yield ("log",
+                            f"⚠️ <b>Web search timed out for <i>{label}</i></b> — "
+                            "falling back to model training knowledge<br>"
                             "<span class='log-detail'>Claude has extensive knowledge of most "
-                            "released games from training data. The analysis will still be "
-                            "data-rich; it just won't include the very latest web sources.</span>"
-                        ))
+                            "released titles. The analysis will still be data-rich.</span>")
                     else:
-                        research_text = res
-                        word_count    = len(res.split())
-                        yield ("log", (
-                            "✅ <b>Web research complete</b> — ~{} words on <i>{}</i><br>"
-                            "<span class='log-detail'>Claude searched the web and compiled: "
-                            "review scores, sales data, gameplay mechanics, and player reception. "
-                            "This will be used as the benchmark in the comparison slides.</span>"
-                        ).format(word_count, game_title))
-                    yield ("step_done", "research")
+                        word_count = len(res.split())
+                        yield ("log",
+                            f"✅ <b>Web research complete — <i>{label}</i></b> "
+                            f"— ~{word_count} words<br>"
+                            "<span class='log-detail'>Review scores, sales data, mechanics, "
+                            "and market context compiled.</span>")
+                    # Mark research step done once all game futures resolved
+                    remaining_games = [l for l in pending.values() if l != "__docs__"]
+                    if not remaining_games:
+                        research_done = True
+                        # Build combined research text
+                        if game_results:
+                            parts = []
+                            for t, r in game_results.items():
+                                parts.append("=== RESEARCH: " + t + " ===\n" + r)
+                            research_text = "\n\n".join(parts)
+                        yield ("step_done", "research")
 
             if pending:
-                # Sleep briefly then emit a heartbeat so the UI stays live
                 time.sleep(TICK)
                 elapsed += TICK
                 still_doing = []
                 if not docs_done:
                     still_doing.append("extracting documents")
-                if not research_done:
+                pending_games = [l for l in pending.values() if l != "__docs__"]
+                if pending_games:
                     still_doing.append(
-                        f"searching web for <i>{game_title}</i> ({elapsed}s elapsed)"
+                        "searching web for <i>" + ", ".join(pending_games) +
+                        f"</i> ({elapsed}s elapsed)"
                     )
                 if still_doing:
-                    yield ("spinner", (
+                    yield ("spinner",
                         "⏳ <b>Still working…</b> " + " &amp; ".join(still_doing) + "<br>"
-                        "<span class='log-detail'>Web search has a 90s wall-clock deadline — if it times out, "
-                        "the analysis will automatically use Claude's training knowledge instead. "
-                        "The pipeline will not hang.</span>"
-                    ))
+                        "<span class='log-detail'>Web search has a 90s wall-clock deadline — "
+                        "if it times out the pipeline falls back to training knowledge automatically."
+                        "</span>")
 
 
     # ── STAGE 3: streaming analysis ───────────────────────────────────────────
@@ -2525,7 +2537,7 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
         "question, and produce a structured {}-slide JSON outline with titles, bullet points, "
         "comparison tables, stat callouts, and speaker notes. "
         "You will see progress updates as each section is written.</span>"
-    ).format(est_input_tokens, model, game_title or "the reference game", slide_count))
+    ).format(est_input_tokens, model, game_title_display or "the reference game", slide_count))
 
     theme_desc = {
         "SEGA Blue — Corporate Executive": "Professional SEGA corporate blue (#0055AA), boardroom-ready.",
@@ -2568,7 +2580,7 @@ Analyse the following and produce a JSON object for a {slide_count}-slide execut
 ## INTERNAL GAME DOCUMENTS:
 {combined_docs}
 
-## REFERENCE GAME RESEARCH — {game_title}:
+## REFERENCE GAME RESEARCH — {game_title_display}:
 {research_text}
 
 ## BUSINESS QUESTION:
@@ -2590,7 +2602,7 @@ Output a single JSON object. Schema:
       "bullets":["..."],
       "stats":[{{"label":"...","value":"...","note":"..."}}],
       "comparison":{{
-        "left_title":"Internal Game","right_title":"{game_title}",
+        "left_title":"Internal Game","right_title":"<Game Title>",
         "rows":[{{"label":"...","left":"...","right":"...","delta":"positive|negative|neutral"}}]
       }},
       "chart":{{
@@ -2614,6 +2626,7 @@ Rules:
 - Keep speaker_notes to 1-2 sentences maximum — they are brief presenter cues, not essays
 - Bullets: max 6 per slide, each under 15 words
 - Comparison rows: max 8 per slide
+- If multiple reference games are provided, you may produce one comparison slide per game, or a multi-column comparison slide covering all of them. Use the game title(s) as the right_title in comparison slides.
 - Use "chart" type when the business question or uploaded data suggests a chart would be clearer than a table. Populate chart.series with real numeric data extracted from documents or research.
 - Return ONLY valid JSON — no markdown fences, no explanation"""
 
@@ -3126,7 +3139,7 @@ if run_btn:
                         st.session_state["plan_mode_active"] = True
 
                     elif etype == "pptx_bytes_out":
-                        fname = f"SEGA_Analysis_{(game_title or 'Report').replace(' ','_')}.pptx"
+                        fname = f"SEGA_Analysis_{(game_title_display or 'Report').replace(' ','_').replace(',','_')[:50]}.pptx"
                         st.session_state["pptx_bytes"]    = event[1]
                         st.session_state["pptx_filename"] = fname
 
