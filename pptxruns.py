@@ -9,7 +9,6 @@ import hashlib
 import hmac
 import random
 import base64
-import requests
 import pandas as pd
 import pypdf
 from pptx import Presentation
@@ -1699,119 +1698,11 @@ def _generate_from_template(slide_data: dict, template_bytes: bytes) -> bytes:
     buf = io.BytesIO()
     prs_out.save(buf)
     return buf.getvalue()
-def _api_post(headers: dict, payload: dict, timeout: int = 90,
-              on_wait=None) -> dict:
-    """
-    POST to /v1/messages with exponential back-off on 429.
-    on_wait(seconds, attempt) is called before each sleep so callers can
-    surface a countdown message to the UI.
-    """
-    for attempt in range(_RL_MAX_TRIES):
-        resp = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers=headers, json=payload, timeout=timeout,
-        )
-        if resp.status_code == 429:
-            if attempt == _RL_MAX_TRIES - 1:
-                raise RuntimeError(
-                    f"Rate limited after {_RL_MAX_TRIES} retries. "
-                    "Try switching to Haiku in the sidebar (much higher rate limit) "
-                    "or wait a minute and run again."
-                )
-            # Honour retry-after header when present; otherwise double each time
-            try:
-                wait = max(float(
-                    resp.headers.get("retry-after") or
-                    resp.headers.get("x-ratelimit-reset-requests") or
-                    _RL_WAIT_BASE * (2 ** attempt)
-                ), 1.0)
-            except (TypeError, ValueError):
-                wait = _RL_WAIT_BASE * (2 ** attempt)
-            if on_wait:
-                on_wait(wait, attempt + 1)
-            time.sleep(wait)
-            continue
-        resp.raise_for_status()
-        return resp.json()
-    raise RuntimeError("Unexpected exit from retry loop.")
-def _api_stream(headers: dict, payload: dict, timeout: int = 240,
-                on_rate_limit=None):
-    """
-    POST with stream=True using httpx for a true wall-clock timeout.
-    Yields text delta chunks as they arrive via SSE.
-    Retries on 429; raises RuntimeError on other errors.
-    """
-    import httpx
+def _make_anthropic_client():
+    """Return an Anthropic SDK client using the key from st.secrets."""
+    import anthropic
+    return anthropic.Anthropic(api_key=st.secrets.get("ANTHROPIC_API_KEY", ""))
 
-    for attempt in range(_RL_MAX_TRIES):
-        stream_payload = {**payload, "stream": True}
-        stream_headers = {**headers, "Accept": "text/event-stream"}
-
-        _retry_after = None  # set inside the with-block, acted on outside
-
-        try:
-            with httpx.stream(
-                "POST",
-                "https://api.anthropic.com/v1/messages",
-                headers=stream_headers,
-                json=stream_payload,
-                timeout=httpx.Timeout(
-                    timeout,          # total wall-clock limit
-                    connect=10,       # connection timeout
-                    read=timeout,     # per-read timeout
-                    write=30,         # write timeout
-                    pool=10,          # pool acquisition timeout
-                ),
-            ) as resp:
-                if resp.status_code == 429:
-                    if attempt == _RL_MAX_TRIES - 1:
-                        raise RuntimeError(
-                            "Rate limited after max retries. "
-                            "Switch to Haiku in the sidebar or wait a minute."
-                        )
-                    try:
-                        _retry_after = max(float(
-                            resp.headers.get("retry-after") or
-                            _RL_WAIT_BASE * (2 ** attempt)
-                        ), 1.0)
-                    except (TypeError, ValueError):
-                        _retry_after = _RL_WAIT_BASE * (2 ** attempt)
-                    # Must exit the with-block before sleeping and retrying
-                elif resp.status_code != 200:
-                    # Must call read() before accessing .text in a stream context
-                    resp.read()
-                    raise RuntimeError(
-                        f"API error {resp.status_code}: {resp.text[:400]}"
-                    )
-                else:
-                    for raw_line in resp.iter_lines():
-                        line = raw_line.strip()
-                        if not line or not line.startswith("data: "):
-                            continue
-                        payload_str = line[6:].strip()
-                        if payload_str == "[DONE]":
-                            return
-                        try:
-                            evt = json.loads(payload_str)
-                        except json.JSONDecodeError:
-                            continue
-                        if evt.get("type") == "content_block_delta":
-                            delta = evt.get("delta", {})
-                            if delta.get("type") == "text_delta":
-                                yield delta.get("text", "")
-                    return  # clean exit
-
-        except httpx.TimeoutException:
-            raise RuntimeError(
-                f"Analysis API timed out after {timeout}s. "
-                "Try reducing the slide count or switching to Haiku in the sidebar."
-            )
-
-        # Handle 429 retry outside the with-block
-        if _retry_after is not None:
-            if on_rate_limit:
-                on_rate_limit(_retry_after, attempt + 1)
-            time.sleep(_retry_after)
 def _render_plan_modal(template_bytes_ref):
     """
     Renders the Plan Mode outline editor as a full-page modal overlay.
@@ -2022,15 +1913,13 @@ def _render_plan_modal(template_bytes_ref):
         send_btn = st.button("Send", key="plan_chat_send", use_container_width=True, type="primary")
 
     if send_btn and chat_input.strip():
-        import httpx as _hx, json as _json
+        import json as _json
 
-        _api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
         _current_slides = _json.dumps(
             st.session_state["plan_slide_data"].get("slides", []),
             indent=2
         )
 
-        # Build conversation: system + history + new user message
         _system = (
             "You are helping edit a PowerPoint presentation outline. "
             "The user will ask you to modify slides. "
@@ -2057,29 +1946,18 @@ def _render_plan_modal(template_bytes_ref):
 
         with st.spinner("Claude is updating the outline…"):
             try:
-                _resp = _hx.post(
-                    "https://api.anthropic.com/v1/messages",
-                    headers={
-                        "x-api-key": _api_key,
-                        "anthropic-version": "2023-06-01",
-                        "content-type": "application/json",
-                    },
-                    json={
-                        "model": "claude-sonnet-4-5",
-                        "max_tokens": 4000,
-                        "system": _system,
-                        "messages": _messages,
-                    },
-                    timeout=_hx.Timeout(120, connect=10),
+                client = _make_anthropic_client()
+                msg = client.messages.create(
+                    model="claude-sonnet-4-5",
+                    max_tokens=4000,
+                    system=_system,
+                    messages=_messages,
                 )
-                _resp.raise_for_status()
-                _raw = ""
-                for _block in _resp.json().get("content", []):
-                    if _block.get("type") == "text":
-                        _raw += _block.get("text", "")
+                _raw = "".join(
+                    b.text for b in msg.content
+                    if hasattr(b, "type") and b.type == "text"
+                ).strip()
 
-                # Strip markdown fences if present
-                _raw = _raw.strip()
                 if _raw.startswith("```"):
                     _raw = _raw.split("\n", 1)[1] if "\n" in _raw else _raw[3:]
                     _raw = _raw.rsplit("```", 1)[0].strip()
@@ -2087,7 +1965,6 @@ def _render_plan_modal(template_bytes_ref):
                 _parsed = _json.loads(_raw)
 
                 if _parsed.get("action") == "update":
-                    # Apply updated slides
                     _new_slides = _parsed.get("slides", [])
                     sd_updated = dict(st.session_state["plan_slide_data"])
                     sd_updated["slides"] = _new_slides
@@ -2096,13 +1973,11 @@ def _render_plan_modal(template_bytes_ref):
                 else:
                     _reply = _parsed.get("text", "No changes made.")
 
-                # Add to chat history
                 st.session_state["plan_chat"].append({"role": "user",      "content": chat_input.strip()})
                 st.session_state["plan_chat"].append({"role": "assistant", "content": _reply})
                 st.rerun()
 
             except _json.JSONDecodeError:
-                # Claude replied with plain text — show it but don't modify outline
                 st.session_state["plan_chat"].append({"role": "user",      "content": chat_input.strip()})
                 st.session_state["plan_chat"].append({"role": "assistant", "content": _raw or "Could not parse response."})
                 st.rerun()
@@ -2157,17 +2032,11 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
     handler.  Produces rich narrative log messages so users understand exactly
     what is happening at each stage.
     """
-    api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
-    if not api_key:
+    if not st.secrets.get("ANTHROPIC_API_KEY", ""):
         yield ("error", "ANTHROPIC_API_KEY not found in st.secrets. "
                         "Add it to .streamlit/secrets.toml.")
         return
 
-    headers = {
-        "Content-Type": "application/json",
-        "x-api-key": api_key,
-        "anthropic-version": "2023-06-01",
-    }
 
     # ── STAGE 1 + 2: document extraction & web research in parallel ──────────
     yield ("spinner", (
@@ -2212,19 +2081,13 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
         return full
 
     def _web_research_one(title: str) -> str:
-        """
-        Fetch competitive intel for a single game title.
-        Runs the blocking httpx.post() in a daemon thread and enforces a hard
-        wall-clock deadline via future.result(timeout=HARD_TIMEOUT). This fires
-        even if the server is dribbling bytes and the socket never goes idle.
-        """
+        """Fetch competitive intel using the Anthropic SDK with a hard timeout."""
         if not web_search_en:
             return f"[Web search disabled — using model knowledge for '{title}']"
 
-        import httpx
         from concurrent.futures import ThreadPoolExecutor as _TPE, TimeoutError as _FTE
 
-        HARD_TIMEOUT = 60   # true wall-clock seconds — future.result() fires this hard
+        HARD_TIMEOUT = 90  # wall-clock seconds enforced via future.result()
 
         prompt = (
             f"Research the video game \"{title}\" for an executive competitive analysis presentation. "
@@ -2242,39 +2105,27 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
             "Use real numbers throughout. Aim for 650-750 words total."
         )
 
-        payload = {
-            "model": "claude-haiku-4-5-20251001",  # Haiku is faster for web search
-            "max_tokens": 2000,
-            "tools": [{"type": "web_search_20250305", "name": "web_search"}],
-            "messages": [{"role": "user", "content": prompt}],
-        }
-
         def _do_fetch():
-            """Single blocking HTTP call — no retries. Wall-clock enforced by future.result() outside."""
             try:
-                resp = httpx.post(
-                    "https://api.anthropic.com/v1/messages",
-                    headers=headers,
-                    json=payload,
-                    timeout=httpx.Timeout(300, connect=10),
+                client = _make_anthropic_client()
+                msg = client.messages.create(
+                    model="claude-haiku-4-5-20251001",
+                    max_tokens=2000,
+                    tools=[{"type": "web_search_20250305", "name": "web_search"}],
+                    messages=[{"role": "user", "content": prompt}],
                 )
-                if resp.status_code == 429:
-                    return "[Web search rate-limited — using training knowledge.]"
-                resp.raise_for_status()
-                blocks = resp.json().get("content", [])
-                text = "\n".join(b.get("text", "") for b in blocks if b.get("type") == "text")
-                return text.strip() or f"[No web results for '{title}']"
+                return "\n".join(
+                    b.text for b in msg.content
+                    if hasattr(b, "type") and b.type == "text" and b.text
+                ) or f"[No web results for '{title}']"
             except Exception as e:
                 return f"[Web search error: {e}]"
 
-        # Run in a single-thread executor so future.result(timeout=N) gives a true
-        # wall-clock deadline regardless of socket activity.
         _ex = _TPE(max_workers=1)
         _fut = _ex.submit(_do_fetch)
         try:
             return _fut.result(timeout=HARD_TIMEOUT)
         except _FTE:
-            _ex.shutdown(wait=False)
             return (
                 f"[Web search timed out after {HARD_TIMEOUT}s. "
                 f"Using Claude's training knowledge for '{title}' instead.]"
@@ -2551,53 +2402,27 @@ Rules:
         import re
         return len(re.findall(r'"type"\s*:\s*"(?:title|section|bullets|stats|comparison|recommendation|closing)"', text))
 
-    # Run the API stream in a background thread, feeding chunks into a queue.
-    # The main generator polls that queue every 2s, yielding heartbeat ticks
-    # between chunks — this way the UI updates even before the first token arrives.
+    # Use the Anthropic SDK to stream the analysis. The SDK handles retries,
+    # connection management, and SSE parsing correctly. We run it in a daemon
+    # thread and poll a queue so the Streamlit generator can yield heartbeat
+    # ticks while waiting for the first token.
     import queue as _queue, threading as _threading
 
-    _chunk_q   = _queue.Queue()
-    _SENTINEL  = object()   # signals stream is done
-    _stream_err = [None]    # mutable container so thread can write to it
+    _chunk_q    = _queue.Queue()
+    _SENTINEL   = object()
+    _stream_err = [None]
 
     def _stream_worker():
-        """
-        Makes a regular blocking POST (no SSE streaming) in a background thread.
-        Puts the full response text as a single chunk, then the sentinel.
-        This avoids httpx.stream() context manager issues in background threads.
-        """
-        import httpx
         try:
-            # Use regular non-streaming POST — simpler and works reliably from threads
-            resp = httpx.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={**headers, "Content-Type": "application/json"},
-                json={
-                    "model": model,
-                    "max_tokens": 8000,
-                    "stream": False,
-                    "system": "You are a precise game industry analyst. Return valid JSON only.",
-                    "messages": [{"role": "user", "content": analysis_prompt}],
-                },
-                timeout=httpx.Timeout(300, connect=15),
-            )
-            if resp.status_code == 429:
-                _stream_err[0] = RuntimeError(
-                    "Rate limited. Switch to Haiku in the sidebar or wait a minute.")
-                return
-            if resp.status_code != 200:
-                _stream_err[0] = RuntimeError(
-                    f"API error {resp.status_code}: {resp.text[:400]}")
-                return
-            data = resp.json()
-            text = ""
-            for block in data.get("content", []):
-                if block.get("type") == "text":
-                    text += block.get("text", "")
-            # Feed in small chunks so the progress counter updates as it "arrives"
-            chunk_size = 120
-            for i in range(0, len(text), chunk_size):
-                _chunk_q.put(text[i:i+chunk_size])
+            client = _make_anthropic_client()
+            with client.messages.stream(
+                model=model,
+                max_tokens=8000,
+                system="You are a precise game industry analyst. Return valid JSON only.",
+                messages=[{"role": "user", "content": analysis_prompt}],
+            ) as stream:
+                for text_chunk in stream.text_stream:
+                    _chunk_q.put(text_chunk)
         except Exception as exc:
             _stream_err[0] = exc
         finally:
@@ -2609,15 +2434,13 @@ Rules:
     _stream_elapsed = 0
     _first_chunk    = True
     _done           = False
-    _STREAM_TIMEOUT = 300  # hard wall-clock cap on the entire generation phase
+    _STREAM_TIMEOUT = 300
 
     try:
         while not _done:
-            # Poll the queue with a 2-second timeout so we can yield heartbeats
             try:
                 item = _chunk_q.get(timeout=2)
             except _queue.Empty:
-                # Nothing arrived in 2s — emit a heartbeat tick
                 _stream_elapsed += 2
                 if _stream_elapsed >= _STREAM_TIMEOUT:
                     yield ("error",
@@ -2638,18 +2461,15 @@ Rules:
                 continue
 
             if item is _SENTINEL:
-                # Check if the worker raised an error
                 if _stream_err[0] is not None:
                     raise _stream_err[0]
                 _done = True
                 break
 
-            # Got a real chunk
             _first_chunk = False
             raw_chunks.append(item)
             char_count += len(item)
 
-            # Announce new slides as they appear in the stream
             current_text  = "".join(raw_chunks)
             slides_so_far = _count_slides_so_far(current_text)
             if slides_so_far > slides_announced:
@@ -2658,7 +2478,6 @@ Rules:
                     yield ("spinner",
                         f"  ✏️ Writing slide {slides_announced} of {slide_count}…")
 
-            # Periodic byte-count tick every ~600 chars
             if char_count - last_tick_at >= 600:
                 last_tick_at = char_count
                 pct = min(int(char_count / (slide_count * 220) * 100), 95)
