@@ -1745,201 +1745,352 @@ def _render_plan_modal(template_bytes_ref):
 
     st.divider()
 
+    # ── Slide editor toolbar ──────────────────────────────────────────────────
+    _tc1, _tc2, _tc3 = st.columns([3, 2, 2])
+    with _tc1:
+        st.markdown(
+            f"<div style='font-size:.78rem;color:#94a3b8;padding-top:.35rem'>"
+            f"<b style='color:#e2e8f0'>{len(slides)}</b> slides — click a slide to expand and edit</div>",
+            unsafe_allow_html=True,
+        )
+    with _tc2:
+        if st.button("⊞ Expand all", key="pm_expand_all", use_container_width=True):
+            st.session_state["pm_expand_all"] = True
+            st.session_state.pop("pm_collapse_all", None)
+            st.rerun()
+    with _tc3:
+        if st.button("⊟ Collapse all", key="pm_collapse_all_btn", use_container_width=True):
+            st.session_state["pm_collapse_all"] = True
+            st.session_state.pop("pm_expand_all", None)
+            st.rerun()
+
+    _expand_all   = st.session_state.pop("pm_expand_all",   False)
+    _collapse_all = st.session_state.pop("pm_collapse_all", False)
+
     updated_slides = list(slides)
-    move_up = move_down = delete_idx = insert_after = None
+    move_up = move_down = delete_idx = insert_after = duplicate_idx = None
+
+    # Type badge colours for expander labels
+    _TYPE_COLORS = {
+        "title":          "#6366f1",
+        "section":        "#8b5cf6",
+        "bullets":        "#0ea5e9",
+        "recommendation": "#10b981",
+        "stats":          "#f59e0b",
+        "comparison":     "#ef4444",
+        "chart":          "#ec4899",
+        "closing":        "#64748b",
+    }
 
     for i, slide in enumerate(slides):
-        stype = slide.get("type", "bullets")
-        with st.expander(
-            f"**{i+1}.** `{stype.upper()}` — {slide.get('title','(untitled)')}",
-            expanded=(i == 0),
-        ):
-            rc1, rc2 = st.columns([2, 1])
+        stype  = slide.get("type", "bullets")
+        _color = _TYPE_COLORS.get(stype, "#64748b")
+        _badge = (
+            f"<span style='background:{_color}22;color:{_color};font-size:.65rem;"
+            f"font-weight:700;padding:.1rem .4rem;border-radius:3px;"
+            f"text-transform:uppercase;letter-spacing:.06em'>{stype}</span>"
+        )
+        _label = f"**{i+1}.** {slide.get('title','(untitled)')}"
+
+        # Determine expanded state
+        if _expand_all:
+            _expanded = True
+        elif _collapse_all:
+            _expanded = False
+        else:
+            _expanded = st.session_state.get(f"pm_exp_{i}", i == 0)
+
+        with st.expander(_label, expanded=_expanded):
+            # ── Row 1: type selector + action buttons ──────────────────────
+            rc1, rc2 = st.columns([3, 2])
             with rc1:
                 new_type = st.selectbox(
-                    "Type", SLIDE_TYPES,
+                    "Slide type", SLIDE_TYPES,
                     index=SLIDE_TYPES.index(stype) if stype in SLIDE_TYPES else 1,
-                    key=f"pm_type_{i}", label_visibility="collapsed",
+                    key=f"pm_type_{i}",
+                    format_func=lambda t: f"{t.upper()}",
                 )
             with rc2:
-                b1, b2, b3, b4 = st.columns(4)
-                if b1.button("⬆", key=f"pu_{i}", help="Move up",      use_container_width=True): move_up      = i
-                if b2.button("⬇", key=f"pd_{i}", help="Move down",    use_container_width=True): move_down    = i
-                if b3.button("➕", key=f"pa_{i}", help="Insert after", use_container_width=True): insert_after = i
-                if b4.button("🗑", key=f"px_{i}", help="Delete",       use_container_width=True): delete_idx   = i
+                b1, b2, b3, b4, b5 = st.columns(5)
+                if b1.button("⬆", key=f"pu_{i}",  help="Move up",       use_container_width=True): move_up       = i
+                if b2.button("⬇", key=f"pd_{i}",  help="Move down",     use_container_width=True): move_down     = i
+                if b3.button("⧉", key=f"pdup_{i}",help="Duplicate",      use_container_width=True): duplicate_idx = i
+                if b4.button("➕", key=f"pa_{i}",  help="Insert after",  use_container_width=True): insert_after  = i
+                if b5.button("🗑", key=f"px_{i}",  help="Delete slide",  use_container_width=True): delete_idx    = i
 
-            new_title    = st.text_input("Title",    slide.get("title",""),    key=f"pm_ti_{i}")
-            new_subtitle = st.text_input("Subtitle", slide.get("subtitle") or slide.get("body",""), key=f"pm_su_{i}")
+            # ── Title + subtitle always shown ──────────────────────────────
+            new_title    = st.text_input("Title",    value=slide.get("title",""),
+                                         key=f"pm_ti_{i}")
+            new_subtitle = st.text_input("Subtitle / body",
+                                         value=slide.get("subtitle") or slide.get("body",""),
+                                         key=f"pm_su_{i}")
 
             new_slide = {**slide, "type": new_type, "title": new_title, "subtitle": new_subtitle}
 
             # ── Type-specific editors ──────────────────────────────────────
             if new_type in ("bullets", "recommendation"):
+                # Migrate content from other types when switching
+                _existing = slide.get("bullets") or []
+                if new_type != stype and not _existing:
+                    _existing = [new_title] if new_title else []
                 raw = st.text_area(
                     "Bullets (one per line, max 6)",
-                    value="\n".join(slide.get("bullets") or []),
-                    height=150, key=f"pm_bu_{i}",
+                    value="\n".join(_existing),
+                    height=160, key=f"pm_bu_{i}",
                 )
-                new_slide["bullets"] = [b.strip() for b in raw.split("\n") if b.strip()][:6]
+                _bullets = [b.strip() for b in raw.split("\n") if b.strip()][:6]
+                if len(_bullets) == 6:
+                    st.caption("⚠️ Maximum 6 bullets — additional lines will be ignored.")
+                new_slide["bullets"] = _bullets
 
             elif new_type == "stats":
-                st.caption("Format: value | label | note")
+                _existing_stats = slide.get("stats") or []
+                # Pad to 4 rows for the editor
+                while len(_existing_stats) < 4:
+                    _existing_stats.append({"value":"", "label":"", "note":""})
+                st.caption("Exactly 4 stat cards required — format: **value | label | note**")
                 raw = st.text_area(
-                    "Stats", height=110, key=f"pm_st_{i}",
+                    "Stats (4 rows)", height=120, key=f"pm_st_{i}",
                     label_visibility="collapsed",
                     value="\n".join(
                         f"{s.get('value','')} | {s.get('label','')} | {s.get('note','')}"
-                        for s in (slide.get("stats") or [])
+                        for s in _existing_stats[:4]
                     ),
                 )
                 new_stats = []
                 for line in raw.split("\n"):
                     p = [x.strip() for x in line.split("|")]
                     if any(p):
-                        new_stats.append({"value": p[0] if p else "", "label": p[1] if len(p)>1 else "", "note": p[2] if len(p)>2 else ""})
+                        new_stats.append({
+                            "value": p[0] if p else "",
+                            "label": p[1] if len(p) > 1 else "",
+                            "note":  p[2] if len(p) > 2 else "",
+                        })
+                _n_stats = len(new_stats[:4])
+                if _n_stats != 4:
+                    st.warning(f"Stats slide needs exactly 4 cards — currently {_n_stats}.")
                 new_slide["stats"] = new_stats[:4]
 
             elif new_type == "comparison":
-                cmp  = slide.get("comparison") or {}
-                rows = cmp.get("rows") or []
+                # Support both root-level and nested comparison keys
+                _cmp  = slide.get("comparison") or {}
+                _rows = _cmp.get("rows") or slide.get("rows") or []
+                _lt   = slide.get("left_title")  or _cmp.get("left_title",  "Internal")
+                _rt   = slide.get("right_title") or _cmp.get("right_title", "Reference")
                 cl, cr = st.columns(2)
-                lt = cl.text_input("Left col title",  cmp.get("left_title",""),  key=f"pm_lt_{i}")
-                rt = cr.text_input("Right col title", cmp.get("right_title",""), key=f"pm_rt_{i}")
-                st.caption("Rows: label | left | right | delta")
-                raw = st.text_area("Rows", height=140, key=f"pm_ro_{i}", label_visibility="collapsed",
+                lt = cl.text_input("Left column title",  _lt, key=f"pm_lt_{i}")
+                rt = cr.text_input("Right column title", _rt, key=f"pm_rt_{i}")
+                st.caption("Rows: **label | left | right | delta** (delta: positive / negative / neutral)")
+                raw = st.text_area(
+                    "Rows", height=160, key=f"pm_ro_{i}", label_visibility="collapsed",
                     value="\n".join(
                         f"{r.get('label','')} | {r.get('left','')} | {r.get('right','')} | {r.get('delta','neutral')}"
-                        for r in rows
+                        for r in _rows
                     ),
                 )
                 new_rows = []
                 for line in raw.split("\n"):
                     p = [x.strip() for x in line.split("|")]
-                    if len(p) >= 3 and any(p):
-                        new_rows.append({"label":p[0],"left":p[1],"right":p[2],"delta":p[3] if len(p)>3 else "neutral"})
-                new_slide["comparison"] = {"left_title":lt,"right_title":rt,"rows":new_rows[:8]}
+                    if len(p) >= 2 and any(p):
+                        new_rows.append({
+                            "label": p[0], "left":  p[1],
+                            "right": p[2] if len(p) > 2 else "",
+                            "delta": p[3] if len(p) > 3 else "neutral",
+                        })
+                new_slide["left_title"]  = lt
+                new_slide["right_title"] = rt
+                new_slide["comparison"]  = {"left_title": lt, "right_title": rt, "rows": new_rows[:8]}
 
             elif new_type == "chart":
-                chart = slide.get("chart") or {}
-                ct_opts = ["bar","line","scatter","pie","horizontal_bar"]
-                ct  = st.selectbox("Chart type", ct_opts,
-                                    index=ct_opts.index(chart.get("chart_type","bar")),
-                                    key=f"pm_ct_{i}")
+                chart   = slide.get("chart") or {}
+                ct_opts = ["bar", "line", "scatter", "pie", "horizontal_bar"]
+                _ct_idx = ct_opts.index(chart.get("chart_type","bar")) if chart.get("chart_type","bar") in ct_opts else 0
+                ct = st.selectbox("Chart type", ct_opts, index=_ct_idx, key=f"pm_ct_{i}")
                 ca, cb = st.columns(2)
-                xl  = ca.text_input("X label", chart.get("x_label",""), key=f"pm_xl_{i}")
-                yl  = cb.text_input("Y label", chart.get("y_label",""), key=f"pm_yl_{i}")
+                xl = ca.text_input("X-axis label", chart.get("x_label",""), key=f"pm_xl_{i}")
+                yl = cb.text_input("Y-axis label", chart.get("y_label",""), key=f"pm_yl_{i}")
                 cats = st.text_input(
                     "Categories (comma-separated)",
-                    ", ".join(chart.get("categories") or []), key=f"pm_ca_{i}"
+                    ", ".join(chart.get("categories") or []), key=f"pm_ca_{i}",
                 )
-                st.caption("Series: label | val1, val2, …  (one per line)")
-                raw = st.text_area("Series", height=100, key=f"pm_se_{i}", label_visibility="collapsed",
+                st.caption("Series: **label | val1, val2, …** (one per line)")
+                raw_ser = st.text_area(
+                    "Series", height=100, key=f"pm_se_{i}", label_visibility="collapsed",
                     value="\n".join(
                         f"{s.get('label','')} | {', '.join(str(v) for v in s.get('values',[]))}"
                         for s in (chart.get("series") or [])
                     ),
                 )
                 new_series = []
-                for line in raw.split("\n"):
+                for line in raw_ser.split("\n"):
                     p = [x.strip() for x in line.split("|")]
                     if len(p) >= 2:
-                        try:
-                            vals = [float(v.strip()) for v in p[1].split(",") if v.strip()]
-                        except ValueError:
-                            vals = []
+                        try:   vals = [float(v.strip()) for v in p[1].split(",") if v.strip()]
+                        except ValueError: vals = []
                         new_series.append({"label": p[0], "values": vals})
+                raw_colors = st.text_input(
+                    "Colors (comma-separated hex, e.g. 2563EB, E11D48)",
+                    ", ".join(chart.get("colors") or []), key=f"pm_col_{i}",
+                )
+                _colors = [c.strip().lstrip("#") for c in raw_colors.split(",") if c.strip()]
                 new_slide["chart"] = {
                     "chart_type": ct, "x_label": xl, "y_label": yl,
                     "categories": [c.strip() for c in cats.split(",") if c.strip()],
-                    "series": new_series,
+                    "series":     new_series,
+                    "colors":     _colors,
                 }
 
             updated_slides[i] = new_slide
 
-    # ── Reorder / delete / insert ────────────────────────────────────────────
+    # ── Reorder / duplicate / delete / insert ────────────────────────────────
     if move_up is not None and move_up > 0:
+        _history = st.session_state.get("plan_slide_history", [])
+        _history.append(list(updated_slides)); st.session_state["plan_slide_history"] = _history[-10:]
         updated_slides[move_up-1], updated_slides[move_up] = updated_slides[move_up], updated_slides[move_up-1]
         sd["slides"] = updated_slides; st.session_state["plan_slide_data"] = sd; st.rerun()
+
     if move_down is not None and move_down < len(updated_slides)-1:
+        _history = st.session_state.get("plan_slide_history", [])
+        _history.append(list(updated_slides)); st.session_state["plan_slide_history"] = _history[-10:]
         updated_slides[move_down], updated_slides[move_down+1] = updated_slides[move_down+1], updated_slides[move_down]
         sd["slides"] = updated_slides; st.session_state["plan_slide_data"] = sd; st.rerun()
-    if delete_idx is not None and len(updated_slides) > 1:
-        updated_slides.pop(delete_idx)
-        sd["slides"] = updated_slides; st.session_state["plan_slide_data"] = sd; st.rerun()
-    if insert_after is not None:
-        updated_slides.insert(insert_after+1, {"type":"bullets","title":"New Slide","bullets":[]})
+
+    if duplicate_idx is not None:
+        _history = st.session_state.get("plan_slide_history", [])
+        _history.append(list(updated_slides)); st.session_state["plan_slide_history"] = _history[-10:]
+        import copy as _copy
+        updated_slides.insert(duplicate_idx + 1, _copy.deepcopy(updated_slides[duplicate_idx]))
         sd["slides"] = updated_slides; st.session_state["plan_slide_data"] = sd; st.rerun()
 
-    # Always persist live edits
+    if delete_idx is not None and len(updated_slides) > 1:
+        _history = st.session_state.get("plan_slide_history", [])
+        _history.append(list(updated_slides)); st.session_state["plan_slide_history"] = _history[-10:]
+        updated_slides.pop(delete_idx)
+        sd["slides"] = updated_slides; st.session_state["plan_slide_data"] = sd; st.rerun()
+
+    if insert_after is not None:
+        _history = st.session_state.get("plan_slide_history", [])
+        _history.append(list(updated_slides)); st.session_state["plan_slide_history"] = _history[-10:]
+        updated_slides.insert(insert_after + 1, {"type": "bullets", "title": "New Slide", "bullets": []})
+        sd["slides"] = updated_slides; st.session_state["plan_slide_data"] = sd; st.rerun()
+
+    # Persist live edits on every render
     sd["slides"] = updated_slides
     st.session_state["plan_slide_data"] = sd
 
-    st.divider()
-
     # ── Chat with Claude ──────────────────────────────────────────────────────
     st.markdown(
-        "<p style='font-size:.8rem;font-weight:700;letter-spacing:.08em;"
-        "text-transform:uppercase;color:#60a5fa;margin-bottom:.4rem'>"
-        "💬 Ask Claude to modify the outline</p>",
+        "<div style='font-size:.78rem;font-weight:700;letter-spacing:.09em;"
+        "text-transform:uppercase;color:#60a5fa;margin:0 0 .6rem 0'>"
+        "💬 Ask Claude to modify the outline</div>",
         unsafe_allow_html=True,
     )
 
-    # Initialise chat history in session state
-    if "plan_chat" not in st.session_state:
-        st.session_state["plan_chat"] = []
+    # Initialise state
+    if "plan_chat"          not in st.session_state: st.session_state["plan_chat"]          = []
+    if "plan_slide_history" not in st.session_state: st.session_state["plan_slide_history"] = []
+    if "plan_chat_clear_input" not in st.session_state: st.session_state["plan_chat_clear_input"] = False
 
-    # Show chat history
-    for msg in st.session_state["plan_chat"]:
-        role_color = "#60a5fa" if msg["role"] == "assistant" else "#94a3b8"
-        role_label = "Claude" if msg["role"] == "assistant" else "You"
+    # ── Undo button ───────────────────────────────────────────────────────────
+    undo_col, _ = st.columns([1, 5])
+    with undo_col:
+        _history = st.session_state["plan_slide_history"]
+        if _history:
+            if st.button(f"↩ Undo ({len(_history)})", key="pm_undo", use_container_width=True):
+                st.session_state["plan_slide_data"]["slides"] = _history.pop()
+                st.session_state["plan_slide_history"] = _history
+                st.rerun()
+
+    # ── Chat history display ──────────────────────────────────────────────────
+    for _msg in st.session_state["plan_chat"]:
+        _is_claude = _msg["role"] == "assistant"
+        _bg   = "#1e3a5f" if _is_claude else "#1e293b"
+        _name = "Claude" if _is_claude else "You"
+        _col  = "#60a5fa" if _is_claude else "#94a3b8"
+        # Escape HTML in content so <tags> in Claude replies don't break layout
+        import html as _html_mod
+        _safe_content = _html_mod.escape(_msg["content"]).replace("\n", "<br>")
         st.markdown(
-            f"<div style='margin-bottom:.5rem'>"
-            f"<span style='font-size:.7rem;font-weight:700;color:{role_color};"
-            f"text-transform:uppercase;letter-spacing:.06em'>{role_label}</span><br>"
-            f"<span style='font-size:.88rem;color:#cbd5e1'>{msg['content']}</span>"
+            f"<div style='background:{_bg};border-radius:6px;padding:.55rem .75rem;"
+            f"margin-bottom:.45rem;border-left:3px solid {_col}'>"
+            f"<span style='font-size:.68rem;font-weight:700;color:{_col};"
+            f"text-transform:uppercase;letter-spacing:.07em'>{_name}</span><br>"
+            f"<span style='font-size:.86rem;color:#e2e8f0;line-height:1.55'>{_safe_content}</span>"
             f"</div>",
             unsafe_allow_html=True,
         )
 
-    # Chat input + send
+    # ── Input row ─────────────────────────────────────────────────────────────
+    # Clear the input box by cycling the key after a send
+    _input_key = f"plan_chat_input_{'b' if st.session_state.get('plan_chat_clear_input') else 'a'}"
+
     chat_col, btn_col = st.columns([5, 1])
     with chat_col:
         chat_input = st.text_input(
-            "chat_input", label_visibility="collapsed",
-            placeholder="e.g. Add a chart slide comparing Year 1 sales, make slide 3 a comparison table…",
-            key="plan_chat_input",
+            "chat", label_visibility="collapsed",
+            placeholder="e.g. Make slide 3 a comparison table, add a chart slide about revenue…",
+            key=_input_key,
         )
     with btn_col:
         send_btn = st.button("Send", key="plan_chat_send", use_container_width=True, type="primary")
 
+    # Clear + undo strip below input
+    if st.session_state.get("plan_chat"):
+        if st.button("🗑 Clear chat", key="plan_chat_clear", use_container_width=False):
+            st.session_state["plan_chat"] = []
+            st.rerun()
+
+    # ── Handle send ───────────────────────────────────────────────────────────
     if send_btn and chat_input.strip():
-        import json as _json
+        import json as _json, html as _html_mod
 
-        _current_slides = _json.dumps(
-            st.session_state["plan_slide_data"].get("slides", []),
-            indent=2
-        )
+        # Save current slides to undo history before any change
+        _current = list(st.session_state["plan_slide_data"].get("slides", []))
 
-        _system = (
-            "You are helping edit a PowerPoint presentation outline. "
-            "The user will ask you to modify slides. "
-            "You MUST respond with a JSON object in this exact format:\n"
-            '{"action": "update", "slides": [<full updated slides array>]}\n'
-            "OR if clarification is needed with no slide changes:\n"
-            '{"action": "message", "text": "your reply here"}\n\n'
-            "Slide types available: title, section, bullets, stats, comparison, recommendation, chart, closing.\n"
-            "Always return the COMPLETE slides array, not just changed slides.\n"
-            "Return ONLY valid JSON, no markdown fences."
-        )
+        _current_slides_json = _json.dumps(_current, indent=2)
 
+        # Detailed system prompt with full slide schema
+        _system = """You are editing a PowerPoint presentation outline for SEGA.
+The user will ask you to modify, add, remove, or reorder slides.
+
+SLIDE SCHEMA — every slide must have "type" and "title". Additional fields by type:
+  title:          { subtitle, body }
+  section:        { subtitle }
+  bullets:        { bullets: ["string", …] }          ← max 6 items
+  recommendation: { bullets: ["string", …] }          ← max 6 items
+  stats:          { stats: [{ value, label, note }, …] }  ← exactly 4 items
+  comparison:     { left_title, right_title, rows: [{ label, left, right, delta }, …] }
+  chart:          { chart: { chart_type, x_label, y_label, categories: [], series: [{ label, values: [] }], colors: [] } }
+  closing:        { subtitle }
+
+RESPONSE FORMAT — you MUST return one of these two JSON objects (no markdown fences):
+  If you are making changes:
+    {"action":"update","slides":[…complete updated array…],"summary":"brief description of what changed"}
+  If you need clarification or cannot make the change:
+    {"action":"message","text":"your reply"}
+
+Rules:
+- Always return the COMPLETE slides array, not just modified slides.
+- Never add duplicate title slides unless asked.
+- Keep slide count reasonable (6-16 slides).
+- For chart slides, use realistic placeholder values if no data is specified.
+- Return ONLY valid JSON — no prose, no markdown."""
+
+        # Build messages: only include previous Claude update summaries, not raw JSON,
+        # so context stays compact and multi-turn works correctly.
         _messages = []
         for _m in st.session_state["plan_chat"]:
-            _messages.append({"role": _m["role"], "content": _m["content"]})
+            if _m["role"] == "user":
+                _messages.append({"role": "user", "content": _m["content"]})
+            else:
+                # For assistant turns, send a compact acknowledgement not the full JSON
+                _messages.append({"role": "assistant", "content": _m.get("_raw_reply", _m["content"])})
+
         _messages.append({
             "role": "user",
             "content": (
-                f"Current outline ({len(st.session_state['plan_slide_data'].get('slides',[]))} slides):\n"
-                f"```json\n{_current_slides}\n```\n\n"
+                f"Current outline ({len(_current)} slides):\n"
+                f"```json\n{_current_slides_json}\n```\n\n"
                 f"Request: {chat_input.strip()}"
             )
         })
@@ -1947,17 +2098,18 @@ def _render_plan_modal(template_bytes_ref):
         with st.spinner("Claude is updating the outline…"):
             try:
                 client = _make_anthropic_client()
-                msg = client.messages.create(
-                    model="claude-sonnet-4-5",
-                    max_tokens=4000,
+                _api_msg = client.messages.create(
+                    model="claude-sonnet-4-6",
+                    max_tokens=6000,
                     system=_system,
                     messages=_messages,
                 )
                 _raw = "".join(
-                    b.text for b in msg.content
+                    b.text for b in _api_msg.content
                     if hasattr(b, "type") and b.type == "text"
                 ).strip()
 
+                # Strip markdown fences if Claude added them despite instructions
                 if _raw.startswith("```"):
                     _raw = _raw.split("\n", 1)[1] if "\n" in _raw else _raw[3:]
                     _raw = _raw.rsplit("```", 1)[0].strip()
@@ -1966,31 +2118,58 @@ def _render_plan_modal(template_bytes_ref):
 
                 if _parsed.get("action") == "update":
                     _new_slides = _parsed.get("slides", [])
-                    sd_updated = dict(st.session_state["plan_slide_data"])
-                    sd_updated["slides"] = _new_slides
-                    st.session_state["plan_slide_data"] = sd_updated
-                    _reply = f"Done — updated outline to {len(_new_slides)} slides."
-                else:
-                    _reply = _parsed.get("text", "No changes made.")
+                    _summary    = _parsed.get("summary", f"Updated to {len(_new_slides)} slides.")
 
-                st.session_state["plan_chat"].append({"role": "user",      "content": chat_input.strip()})
-                st.session_state["plan_chat"].append({"role": "assistant", "content": _reply})
+                    # Compute a human-readable diff
+                    _old_titles = [s.get("title","") for s in _current]
+                    _new_titles = [s.get("title","") for s in _new_slides]
+                    _added   = [t for t in _new_titles if t not in _old_titles]
+                    _removed = [t for t in _old_titles if t not in _new_titles]
+                    _diff_parts = []
+                    if _added:   _diff_parts.append(f"+{len(_added)} added")
+                    if _removed: _diff_parts.append(f"−{len(_removed)} removed")
+                    if len(_new_slides) != len(_current):
+                        _diff_parts.append(f"{len(_current)}→{len(_new_slides)} slides")
+                    _diff_str = "  ·  ".join(_diff_parts) if _diff_parts else "outline updated"
+
+                    # Push to undo history (cap at 10)
+                    _history = st.session_state["plan_slide_history"]
+                    _history.append(_current)
+                    st.session_state["plan_slide_history"] = _history[-10:]
+
+                    # Apply
+                    _sd = dict(st.session_state["plan_slide_data"])
+                    _sd["slides"] = _new_slides
+                    st.session_state["plan_slide_data"] = _sd
+
+                    _display_reply = f"✅ {_summary}\n{_diff_str}"
+                else:
+                    _display_reply = _parsed.get("text", "No changes made.")
+                    _raw = _json.dumps({"action": "message", "text": _display_reply})
+
+                st.session_state["plan_chat"].append({
+                    "role": "user", "content": chat_input.strip()
+                })
+                st.session_state["plan_chat"].append({
+                    "role": "assistant",
+                    "content": _display_reply,
+                    "_raw_reply": _raw,   # stored for accurate multi-turn context
+                })
+                # Flip the key to clear the input box on next render
+                st.session_state["plan_chat_clear_input"] = not st.session_state.get("plan_chat_clear_input", False)
                 st.rerun()
 
             except _json.JSONDecodeError:
+                _display = _raw if _raw else "Could not parse Claude's response."
                 st.session_state["plan_chat"].append({"role": "user",      "content": chat_input.strip()})
-                st.session_state["plan_chat"].append({"role": "assistant", "content": _raw or "Could not parse response."})
+                st.session_state["plan_chat"].append({"role": "assistant", "content": _display, "_raw_reply": _display})
+                st.session_state["plan_chat_clear_input"] = not st.session_state.get("plan_chat_clear_input", False)
                 st.rerun()
             except Exception as _ce:
                 st.error(f"Chat error: {_ce}")
 
-    # Clear chat history button
-    if st.session_state.get("plan_chat"):
-        if st.button("🗑 Clear chat history", key="plan_chat_clear", use_container_width=False):
-            st.session_state["plan_chat"] = []
-            st.rerun()
-
     st.divider()
+
 
     # ── Export ────────────────────────────────────────────────────────────────
     ec1, ec2, _ = st.columns([1, 1, 1])
