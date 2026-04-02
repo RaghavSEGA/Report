@@ -1866,6 +1866,9 @@ def _render_plan_modal(template_bytes_ref):
         # ── NORMAL EXPANDER EDIT VIEW ─────────────────────────────────────────
 
 
+        updated_slides = list(slides)
+        move_up = move_down = delete_idx = insert_after = duplicate_idx = None
+
         # Type badge colours for expander labels
         _TYPE_COLORS = {
             "title":          "#6366f1",
