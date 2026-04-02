@@ -771,6 +771,7 @@ def _slide_chart(prs, s: dict, C: dict):
 
 
 
+def generate_pptx(slide_data: dict, template_bytes: bytes | None = None) -> bytes:
     """
     Build a PPTX from slide_data.
 
@@ -1778,7 +1779,7 @@ def _render_plan_modal(template_bytes_ref):
     st.divider()
 
     # ── Slide editor toolbar ──────────────────────────────────────────────────
-    _tc1, _tc2, _tc3 = st.columns([3, 2, 2])
+    _tc1, _tc2, _tc3, _tc4 = st.columns([3, 2, 2, 2])
     with _tc1:
         st.markdown(
             f"<div style='font-size:.78rem;color:#94a3b8;padding-top:.35rem'>"
@@ -1795,242 +1796,306 @@ def _render_plan_modal(template_bytes_ref):
             st.session_state["pm_collapse_all"] = True
             st.session_state.pop("pm_expand_all", None)
             st.rerun()
+    with _tc4:
+        _reorder_active = st.session_state.get("pm_reorder_mode", False)
+        if st.button(
+            "↕ Reorder" if not _reorder_active else "✓ Done reordering",
+            key="pm_reorder_toggle",
+            use_container_width=True,
+            type="primary" if _reorder_active else "secondary",
+        ):
+            st.session_state["pm_reorder_mode"] = not _reorder_active
+            st.rerun()
 
     _expand_all   = st.session_state.pop("pm_expand_all",   False)
     _collapse_all = st.session_state.pop("pm_collapse_all", False)
+    _reorder_mode = st.session_state.get("pm_reorder_mode", False)
 
-    updated_slides = list(slides)
-    move_up = move_down = delete_idx = insert_after = duplicate_idx = None
+    # ── DRAG-AND-DROP REORDER VIEW ────────────────────────────────────────────
+    if _reorder_mode:
+        try:
+            from streamlit_sortables import sort_items as _sort_items
+        except ImportError:
+            st.error("streamlit-sortables not installed. Add it to requirements.txt.")
+            st.session_state["pm_reorder_mode"] = False
+            st.rerun()
 
-    # Type badge colours for expander labels
-    _TYPE_COLORS = {
-        "title":          "#6366f1",
-        "section":        "#8b5cf6",
-        "bullets":        "#0ea5e9",
-        "recommendation": "#10b981",
-        "stats":          "#f59e0b",
-        "comparison":     "#ef4444",
-        "chart":          "#ec4899",
-        "closing":        "#64748b",
-    }
+        # Type badge emoji for quick visual scanning in the drag list
+        _TYPE_EMOJI = {
+            "title": "🎯", "section": "📌", "bullets": "📝",
+            "recommendation": "💡", "stats": "📊", "comparison": "⚖️",
+            "chart": "📈", "closing": "🏁",
+        }
 
-    for i, slide in enumerate(slides):
-        stype  = slide.get("type", "bullets")
-        _color = _TYPE_COLORS.get(stype, "#64748b")
-        _badge = (
-            f"<span style='background:{_color}22;color:{_color};font-size:.65rem;"
-            f"font-weight:700;padding:.1rem .4rem;border-radius:3px;"
-            f"text-transform:uppercase;letter-spacing:.06em'>{stype}</span>"
+        # Build stable item labels — index prefix makes each unique even with duplicate titles
+        _sort_labels = [
+            f"{i+1}. {_TYPE_EMOJI.get(s.get('type','bullets'),'📝')} {s.get('title','(untitled)')}"
+            for i, s in enumerate(slides)
+        ]
+
+        st.markdown(
+            "<div style='font-size:.78rem;color:#94a3b8;margin-bottom:.4rem'>"
+            "Drag the cards below to reorder your slides, then click <b>✓ Done reordering</b>.</div>",
+            unsafe_allow_html=True,
         )
-        _label = f"**{i+1}.** {slide.get('title','(untitled)')}"
 
-        # Determine expanded state
-        if _expand_all:
-            _expanded = True
-        elif _collapse_all:
-            _expanded = False
-        else:
-            _expanded = st.session_state.get(f"pm_exp_{i}", i == 0)
+        _sorted_labels = _sort_items(
+            _sort_labels,
+            direction="vertical",
+            key="pm_sortable",
+        )
 
-        with st.expander(_label, expanded=_expanded):
-            # ── Row 1: type selector + action buttons ──────────────────────
-            rc1, rc2 = st.columns([3, 2])
-            with rc1:
-                new_type = st.selectbox(
-                    "Slide type", SLIDE_TYPES,
-                    index=SLIDE_TYPES.index(stype) if stype in SLIDE_TYPES else 1,
-                    key=f"pm_type_{i}",
-                    format_func=lambda t: f"{t.upper()}",
-                )
-            with rc2:
-                b1, b2, b3, b4, b5 = st.columns(5)
-                if b1.button("⬆", key=f"pu_{i}",  help="Move up",       use_container_width=True): move_up       = i
-                if b2.button("⬇", key=f"pd_{i}",  help="Move down",     use_container_width=True): move_down     = i
-                if b3.button("⧉", key=f"pdup_{i}",help="Duplicate",      use_container_width=True): duplicate_idx = i
-                if b4.button("➕", key=f"pa_{i}",  help="Insert after",  use_container_width=True): insert_after  = i
-                if b5.button("🗑", key=f"px_{i}",  help="Delete slide",  use_container_width=True): delete_idx    = i
+        # Detect if order changed and apply immediately
+        if _sorted_labels != _sort_labels:
+            # Map sorted labels back to slides via the original index prefix
+            _label_to_slide = {lbl: slides[i] for i, lbl in enumerate(_sort_labels)}
+            _new_order = [_label_to_slide[lbl] for lbl in _sorted_labels if lbl in _label_to_slide]
+            if len(_new_order) == len(slides):
+                _history = st.session_state.get("plan_slide_history", [])
+                _history.append(list(slides))
+                st.session_state["plan_slide_history"] = _history[-10:]
+                sd["slides"] = _new_order
+                st.session_state["plan_slide_data"] = sd
+                st.rerun()
 
-            # ── Title + subtitle always shown ──────────────────────────────
-            new_title    = st.text_input("Title",    value=slide.get("title",""),
-                                         key=f"pm_ti_{i}")
-            new_subtitle = st.text_input("Subtitle / body",
-                                         value=slide.get("subtitle") or slide.get("body",""),
-                                         key=f"pm_su_{i}")
-            new_notes    = st.text_input(
-                "🎤 Speaker notes",
-                value=slide.get("speaker_notes") or slide.get("notes") or "",
-                key=f"pm_no_{i}",
-                placeholder="Brief presenter cue — shown in PowerPoint notes pane",
+        # Persist and skip the expander loop when in reorder mode
+        sd["slides"] = list(slides)
+        st.session_state["plan_slide_data"] = sd
+
+    else:
+        # ── NORMAL EXPANDER EDIT VIEW ─────────────────────────────────────────
+
+
+        # Type badge colours for expander labels
+        _TYPE_COLORS = {
+            "title":          "#6366f1",
+            "section":        "#8b5cf6",
+            "bullets":        "#0ea5e9",
+            "recommendation": "#10b981",
+            "stats":          "#f59e0b",
+            "comparison":     "#ef4444",
+            "chart":          "#ec4899",
+            "closing":        "#64748b",
+        }
+    
+        for i, slide in enumerate(slides):
+            stype  = slide.get("type", "bullets")
+            _color = _TYPE_COLORS.get(stype, "#64748b")
+            _badge = (
+                f"<span style='background:{_color}22;color:{_color};font-size:.65rem;"
+                f"font-weight:700;padding:.1rem .4rem;border-radius:3px;"
+                f"text-transform:uppercase;letter-spacing:.06em'>{stype}</span>"
             )
-
-            new_slide = {**slide, "type": new_type, "title": new_title,
-                         "subtitle": new_subtitle, "speaker_notes": new_notes}
-
-            # ── Type-specific editors ──────────────────────────────────────
-            if new_type in ("bullets", "recommendation"):
-                # Migrate content from other types when switching
-                _existing = slide.get("bullets") or []
-                if new_type != stype and not _existing:
-                    _existing = [new_title] if new_title else []
-                raw = st.text_area(
-                    "Bullets (one per line, max 6)",
-                    value="\n".join(_existing),
-                    height=160, key=f"pm_bu_{i}",
+            _label = f"**{i+1}.** {slide.get('title','(untitled)')}"
+    
+            # Determine expanded state
+            if _expand_all:
+                _expanded = True
+            elif _collapse_all:
+                _expanded = False
+            else:
+                _expanded = st.session_state.get(f"pm_exp_{i}", i == 0)
+    
+            with st.expander(_label, expanded=_expanded):
+                # ── Row 1: type selector + action buttons ──────────────────────
+                rc1, rc2 = st.columns([3, 2])
+                with rc1:
+                    new_type = st.selectbox(
+                        "Slide type", SLIDE_TYPES,
+                        index=SLIDE_TYPES.index(stype) if stype in SLIDE_TYPES else 1,
+                        key=f"pm_type_{i}",
+                        format_func=lambda t: f"{t.upper()}",
+                    )
+                with rc2:
+                    b1, b2, b3, b4, b5 = st.columns(5)
+                    if b1.button("⬆", key=f"pu_{i}",  help="Move up",       use_container_width=True): move_up       = i
+                    if b2.button("⬇", key=f"pd_{i}",  help="Move down",     use_container_width=True): move_down     = i
+                    if b3.button("⧉", key=f"pdup_{i}",help="Duplicate",      use_container_width=True): duplicate_idx = i
+                    if b4.button("➕", key=f"pa_{i}",  help="Insert after",  use_container_width=True): insert_after  = i
+                    if b5.button("🗑", key=f"px_{i}",  help="Delete slide",  use_container_width=True): delete_idx    = i
+    
+                # ── Title + subtitle always shown ──────────────────────────────
+                new_title    = st.text_input("Title",    value=slide.get("title",""),
+                                             key=f"pm_ti_{i}")
+                new_subtitle = st.text_input("Subtitle / body",
+                                             value=slide.get("subtitle") or slide.get("body",""),
+                                             key=f"pm_su_{i}")
+                new_notes    = st.text_input(
+                    "🎤 Speaker notes",
+                    value=slide.get("speaker_notes") or slide.get("notes") or "",
+                    key=f"pm_no_{i}",
+                    placeholder="Brief presenter cue — shown in PowerPoint notes pane",
                 )
-                _bullets = [b.strip() for b in raw.split("\n") if b.strip()][:6]
-                if len(_bullets) == 6:
-                    st.caption("⚠️ Maximum 6 bullets — additional lines will be ignored.")
-                new_slide["bullets"] = _bullets
-
-            elif new_type == "stats":
-                _existing_stats = slide.get("stats") or []
-                # Pad to 4 rows for the editor
-                while len(_existing_stats) < 4:
-                    _existing_stats.append({"value":"", "label":"", "note":""})
-                st.caption("Exactly 4 stat cards required — format: **value | label | note**")
-                raw = st.text_area(
-                    "Stats (4 rows)", height=120, key=f"pm_st_{i}",
-                    label_visibility="collapsed",
-                    value="\n".join(
-                        f"{s.get('value','')} | {s.get('label','')} | {s.get('note','')}"
-                        for s in _existing_stats[:4]
-                    ),
-                )
-                new_stats = []
-                for line in raw.split("\n"):
-                    p = [x.strip() for x in line.split("|")]
-                    if any(p):
-                        new_stats.append({
-                            "value": p[0] if p else "",
-                            "label": p[1] if len(p) > 1 else "",
-                            "note":  p[2] if len(p) > 2 else "",
-                        })
-                _n_stats = len(new_stats[:4])
-                if _n_stats != 4:
-                    st.warning(f"Stats slide needs exactly 4 cards — currently {_n_stats}.")
-                new_slide["stats"] = new_stats[:4]
-
-            elif new_type == "comparison":
-                # Support both root-level and nested comparison keys
-                _cmp  = slide.get("comparison") or {}
-                _rows = _cmp.get("rows") or slide.get("rows") or []
-                _lt   = slide.get("left_title")  or _cmp.get("left_title",  "Internal")
-                _rt   = slide.get("right_title") or _cmp.get("right_title", "Reference")
-                cl, cr = st.columns(2)
-                lt = cl.text_input("Left column title",  _lt, key=f"pm_lt_{i}")
-                rt = cr.text_input("Right column title", _rt, key=f"pm_rt_{i}")
-                st.caption("Rows: **label | left | right | delta** (delta: positive / negative / neutral)")
-                raw = st.text_area(
-                    "Rows", height=160, key=f"pm_ro_{i}", label_visibility="collapsed",
-                    value="\n".join(
-                        f"{r.get('label','')} | {r.get('left','')} | {r.get('right','')} | {r.get('delta','neutral')}"
-                        for r in _rows
-                    ),
-                )
-                new_rows = []
-                for line in raw.split("\n"):
-                    p = [x.strip() for x in line.split("|")]
-                    if len(p) >= 2 and any(p):
-                        new_rows.append({
-                            "label": p[0], "left":  p[1],
-                            "right": p[2] if len(p) > 2 else "",
-                            "delta": p[3] if len(p) > 3 else "neutral",
-                        })
-                new_slide["left_title"]  = lt
-                new_slide["right_title"] = rt
-                new_slide["comparison"]  = {"left_title": lt, "right_title": rt, "rows": new_rows[:8]}
-
-            elif new_type == "chart":
-                chart   = slide.get("chart") or {}
-                ct_opts = ["bar", "line", "scatter", "pie", "horizontal_bar"]
-                _ct_idx = ct_opts.index(chart.get("chart_type","bar")) if chart.get("chart_type","bar") in ct_opts else 0
-                ct = st.selectbox("Chart type", ct_opts, index=_ct_idx, key=f"pm_ct_{i}")
-                ca, cb = st.columns(2)
-                xl = ca.text_input("X-axis label", chart.get("x_label",""), key=f"pm_xl_{i}")
-                yl = cb.text_input("Y-axis label", chart.get("y_label",""), key=f"pm_yl_{i}")
-                cats = st.text_input(
-                    "Categories (comma-separated)",
-                    ", ".join(chart.get("categories") or []), key=f"pm_ca_{i}",
-                )
-                st.caption("Series: **label | val1, val2, …** (one per line)")
-                raw_ser = st.text_area(
-                    "Series", height=100, key=f"pm_se_{i}", label_visibility="collapsed",
-                    value="\n".join(
-                        f"{s.get('label','')} | {', '.join(str(v) for v in s.get('values',[]))}"
-                        for s in (chart.get("series") or [])
-                    ),
-                )
-                new_series = []
-                for line in raw_ser.split("\n"):
-                    p = [x.strip() for x in line.split("|")]
-                    if len(p) >= 2:
-                        try:   vals = [float(v.strip()) for v in p[1].split(",") if v.strip()]
-                        except ValueError: vals = []
-                        new_series.append({"label": p[0], "values": vals})
-                raw_colors = st.text_input(
-                    "Colors (comma-separated hex, e.g. 2563EB, E11D48)",
-                    ", ".join(chart.get("colors") or []), key=f"pm_col_{i}",
-                )
-                _colors = [c.strip().lstrip("#") for c in raw_colors.split(",") if c.strip()]
-                new_slide["chart"] = {
-                    "chart_type": ct, "x_label": xl, "y_label": yl,
-                    "categories": [c.strip() for c in cats.split(",") if c.strip()],
-                    "series":     new_series,
-                    "colors":     _colors,
-                }
-
-                # ── Inline chart preview ───────────────────────────────────
-                _preview_cats = [c.strip() for c in cats.split(",") if c.strip()]
-                if _preview_cats and new_series:
-                    try:
-                        _preview_spec = {
-                            "chart_type": ct, "x_label": xl, "y_label": yl,
-                            "categories": _preview_cats,
-                            "series":     new_series,
-                            "colors":     _colors,
-                        }
-                        _preview_png = _render_chart_png(_preview_spec, width_px=520, height_px=260)
-                        st.image(_preview_png, caption="Chart preview", use_container_width=False)
-                    except Exception as _ce:
-                        st.caption(f"Preview unavailable: {_ce}")
-
-            updated_slides[i] = new_slide
-
-    # ── Reorder / duplicate / delete / insert ────────────────────────────────
-    if move_up is not None and move_up > 0:
-        _history = st.session_state.get("plan_slide_history", [])
-        _history.append(list(updated_slides)); st.session_state["plan_slide_history"] = _history[-10:]
-        updated_slides[move_up-1], updated_slides[move_up] = updated_slides[move_up], updated_slides[move_up-1]
-        sd["slides"] = updated_slides; st.session_state["plan_slide_data"] = sd; st.rerun()
-
-    if move_down is not None and move_down < len(updated_slides)-1:
-        _history = st.session_state.get("plan_slide_history", [])
-        _history.append(list(updated_slides)); st.session_state["plan_slide_history"] = _history[-10:]
-        updated_slides[move_down], updated_slides[move_down+1] = updated_slides[move_down+1], updated_slides[move_down]
-        sd["slides"] = updated_slides; st.session_state["plan_slide_data"] = sd; st.rerun()
-
-    if duplicate_idx is not None:
-        _history = st.session_state.get("plan_slide_history", [])
-        _history.append(list(updated_slides)); st.session_state["plan_slide_history"] = _history[-10:]
-        import copy as _copy
-        updated_slides.insert(duplicate_idx + 1, _copy.deepcopy(updated_slides[duplicate_idx]))
-        sd["slides"] = updated_slides; st.session_state["plan_slide_data"] = sd; st.rerun()
-
-    if delete_idx is not None and len(updated_slides) > 1:
-        _history = st.session_state.get("plan_slide_history", [])
-        _history.append(list(updated_slides)); st.session_state["plan_slide_history"] = _history[-10:]
-        updated_slides.pop(delete_idx)
-        sd["slides"] = updated_slides; st.session_state["plan_slide_data"] = sd; st.rerun()
-
-    if insert_after is not None:
-        _history = st.session_state.get("plan_slide_history", [])
-        _history.append(list(updated_slides)); st.session_state["plan_slide_history"] = _history[-10:]
-        updated_slides.insert(insert_after + 1, {"type": "bullets", "title": "New Slide", "bullets": []})
-        sd["slides"] = updated_slides; st.session_state["plan_slide_data"] = sd; st.rerun()
-
-    # Persist live edits on every render
-    sd["slides"] = updated_slides
-    st.session_state["plan_slide_data"] = sd
+    
+                new_slide = {**slide, "type": new_type, "title": new_title,
+                             "subtitle": new_subtitle, "speaker_notes": new_notes}
+    
+                # ── Type-specific editors ──────────────────────────────────────
+                if new_type in ("bullets", "recommendation"):
+                    # Migrate content from other types when switching
+                    _existing = slide.get("bullets") or []
+                    if new_type != stype and not _existing:
+                        _existing = [new_title] if new_title else []
+                    raw = st.text_area(
+                        "Bullets (one per line, max 6)",
+                        value="\n".join(_existing),
+                        height=160, key=f"pm_bu_{i}",
+                    )
+                    _bullets = [b.strip() for b in raw.split("\n") if b.strip()][:6]
+                    if len(_bullets) == 6:
+                        st.caption("⚠️ Maximum 6 bullets — additional lines will be ignored.")
+                    new_slide["bullets"] = _bullets
+    
+                elif new_type == "stats":
+                    _existing_stats = slide.get("stats") or []
+                    # Pad to 4 rows for the editor
+                    while len(_existing_stats) < 4:
+                        _existing_stats.append({"value":"", "label":"", "note":""})
+                    st.caption("Exactly 4 stat cards required — format: **value | label | note**")
+                    raw = st.text_area(
+                        "Stats (4 rows)", height=120, key=f"pm_st_{i}",
+                        label_visibility="collapsed",
+                        value="\n".join(
+                            f"{s.get('value','')} | {s.get('label','')} | {s.get('note','')}"
+                            for s in _existing_stats[:4]
+                        ),
+                    )
+                    new_stats = []
+                    for line in raw.split("\n"):
+                        p = [x.strip() for x in line.split("|")]
+                        if any(p):
+                            new_stats.append({
+                                "value": p[0] if p else "",
+                                "label": p[1] if len(p) > 1 else "",
+                                "note":  p[2] if len(p) > 2 else "",
+                            })
+                    _n_stats = len(new_stats[:4])
+                    if _n_stats != 4:
+                        st.warning(f"Stats slide needs exactly 4 cards — currently {_n_stats}.")
+                    new_slide["stats"] = new_stats[:4]
+    
+                elif new_type == "comparison":
+                    # Support both root-level and nested comparison keys
+                    _cmp  = slide.get("comparison") or {}
+                    _rows = _cmp.get("rows") or slide.get("rows") or []
+                    _lt   = slide.get("left_title")  or _cmp.get("left_title",  "Internal")
+                    _rt   = slide.get("right_title") or _cmp.get("right_title", "Reference")
+                    cl, cr = st.columns(2)
+                    lt = cl.text_input("Left column title",  _lt, key=f"pm_lt_{i}")
+                    rt = cr.text_input("Right column title", _rt, key=f"pm_rt_{i}")
+                    st.caption("Rows: **label | left | right | delta** (delta: positive / negative / neutral)")
+                    raw = st.text_area(
+                        "Rows", height=160, key=f"pm_ro_{i}", label_visibility="collapsed",
+                        value="\n".join(
+                            f"{r.get('label','')} | {r.get('left','')} | {r.get('right','')} | {r.get('delta','neutral')}"
+                            for r in _rows
+                        ),
+                    )
+                    new_rows = []
+                    for line in raw.split("\n"):
+                        p = [x.strip() for x in line.split("|")]
+                        if len(p) >= 2 and any(p):
+                            new_rows.append({
+                                "label": p[0], "left":  p[1],
+                                "right": p[2] if len(p) > 2 else "",
+                                "delta": p[3] if len(p) > 3 else "neutral",
+                            })
+                    new_slide["left_title"]  = lt
+                    new_slide["right_title"] = rt
+                    new_slide["comparison"]  = {"left_title": lt, "right_title": rt, "rows": new_rows[:8]}
+    
+                elif new_type == "chart":
+                    chart   = slide.get("chart") or {}
+                    ct_opts = ["bar", "line", "scatter", "pie", "horizontal_bar"]
+                    _ct_idx = ct_opts.index(chart.get("chart_type","bar")) if chart.get("chart_type","bar") in ct_opts else 0
+                    ct = st.selectbox("Chart type", ct_opts, index=_ct_idx, key=f"pm_ct_{i}")
+                    ca, cb = st.columns(2)
+                    xl = ca.text_input("X-axis label", chart.get("x_label",""), key=f"pm_xl_{i}")
+                    yl = cb.text_input("Y-axis label", chart.get("y_label",""), key=f"pm_yl_{i}")
+                    cats = st.text_input(
+                        "Categories (comma-separated)",
+                        ", ".join(chart.get("categories") or []), key=f"pm_ca_{i}",
+                    )
+                    st.caption("Series: **label | val1, val2, …** (one per line)")
+                    raw_ser = st.text_area(
+                        "Series", height=100, key=f"pm_se_{i}", label_visibility="collapsed",
+                        value="\n".join(
+                            f"{s.get('label','')} | {', '.join(str(v) for v in s.get('values',[]))}"
+                            for s in (chart.get("series") or [])
+                        ),
+                    )
+                    new_series = []
+                    for line in raw_ser.split("\n"):
+                        p = [x.strip() for x in line.split("|")]
+                        if len(p) >= 2:
+                            try:   vals = [float(v.strip()) for v in p[1].split(",") if v.strip()]
+                            except ValueError: vals = []
+                            new_series.append({"label": p[0], "values": vals})
+                    raw_colors = st.text_input(
+                        "Colors (comma-separated hex, e.g. 2563EB, E11D48)",
+                        ", ".join(chart.get("colors") or []), key=f"pm_col_{i}",
+                    )
+                    _colors = [c.strip().lstrip("#") for c in raw_colors.split(",") if c.strip()]
+                    new_slide["chart"] = {
+                        "chart_type": ct, "x_label": xl, "y_label": yl,
+                        "categories": [c.strip() for c in cats.split(",") if c.strip()],
+                        "series":     new_series,
+                        "colors":     _colors,
+                    }
+    
+                    # ── Inline chart preview ───────────────────────────────────
+                    _preview_cats = [c.strip() for c in cats.split(",") if c.strip()]
+                    if _preview_cats and new_series:
+                        try:
+                            _preview_spec = {
+                                "chart_type": ct, "x_label": xl, "y_label": yl,
+                                "categories": _preview_cats,
+                                "series":     new_series,
+                                "colors":     _colors,
+                            }
+                            _preview_png = _render_chart_png(_preview_spec, width_px=520, height_px=260)
+                            st.image(_preview_png, caption="Chart preview", use_container_width=False)
+                        except Exception as _ce:
+                            st.caption(f"Preview unavailable: {_ce}")
+    
+                updated_slides[i] = new_slide
+    
+        # ── Reorder / duplicate / delete / insert ────────────────────────────────
+        if move_up is not None and move_up > 0:
+            _history = st.session_state.get("plan_slide_history", [])
+            _history.append(list(updated_slides)); st.session_state["plan_slide_history"] = _history[-10:]
+            updated_slides[move_up-1], updated_slides[move_up] = updated_slides[move_up], updated_slides[move_up-1]
+            sd["slides"] = updated_slides; st.session_state["plan_slide_data"] = sd; st.rerun()
+    
+        if move_down is not None and move_down < len(updated_slides)-1:
+            _history = st.session_state.get("plan_slide_history", [])
+            _history.append(list(updated_slides)); st.session_state["plan_slide_history"] = _history[-10:]
+            updated_slides[move_down], updated_slides[move_down+1] = updated_slides[move_down+1], updated_slides[move_down]
+            sd["slides"] = updated_slides; st.session_state["plan_slide_data"] = sd; st.rerun()
+    
+        if duplicate_idx is not None:
+            _history = st.session_state.get("plan_slide_history", [])
+            _history.append(list(updated_slides)); st.session_state["plan_slide_history"] = _history[-10:]
+            import copy as _copy
+            updated_slides.insert(duplicate_idx + 1, _copy.deepcopy(updated_slides[duplicate_idx]))
+            sd["slides"] = updated_slides; st.session_state["plan_slide_data"] = sd; st.rerun()
+    
+        if delete_idx is not None and len(updated_slides) > 1:
+            _history = st.session_state.get("plan_slide_history", [])
+            _history.append(list(updated_slides)); st.session_state["plan_slide_history"] = _history[-10:]
+            updated_slides.pop(delete_idx)
+            sd["slides"] = updated_slides; st.session_state["plan_slide_data"] = sd; st.rerun()
+    
+        if insert_after is not None:
+            _history = st.session_state.get("plan_slide_history", [])
+            _history.append(list(updated_slides)); st.session_state["plan_slide_history"] = _history[-10:]
+            updated_slides.insert(insert_after + 1, {"type": "bullets", "title": "New Slide", "bullets": []})
+            sd["slides"] = updated_slides; st.session_state["plan_slide_data"] = sd; st.rerun()
+    
+    # Persist live edits on every render (reorder mode persists its own state above)
+    if not _reorder_mode:
+        sd["slides"] = updated_slides
+        st.session_state["plan_slide_data"] = sd
 
     # ── Chat with Claude ──────────────────────────────────────────────────────
     st.markdown(
