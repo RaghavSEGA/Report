@@ -2057,8 +2057,8 @@ def _render_plan_modal(template_bytes_ref):
                             st.image(_preview_png, caption="Chart preview", use_container_width=False)
                         except Exception as _ce:
                             st.caption(f"Preview unavailable: {_ce}")
-    
-                updated_slides[i] = new_slide
+
+            updated_slides[i] = new_slide
     
         # ── Reorder / duplicate / delete / insert ────────────────────────────────
         if move_up is not None and move_up > 0:
