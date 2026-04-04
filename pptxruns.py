@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 import random
 import base64
 import pandas as pd
+from pdf_to_pptx import pdf_to_editable_pptx as _pdf_to_pptx
 from storage_pptx import (
     init_db as _init_pptx_db,
     get_projects, project_exists, create_project,
@@ -3557,336 +3558,475 @@ st.markdown(
 )
 
 # ─────────────────────────────────────────────────────────────
-# MAIN LAYOUT
+# TABS — Analysis tool vs PDF converter
 # ─────────────────────────────────────────────────────────────
-col_left, col_right = st.columns([1.1, 0.9], gap="large")
+_tab_analysis, _tab_pdf = st.tabs(["📊 Analysis & PPTX", "📄 PDF → Editable PPTX"])
 
-with col_left:
-    st.markdown('<div class="section-label">Documents</div>', unsafe_allow_html=True)
-    uploaded_files = st.file_uploader(
-        "Upload internal game documents",
-        type=["pdf", "xlsx", "xls", "csv", "txt", "docx"],
-        accept_multiple_files=True,
-        label_visibility="hidden",
+with _tab_pdf:
+    st.markdown(
+        "<div style='font-size:.85rem;color:#94a3b8;margin-bottom:1rem;'>"
+        "Upload any PDF of slides — even rasterised/image-only exports from NotebookLM, Canva, etc. "
+        "Claude reads each page with vision and reconstructs it as fully editable PowerPoint shapes, "
+        "text boxes, and tables you can click and modify in PowerPoint or Google Slides."
+        "</div>",
+        unsafe_allow_html=True,
     )
-    if uploaded_files:
-        st.caption(f"{len(uploaded_files)} file(s): " + ", ".join(f.name for f in uploaded_files))
-        st.session_state["project_doc_names"] = [f.name for f in uploaded_files]
 
-    st.markdown('<div class="section-label" style="margin-top:.75rem;">Data for charts (optional)</div>', unsafe_allow_html=True)
-    data_files = st.file_uploader(
-        "Upload data files for chart generation",
-        type=["xlsx", "xls", "csv"],
-        accept_multiple_files=True,
-        label_visibility="hidden",
-        key="data_upload",
-        help="Upload Excel or CSV files. Mention specific charts in the Business Question field.",
-    )
-    if data_files:
-        st.caption(f"📊 {len(data_files)} data file(s): " + ", ".join(f.name for f in data_files))
+    _pdf_col, _pdf_out_col = st.columns([1, 1], gap="large")
 
-    st.markdown('<div class="section-label">Analysis inputs</div>', unsafe_allow_html=True)
+    with _pdf_col:
+        st.markdown('<div class="section-label">Upload PDF</div>', unsafe_allow_html=True)
+        _pdf_file = st.file_uploader(
+            "Upload a PDF of slides",
+            type=["pdf"],
+            label_visibility="hidden",
+            key="pdf_converter_upload",
+        )
+        if _pdf_file:
+            import pypdf as _pypdf
+            _pdf_reader = _pypdf.PdfReader(io.BytesIO(_pdf_file.read()))
+            _pdf_n_pages = len(_pdf_reader.pages)
+            _pdf_file.seek(0)
+            st.caption(f"📄 {_pdf_n_pages} page{'s' if _pdf_n_pages != 1 else ''} detected")
 
-    game_title = st.text_input(
-        "Reference / competitor game titles (comma-separated for multiple)",
-        value=st.session_state.get("project_game_title", ""),
-        placeholder="e.g. Mario Odyssey, Astro Bot, Hollow Knight — separate multiple with commas",
-        key="game_title_input",
-    )
-    st.session_state["project_game_title"] = game_title
-    business_question = st.text_area(
-        "Business question",
-        value=st.session_state.get("project_question", ""),
-        placeholder=(
-            "e.g. Compare our internal game's combat mechanics and scope against Sonic Frontiers, "
-            "highlighting gaps and opportunities for the executive team…"
-        ),
-        height=130,
-        key="biz_question_input",
-    )
-    st.session_state["project_question"] = business_question
-    audience = st.text_input(
-        "Presentation audience",
-        value=st.session_state.get("project_audience", "Executive team"),
-        placeholder="e.g. Executive team, Product leads, Marketing…",
-        key="audience_input",
-    )
-    st.session_state["project_audience"] = audience
-
-    run_btn = st.button("⚡ Run analysis", use_container_width=True, type="primary")
-
-with col_right:
-    st.markdown('<div class="section-label">Output</div>', unsafe_allow_html=True)
-    output_area   = st.empty()
-    download_area = st.empty()
-
-    if st.session_state.get("plan_mode_active") and not run_btn:
-        with output_area.container():
-            _render_plan_modal(st.session_state.get("template_upload"))
-    elif not run_btn and "pptx_bytes" not in st.session_state:
-        output_area.markdown("""
-<div class="status-card">
-<div class="status-card-label">Ready</div>
-<div class="status-card-value" style="color:#475569;font-size:.82rem;line-height:1.8;">
-Fill in the inputs on the left and click <strong style="color:#e2e8f0;">Run analysis</strong>.<br><br>
-The pipeline will:<br>
-&nbsp;1. Extract your uploaded documents<br>
-&nbsp;2. Search the web for the reference game<br>
-&nbsp;3. Run a Claude-powered comparative analysis<br>
-&nbsp;4. Show you the outline to review and edit<br>
-&nbsp;5. Export to a SEGA-branded PPTX on demand
-</div>
-</div>
-""", unsafe_allow_html=True)
-
-    if "pptx_bytes" in st.session_state and not run_btn:
-        download_area.download_button(
-            label="⬇️ Download previous PPTX",
-            data=st.session_state["pptx_bytes"],
-            file_name=st.session_state.get("pptx_filename", "SEGA_Analysis.pptx"),
-            mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-            use_container_width=True,
+        _pdf_model = st.selectbox(
+            "Vision model",
+            ["claude-opus-4-5", "claude-sonnet-4-5"],
+            help="Opus gives the most accurate layout extraction. Sonnet is faster and cheaper.",
+            key="pdf_vision_model",
+        )
+        _pdf_dpi = st.select_slider(
+            "Rasterisation quality",
+            options=[96, 120, 150, 200],
+            value=150,
+            key="pdf_dpi",
+            help="Higher DPI = sharper image for Claude to read, but slower. 150 is a good default.",
         )
 
-# ─────────────────────────────────────────────────────────────
-# HELPERS
-# ─────────────────────────────────────────────────────────────
+        _pdf_run_btn = st.button(
+            "⚡ Convert to editable PPTX",
+            use_container_width=True,
+            type="primary",
+            key="pdf_convert_btn",
+            disabled=not bool(_pdf_file),
+        )
 
+    with _pdf_out_col:
+        st.markdown('<div class="section-label">Output</div>', unsafe_allow_html=True)
+        _pdf_output_area = st.empty()
 
+        if "pdf_pptx_bytes" in st.session_state and not _pdf_run_btn:
+            _pdf_output_area.download_button(
+                "⬇️ Download editable PPTX",
+                data=st.session_state["pdf_pptx_bytes"],
+                file_name=st.session_state.get("pdf_pptx_filename", "converted.pptx"),
+                mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                use_container_width=True,
+            )
 
-
-# ─────────────────────────────────────────────────────────────
-# PPTX GENERATION — pure python-pptx (no Node.js required)
-# ─────────────────────────────────────────────────────────────
-
-
-# Slide canvas: 13.3 × 7.5 inches (LAYOUT_WIDE)
-
-
-
-
-
-
-
-# ── Slide type renderers ──────────────────────────────────────
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# ─────────────────────────────────────────────────────────────
-# API HELPERS  (with rate-limit retry + back-off)
-# ─────────────────────────────────────────────────────────────
-
-_RL_WAIT_BASE = 20   # seconds to wait on first 429
-_RL_MAX_TRIES = 5    # max retries before giving up
-
-
-
-
-
-
-# ─────────────────────────────────────────────────────────────
-# PIPELINE  (parallel extraction + research, streaming analysis)
-# ─────────────────────────────────────────────────────────────
-
-# Characters of document context to send.
-# 60 000 chars ≈ 15 000 tokens — plenty for most PDFs while staying well under
-# Sonnet's 200k context window.  Rate-limit headroom is managed by model choice.
-_MAX_DOC_CHARS = 60_000
-
-
-
-
-# ─────────────────────────────────────────────────────────────
-# RUN BUTTON HANDLER
-# ─────────────────────────────────────────────────────────────
-
-
-
-if run_btn:
-    if not business_question.strip():
-        st.error("Please enter a business question.")
-    else:
-        # Collect data files
-        data_files = st.session_state.get("data_upload") or []
-        if hasattr(data_files, "read"):  # single file — wrap
-            data_files = [data_files]
-
-        # Use uploaded template override, or fall back to the embedded SEGA blue default
-        _template_bytes = None
-        _template_file = st.session_state.get("template_upload")
-        if _template_file is not None:
-            try:
-                _template_file.seek(0)
-                _template_bytes = _template_file.read()
-                # Persist for project Save
-                st.session_state["saved_template_bytes"] = _template_bytes
-            except Exception as _e:
-                st.warning(f"Could not read template file: {_e}. Using default SEGA blue template.")
-                _template_bytes = _SEGA_BLUE_TEMPLATE_BYTES
+    if _pdf_run_btn and _pdf_file:
+        _api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
+        if not _api_key:
+            st.error("ANTHROPIC_API_KEY not found in st.secrets.")
         else:
-            # Always use the embedded SEGA blue template as the default
-            _template_bytes = _SEGA_BLUE_TEMPLATE_BYTES
+            _pdf_file.seek(0)
+            _pdf_bytes_raw = _pdf_file.read()
+            _pdf_n = len(_pypdf.PdfReader(io.BytesIO(_pdf_bytes_raw)).pages)
 
-        pipeline_steps = {
-            "upload": bool(uploaded_files), "extract": False,
-            "research": False, "analyze": False, "generate": False,
-        }
-        st.session_state["pipeline_steps"] = pipeline_steps
-        log_lines = []
+            _prog_bar  = _pdf_output_area.progress(0, text="Starting…")
+            _log_area  = st.empty()
+            _log_lines = []
 
-        with output_area.container():
-            st.markdown('<div class="section-label">Pipeline log</div>', unsafe_allow_html=True)
-            log_area = st.empty()
+            def _pdf_log(msg):
+                _log_lines.append(msg)
+                _log_area.markdown(
+                    "<div style='background:#0f172a;border-radius:6px;padding:.75rem 1rem;"
+                    "font-size:.8rem;color:#94a3b8;font-family:monospace;max-height:260px;"
+                    "overflow-y:auto;'>"
+                    + "".join(f"<div>{l}</div>" for l in _log_lines[-20:])
+                    + "</div>",
+                    unsafe_allow_html=True,
+                )
+
+            def _pdf_progress(frac):
+                page_num = max(1, round(frac * _pdf_n))
+                _prog_bar.progress(
+                    min(frac, 0.99),
+                    text=f"Processing page {page_num} of {_pdf_n}…",
+                )
+
+            _pdf_log(f"📄 <b>PDF loaded</b> — {_pdf_n} page(s)")
+            _pdf_log(f"🔍 <b>Sending to {_pdf_model}</b> for vision extraction…")
 
             try:
-                for event in run_pipeline(
-                    model, uploaded_files, game_title, business_question,
-                    audience, theme_preset, web_search_enabled, slide_count,
-                    template_bytes=_template_bytes,
-                    data_files=data_files,
-                    plan_mode=plan_mode,
-                ):
-                    etype = event[0]
+                _pptx_out, _errs = _pdf_to_pptx(
+                    _pdf_bytes_raw,
+                    api_key=_api_key,
+                    model=_pdf_model,
+                    dpi=_pdf_dpi,
+                    progress_cb=_pdf_progress,
+                )
+                _fname = (_pdf_file.name.rsplit(".", 1)[0] if "." in _pdf_file.name
+                          else _pdf_file.name) + "_editable.pptx"
+                st.session_state["pdf_pptx_bytes"]    = _pptx_out
+                st.session_state["pdf_pptx_filename"] = _fname
 
-                    if etype in ("log", "spinner"):
-                        # "spinner" = active working entry (animated ring at bottom)
-                        # "log"     = completed entry (static, left-border style)
-                        # When a new event arrives, any previous spinner is promoted
-                        # to a plain log entry so only the latest one animates.
-                        if etype == "spinner":
-                            # Promote the last spinner (if any) to a plain log entry
-                            if log_lines and log_lines[-1][0] == "spinner":
-                                log_lines[-1] = ("log", log_lines[-1][1])
-                            log_lines.append(("spinner", event[1]))
-                        else:
-                            # Promote any trailing spinner before adding the completed msg
-                            if log_lines and log_lines[-1][0] == "spinner":
-                                log_lines[-1] = ("log", log_lines[-1][1])
-                            log_lines.append(("log", event[1]))
+                if _errs:
+                    for _e in _errs:
+                        _pdf_log(f"⚠️ {_e}")
 
-                        # Build self-contained HTML with inline CSS.
-                        # Streamlit does NOT share CSS between separate markdown() calls,
-                        # so all styles must be embedded in every render.
-                        _CSS = (
-                            "<style>"
-                            "@keyframes _sp{to{transform:rotate(360deg)}}"
-                            "._lw{background:#0f172a;border:1px solid #1e293b;border-radius:8px;"
-                            "padding:1rem 1.25rem;font-size:.82rem;"
-                            "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;"
-                            "color:#94a3b8;max-height:480px;overflow-y:auto;line-height:1.7}"
-                            "._lw b{color:#e2e8f0;font-weight:600}"
-                            "._lw i{color:#60a5fa}"
-                            "._ld{color:#64748b;font-size:.76rem;line-height:1.55;display:block;"
-                            "margin-top:.15rem;margin-bottom:.35rem}"
-                            "._le{border-left:2px solid #1e3a5f;padding-left:.6rem;margin-bottom:.5rem}"
-                            "._la{border-left:2px solid #00AADD;padding-left:.6rem;"
-                            "margin-bottom:.5rem;display:flex;align-items:flex-start;gap:.55rem}"
-                            "._lr{flex-shrink:0;width:14px;height:14px;margin-top:3px;"
-                            "border:2px solid rgba(0,170,221,.25);border-top-color:#00AADD;"
-                            "border-radius:50%;animation:_sp .8s linear infinite}"
-                            "._lt{flex:1}"
-                            "</style>"
-                        )
-                        html_parts = [_CSS, '<div class="_lw">']
-                        for _kind, _text in log_lines[-14:]:
-                            _t = _text.replace("class='log-detail'", "class='_ld'")
-                            if _kind == "spinner":
-                                html_parts.append(
-                                    f'<div class="_la"><div class="_lr"></div>'
-                                    f'<div class="_lt">{_t}</div></div>'
-                                )
-                            else:
-                                html_parts.append(f'<div class="_le">{_t}</div>')
-                        html_parts.append("</div>")
-                        log_area.markdown("".join(html_parts), unsafe_allow_html=True)
-                    elif etype == "step_done":
-                        pipeline_steps[event[1]] = True
-                        st.session_state["pipeline_steps"] = pipeline_steps
+                _prog_bar.progress(1.0, text="Done!")
+                _pdf_log(f"🎉 <b>Conversion complete</b> — {len(_pptx_out)//1024} KB PPTX")
 
-                    elif etype == "slide_data":
-                        st.session_state["slide_data"] = event[1]
-
-                    elif etype == "plan_ready":
-                        st.session_state["plan_slide_data"] = event[1]
-                        st.session_state["plan_mode_active"] = True
-                        # Auto-save slide plan to project
-                        _ap = st.session_state.get("active_project")
-                        if _ap:
-                            save_project(
-                                OWNER, _ap,
-                                business_question=st.session_state.get("project_question", ""),
-                                game_title=st.session_state.get("project_game_title", ""),
-                                audience=st.session_state.get("project_audience", "Executive team"),
-                                doc_names=st.session_state.get("project_doc_names", []),
-                                slide_json=event[1],
-                                plan_chat=st.session_state.get("plan_chat", []),
-                            )
-
-                    elif etype == "pptx_bytes_out":
-                        _gt_disp = ", ".join(
-                            g.strip() for g in (game_title or "").split(",") if g.strip()
-                        ) or "Report"
-                        fname = f"SEGA_Analysis_{_gt_disp.replace(' ','_').replace(',','_')[:50]}.pptx"
-                        st.session_state["pptx_bytes"]    = event[1]
-                        st.session_state["pptx_filename"] = fname
-
-                    elif etype == "error":
-                        st.error(event[1])
-                        break
-
-            except Exception as ex:
-                st.error(f"Unexpected error: {ex}")
-                import traceback
-                st.code(traceback.format_exc())
-
-        if st.session_state.get("plan_mode_active"):
-            with output_area.container():
-                _render_plan_modal(st.session_state.get("template_upload"))
-
-        if "pptx_bytes" in st.session_state:
-            with download_area.container():
-                st.success("Analysis complete.")
-                st.download_button(
-                    label="⬇️ Download PPTX",
-                    data=st.session_state["pptx_bytes"],
-                    file_name=st.session_state["pptx_filename"],
+                _pdf_output_area.download_button(
+                    "⬇️ Download editable PPTX",
+                    data=_pptx_out,
+                    file_name=_fname,
                     mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
                     use_container_width=True,
                 )
-                if "slide_data" in st.session_state:
-                    with st.expander("Slide outline", expanded=False):
-                        for i, sl in enumerate(st.session_state["slide_data"].get("slides", []), 1):
-                            st.markdown(f"**{i}.** `{sl.get('type','?').upper()}` — {sl.get('title','')}")
+                st.rerun()
 
+            except Exception as _pdf_ex:
+                st.error(f"Conversion failed: {_pdf_ex}")
+                import traceback
+                st.code(traceback.format_exc())
 
-
+with _tab_analysis:
+    pass  # rest of the app flows into this tab below
 
 # ─────────────────────────────────────────────────────────────
-# PLAN MODE — OUTLINE EDITOR (modal dialog)
+# MAIN LAYOUT  (inside the Analysis tab)
 # ─────────────────────────────────────────────────────────────
+with _tab_analysis:
+    col_left, col_right = st.columns([1.1, 0.9], gap="large")
+
+    with col_left:
+        st.markdown('<div class="section-label">Documents</div>', unsafe_allow_html=True)
+        uploaded_files = st.file_uploader(
+            "Upload internal game documents",
+            type=["pdf", "xlsx", "xls", "csv", "txt", "docx"],
+            accept_multiple_files=True,
+            label_visibility="hidden",
+        )
+        if uploaded_files:
+            st.caption(f"{len(uploaded_files)} file(s): " + ", ".join(f.name for f in uploaded_files))
+            st.session_state["project_doc_names"] = [f.name for f in uploaded_files]
+
+        st.markdown('<div class="section-label" style="margin-top:.75rem;">Data for charts (optional)</div>', unsafe_allow_html=True)
+        data_files = st.file_uploader(
+            "Upload data files for chart generation",
+            type=["xlsx", "xls", "csv"],
+            accept_multiple_files=True,
+            label_visibility="hidden",
+            key="data_upload",
+            help="Upload Excel or CSV files. Mention specific charts in the Business Question field.",
+        )
+        if data_files:
+            st.caption(f"📊 {len(data_files)} data file(s): " + ", ".join(f.name for f in data_files))
+
+        st.markdown('<div class="section-label">Analysis inputs</div>', unsafe_allow_html=True)
+
+        game_title = st.text_input(
+            "Reference / competitor game titles (comma-separated for multiple)",
+            value=st.session_state.get("project_game_title", ""),
+            placeholder="e.g. Mario Odyssey, Astro Bot, Hollow Knight — separate multiple with commas",
+            key="game_title_input",
+        )
+        st.session_state["project_game_title"] = game_title
+        business_question = st.text_area(
+            "Business question",
+            value=st.session_state.get("project_question", ""),
+            placeholder=(
+                "e.g. Compare our internal game's combat mechanics and scope against Sonic Frontiers, "
+                "highlighting gaps and opportunities for the executive team…"
+            ),
+            height=130,
+            key="biz_question_input",
+        )
+        st.session_state["project_question"] = business_question
+        audience = st.text_input(
+            "Presentation audience",
+            value=st.session_state.get("project_audience", "Executive team"),
+            placeholder="e.g. Executive team, Product leads, Marketing…",
+            key="audience_input",
+        )
+        st.session_state["project_audience"] = audience
+
+        run_btn = st.button("⚡ Run analysis", use_container_width=True, type="primary")
+
+    with col_right:
+        st.markdown('<div class="section-label">Output</div>', unsafe_allow_html=True)
+        output_area   = st.empty()
+        download_area = st.empty()
+
+        if st.session_state.get("plan_mode_active") and not run_btn:
+            with output_area.container():
+                _render_plan_modal(st.session_state.get("template_upload"))
+        elif not run_btn and "pptx_bytes" not in st.session_state:
+            output_area.markdown("""
+    <div class="status-card">
+    <div class="status-card-label">Ready</div>
+    <div class="status-card-value" style="color:#475569;font-size:.82rem;line-height:1.8;">
+    Fill in the inputs on the left and click <strong style="color:#e2e8f0;">Run analysis</strong>.<br><br>
+    The pipeline will:<br>
+    &nbsp;1. Extract your uploaded documents<br>
+    &nbsp;2. Search the web for the reference game<br>
+    &nbsp;3. Run a Claude-powered comparative analysis<br>
+    &nbsp;4. Show you the outline to review and edit<br>
+    &nbsp;5. Export to a SEGA-branded PPTX on demand
+    </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+        if "pptx_bytes" in st.session_state and not run_btn:
+            download_area.download_button(
+                label="⬇️ Download previous PPTX",
+                data=st.session_state["pptx_bytes"],
+                file_name=st.session_state.get("pptx_filename", "SEGA_Analysis.pptx"),
+                mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                use_container_width=True,
+            )
+
+    # ─────────────────────────────────────────────────────────────
+    # HELPERS
+    # ─────────────────────────────────────────────────────────────
+
+
+
+
+    # ─────────────────────────────────────────────────────────────
+    # PPTX GENERATION — pure python-pptx (no Node.js required)
+    # ─────────────────────────────────────────────────────────────
+
+
+    # Slide canvas: 13.3 × 7.5 inches (LAYOUT_WIDE)
+
+
+
+
+
+
+
+    # ── Slide type renderers ──────────────────────────────────────
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    # ─────────────────────────────────────────────────────────────
+    # API HELPERS  (with rate-limit retry + back-off)
+    # ─────────────────────────────────────────────────────────────
+
+    _RL_WAIT_BASE = 20   # seconds to wait on first 429
+    _RL_MAX_TRIES = 5    # max retries before giving up
+
+
+
+
+
+
+    # ─────────────────────────────────────────────────────────────
+    # PIPELINE  (parallel extraction + research, streaming analysis)
+    # ─────────────────────────────────────────────────────────────
+
+    # Characters of document context to send.
+    # 60 000 chars ≈ 15 000 tokens — plenty for most PDFs while staying well under
+    # Sonnet's 200k context window.  Rate-limit headroom is managed by model choice.
+    _MAX_DOC_CHARS = 60_000
+
+
+
+
+    # ─────────────────────────────────────────────────────────────
+    # RUN BUTTON HANDLER
+    # ─────────────────────────────────────────────────────────────
+
+
+
+    if run_btn:
+        if not business_question.strip():
+            st.error("Please enter a business question.")
+        else:
+            # Collect data files
+            data_files = st.session_state.get("data_upload") or []
+            if hasattr(data_files, "read"):  # single file — wrap
+                data_files = [data_files]
+
+            # Use uploaded template override, or fall back to the embedded SEGA blue default
+            _template_bytes = None
+            _template_file = st.session_state.get("template_upload")
+            if _template_file is not None:
+                try:
+                    _template_file.seek(0)
+                    _template_bytes = _template_file.read()
+                    # Persist for project Save
+                    st.session_state["saved_template_bytes"] = _template_bytes
+                except Exception as _e:
+                    st.warning(f"Could not read template file: {_e}. Using default SEGA blue template.")
+                    _template_bytes = _SEGA_BLUE_TEMPLATE_BYTES
+            else:
+                # Always use the embedded SEGA blue template as the default
+                _template_bytes = _SEGA_BLUE_TEMPLATE_BYTES
+
+            pipeline_steps = {
+                "upload": bool(uploaded_files), "extract": False,
+                "research": False, "analyze": False, "generate": False,
+            }
+            st.session_state["pipeline_steps"] = pipeline_steps
+            log_lines = []
+
+            with output_area.container():
+                st.markdown('<div class="section-label">Pipeline log</div>', unsafe_allow_html=True)
+                log_area = st.empty()
+
+                try:
+                    for event in run_pipeline(
+                        model, uploaded_files, game_title, business_question,
+                        audience, theme_preset, web_search_enabled, slide_count,
+                        template_bytes=_template_bytes,
+                        data_files=data_files,
+                        plan_mode=plan_mode,
+                    ):
+                        etype = event[0]
+
+                        if etype in ("log", "spinner"):
+                            # "spinner" = active working entry (animated ring at bottom)
+                            # "log"     = completed entry (static, left-border style)
+                            # When a new event arrives, any previous spinner is promoted
+                            # to a plain log entry so only the latest one animates.
+                            if etype == "spinner":
+                                # Promote the last spinner (if any) to a plain log entry
+                                if log_lines and log_lines[-1][0] == "spinner":
+                                    log_lines[-1] = ("log", log_lines[-1][1])
+                                log_lines.append(("spinner", event[1]))
+                            else:
+                                # Promote any trailing spinner before adding the completed msg
+                                if log_lines and log_lines[-1][0] == "spinner":
+                                    log_lines[-1] = ("log", log_lines[-1][1])
+                                log_lines.append(("log", event[1]))
+
+                            # Build self-contained HTML with inline CSS.
+                            # Streamlit does NOT share CSS between separate markdown() calls,
+                            # so all styles must be embedded in every render.
+                            _CSS = (
+                                "<style>"
+                                "@keyframes _sp{to{transform:rotate(360deg)}}"
+                                "._lw{background:#0f172a;border:1px solid #1e293b;border-radius:8px;"
+                                "padding:1rem 1.25rem;font-size:.82rem;"
+                                "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;"
+                                "color:#94a3b8;max-height:480px;overflow-y:auto;line-height:1.7}"
+                                "._lw b{color:#e2e8f0;font-weight:600}"
+                                "._lw i{color:#60a5fa}"
+                                "._ld{color:#64748b;font-size:.76rem;line-height:1.55;display:block;"
+                                "margin-top:.15rem;margin-bottom:.35rem}"
+                                "._le{border-left:2px solid #1e3a5f;padding-left:.6rem;margin-bottom:.5rem}"
+                                "._la{border-left:2px solid #00AADD;padding-left:.6rem;"
+                                "margin-bottom:.5rem;display:flex;align-items:flex-start;gap:.55rem}"
+                                "._lr{flex-shrink:0;width:14px;height:14px;margin-top:3px;"
+                                "border:2px solid rgba(0,170,221,.25);border-top-color:#00AADD;"
+                                "border-radius:50%;animation:_sp .8s linear infinite}"
+                                "._lt{flex:1}"
+                                "</style>"
+                            )
+                            html_parts = [_CSS, '<div class="_lw">']
+                            for _kind, _text in log_lines[-14:]:
+                                _t = _text.replace("class='log-detail'", "class='_ld'")
+                                if _kind == "spinner":
+                                    html_parts.append(
+                                        f'<div class="_la"><div class="_lr"></div>'
+                                        f'<div class="_lt">{_t}</div></div>'
+                                    )
+                                else:
+                                    html_parts.append(f'<div class="_le">{_t}</div>')
+                            html_parts.append("</div>")
+                            log_area.markdown("".join(html_parts), unsafe_allow_html=True)
+                        elif etype == "step_done":
+                            pipeline_steps[event[1]] = True
+                            st.session_state["pipeline_steps"] = pipeline_steps
+
+                        elif etype == "slide_data":
+                            st.session_state["slide_data"] = event[1]
+
+                        elif etype == "plan_ready":
+                            st.session_state["plan_slide_data"] = event[1]
+                            st.session_state["plan_mode_active"] = True
+                            # Auto-save slide plan to project
+                            _ap = st.session_state.get("active_project")
+                            if _ap:
+                                save_project(
+                                    OWNER, _ap,
+                                    business_question=st.session_state.get("project_question", ""),
+                                    game_title=st.session_state.get("project_game_title", ""),
+                                    audience=st.session_state.get("project_audience", "Executive team"),
+                                    doc_names=st.session_state.get("project_doc_names", []),
+                                    slide_json=event[1],
+                                    plan_chat=st.session_state.get("plan_chat", []),
+                                )
+
+                        elif etype == "pptx_bytes_out":
+                            _gt_disp = ", ".join(
+                                g.strip() for g in (game_title or "").split(",") if g.strip()
+                            ) or "Report"
+                            fname = f"SEGA_Analysis_{_gt_disp.replace(' ','_').replace(',','_')[:50]}.pptx"
+                            st.session_state["pptx_bytes"]    = event[1]
+                            st.session_state["pptx_filename"] = fname
+
+                        elif etype == "error":
+                            st.error(event[1])
+                            break
+
+                except Exception as ex:
+                    st.error(f"Unexpected error: {ex}")
+                    import traceback
+                    st.code(traceback.format_exc())
+
+            if st.session_state.get("plan_mode_active"):
+                with output_area.container():
+                    _render_plan_modal(st.session_state.get("template_upload"))
+
+            if "pptx_bytes" in st.session_state:
+                with download_area.container():
+                    st.success("Analysis complete.")
+                    st.download_button(
+                        label="⬇️ Download PPTX",
+                        data=st.session_state["pptx_bytes"],
+                        file_name=st.session_state["pptx_filename"],
+                        mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                        use_container_width=True,
+                    )
+                    if "slide_data" in st.session_state:
+                        with st.expander("Slide outline", expanded=False):
+                            for i, sl in enumerate(st.session_state["slide_data"].get("slides", []), 1):
+                                st.markdown(f"**{i}.** `{sl.get('type','?').upper()}` — {sl.get('title','')}")
+
+
+
+
+    # ─────────────────────────────────────────────────────────────
+    # PLAN MODE — OUTLINE EDITOR (modal dialog)
+    # ─────────────────────────────────────────────────────────────
