@@ -50,27 +50,53 @@ _ALIGN_MAP = {
     "justify": PP_ALIGN.JUSTIFY,
 }
 
-EXTRACTION_PROMPT = """Analyze this presentation slide image carefully and extract ALL content into a structured JSON object.
+def _build_extraction_prompt(image_regions: list) -> str:
+    """
+    Build the Claude extraction prompt. If image_regions is provided,
+    tell Claude which areas are already covered by extracted images
+    so it skips recreating them as shapes.
+    """
+    if image_regions:
+        img_note = (
+            "\n\nIMPORTANT — IMAGES ALREADY EXTRACTED:\n"
+            "The following regions contain embedded images that have already been "
+            "extracted and will be placed on the slide automatically. Do NOT try to "
+            "recreate these areas as shapes or text — exclude them from elements:\n"
+        )
+        for r in image_regions:
+            img_note += (
+                f"  - Image at x={r['x_in']:.2f}, y={r['y_in']:.2f}, "
+                f"w={r['w_in']:.2f}, h={r['h_in']:.2f} inches\n"
+            )
+        img_note += (
+            "Only extract text, shapes, and tables that appear ON TOP OF or "
+            "OUTSIDE these image regions (titles, overlaid text, footer bars, "
+            "insight boxes, captions, page numbers).\n"
+        )
+    else:
+        img_note = ""
 
-Return ONLY valid JSON — no markdown fences, no explanation, no preamble.
-
-The slide canvas is 13.33 inches wide × 7.5 inches tall. Express all positions and sizes in inches from the top-left corner.
+    return (
+        "Analyze this presentation slide image carefully and extract ALL content "
+        "into a structured JSON object.\n\n"
+        "Return ONLY valid JSON — no markdown fences, no explanation, no preamble.\n\n"
+        "The slide canvas is 13.33 inches wide × 7.5 inches tall. "
+        "Express all positions and sizes in inches from the top-left corner."
+        + img_note +
+        """
 
 Use this exact schema:
 
 {
   "background_color": "hex6 (e.g. FFFFFF)",
   "elements": [
-    // BACKGROUND / DECORATIVE SHAPES — colored rectangles, bars, accent panels
     {
       "type": "shape",
-      "x": 0.0, "y": 0.0, "w": 13.33, "h": 7.5,
+      "x": 0.0, "y": 0.0, "w": 13.33, "h": 0.5,
       "fill": "hex6 or null",
       "border_color": "hex6 or null",
       "border_pt": 1.0
     },
-
-    // TEXT BOXES — titles, body text, labels, bullets, footnotes
     {
       "type": "text",
       "x": 0.0, "y": 0.0, "w": 6.0, "h": 0.6,
@@ -83,8 +109,6 @@ Use this exact schema:
       "align": "left",
       "font": "Calibri"
     },
-
-    // TABLES — any grid of data
     {
       "type": "table",
       "x": 0.0, "y": 1.5, "w": 12.0, "h": 4.0,
@@ -92,21 +116,14 @@ Use this exact schema:
       "row_heights_in": [0.7, 1.0, 1.0, 1.0],
       "header_row": {
         "cells": ["Column 1", "Column 2", "Column 3"],
-        "bg": "hex6",
-        "fg": "hex6",
-        "bold": true,
-        "font_size": 12.0
+        "bg": "hex6", "fg": "hex6", "bold": true, "font_size": 12.0,
+        "cell_overrides": {"2": {"bg": "1565C0", "fg": "FFFFFF", "bold": true}}
       },
       "data_rows": [
         {
           "cells": ["Row 1 Col 1", "Row 1 Col 2", "Row 1 Col 3"],
-          "bg": "hex6",
-          "fg": "hex6",
-          "bold": false,
-          "font_size": 12.0,
-          "cell_overrides": {
-            "2": {"bg": "1565C0", "fg": "FFFFFF", "bold": true}
-          }
+          "bg": "hex6", "fg": "hex6", "bold": false, "font_size": 12.0,
+          "cell_overrides": {"2": {"bg": "1565C0", "fg": "FFFFFF", "bold": true}}
         }
       ]
     }
@@ -114,15 +131,15 @@ Use this exact schema:
 }
 
 Rules:
-- Include EVERY visible element: backgrounds, colored bars, decorative shapes, all text, tables, footers, page numbers, logos (as text placeholders)
-- Extract exact text — preserve capitalization, hyphens, line breaks (use \\n)
-- For tables: capture EVERY cell. Use cell_overrides for cells with different colors than the row default (e.g. a blue "Age Today" column)
-- For col_widths_in: values must sum to approximately the table width w
-- For shapes: include the footer bar, accent panels, colored backgrounds
-- Estimate positions carefully — a title starting near top-left might be x=0.35, y=0.1
+- Include EVERY visible element outside image regions: colored bars, shapes, text, tables, footers, page numbers
+- Extract exact text — preserve capitalisation, hyphens, line breaks (use \\n)
+- For tables: capture EVERY cell; use cell_overrides for cells with different colors
+- col_widths_in values must sum to approximately the table width w
 - Colors: 6-digit hex without # symbol
-- Order elements back-to-front (backgrounds first, text on top)
+- Order elements back-to-front (backgrounds first, text/tables on top)
 """
+    )
+
 
 
 def _rgb(hex6: str) -> RGBColor:
@@ -130,10 +147,72 @@ def _rgb(hex6: str) -> RGBColor:
     return RGBColor(int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
 
 
-def _extract_slide_json(image_b64: str, api_key: str, model: str) -> dict:
+def _extract_page_images(fitz_doc, page_index: int, page_w_pt: float, page_h_pt: float) -> list:
+    """
+    Extract all embedded images from a PDF page with their positions in inches.
+    Returns a list of dicts: {bytes, ext, x_in, y_in, w_in, h_in, is_background}
+    """
+    page = fitz_doc[page_index]
+    results = []
+    for img_meta in page.get_images(full=True):
+        xref = img_meta[0]
+        try:
+            base_image = fitz_doc.extract_image(xref)
+            rects = page.get_image_rects(xref)
+            for r in rects:
+                x_in = r.x0 / page_w_pt * SLIDE_W_IN
+                y_in = r.y0 / page_h_pt * SLIDE_H_IN
+                w_in = (r.x1 - r.x0) / page_w_pt * SLIDE_W_IN
+                h_in = (r.y1 - r.y0) / page_h_pt * SLIDE_H_IN
+                # A "background" image is one that covers most of the slide
+                is_bg = w_in > SLIDE_W_IN * 0.8 and h_in > SLIDE_H_IN * 0.6
+                results.append({
+                    "bytes": base_image["image"],
+                    "ext":   base_image["ext"],
+                    "x_in": max(0.0, x_in),
+                    "y_in": max(0.0, y_in),
+                    "w_in": w_in,
+                    "h_in": h_in,
+                    "is_background": is_bg,
+                })
+        except Exception:
+            pass
+    return results
+
+
+def _add_image_to_slide(slide, img_info: dict) -> None:
+    """Place an extracted PDF image onto a pptx slide at the correct position."""
+    import io as _io
+    from PIL import Image as _PIL
+    from pptx.util import Inches as _In
+
+    raw = img_info["bytes"]
+    # Normalise to PNG so python-pptx can always handle it
+    try:
+        pil_img = _PIL.open(_io.BytesIO(raw))
+        buf = _io.BytesIO()
+        pil_img.save(buf, format="PNG")
+        buf.seek(0)
+    except Exception:
+        buf = _io.BytesIO(raw)
+        buf.seek(0)
+
+    slide.shapes.add_picture(
+        buf,
+        _In(img_info["x_in"]),
+        _In(img_info["y_in"]),
+        _In(img_info["w_in"]),
+        _In(img_info["h_in"]),
+    )
+
+
+def _extract_slide_json(image_b64: str, api_key: str, model: str,
+                        image_regions: list | None = None) -> dict:
     """Call Claude vision API and return parsed JSON for one slide."""
     import anthropic
     client = anthropic.Anthropic(api_key=api_key)
+
+    prompt = _build_extraction_prompt(image_regions or [])
 
     msg = client.messages.create(
         model=model,
@@ -149,7 +228,7 @@ def _extract_slide_json(image_b64: str, api_key: str, model: str) -> dict:
                         "data": image_b64,
                     },
                 },
-                {"type": "text", "text": EXTRACTION_PROMPT},
+                {"type": "text", "text": prompt},
             ],
         }],
     )
@@ -379,15 +458,23 @@ def pdf_to_editable_pptx(
 
     for i, img in enumerate(images):
         if progress_cb:
-            progress_cb((i) / n)
+            progress_cb(i / n)
 
         b64 = _page_to_b64(img)
 
+        # ── Extract embedded images from this PDF page ────────────────────────
+        page     = doc[i]
+        page_w   = page.rect.width
+        page_h   = page.rect.height
+        page_imgs = _extract_page_images(doc, i, page_w, page_h)
+
+        # Tell Claude which regions are already covered by images
+        image_regions = [pi for pi in page_imgs]  # pass all so Claude skips them
+
         try:
-            spec = _extract_slide_json(b64, api_key, model)
+            spec = _extract_slide_json(b64, api_key, model, image_regions=image_regions)
         except Exception as e:
             errors.append(f"Page {i+1}: vision extraction failed — {e}")
-            # Add a blank slide with an error note
             slide = prs.slides.add_slide(blank_layout)
             txb = slide.shapes.add_textbox(Inches(0.5), Inches(0.5), Inches(12), Inches(1))
             txb.text_frame.paragraphs[0].add_run().text = f"[Page {i+1} could not be extracted: {e}]"
@@ -395,14 +482,23 @@ def pdf_to_editable_pptx(
 
         slide = prs.slides.add_slide(blank_layout)
 
-        # Set background
+        # ── Background fill ───────────────────────────────────────────────────
         bg = spec.get("background_color", "FFFFFF")
         bg_shape = slide.shapes.add_shape(1, 0, 0, prs.slide_width, prs.slide_height)
         bg_shape.fill.solid()
         bg_shape.fill.fore_color.rgb = _rgb(bg)
         bg_shape.line.fill.background()
 
-        # Render elements in order (back to front)
+        # ── Place extracted images (back-to-front: backgrounds first) ─────────
+        # Background images go first so overlaid text/shapes appear on top
+        for pi in sorted(page_imgs, key=lambda x: (not x["is_background"],
+                                                     x["w_in"] * x["h_in"]), reverse=True):
+            try:
+                _add_image_to_slide(slide, pi)
+            except Exception as e:
+                errors.append(f"Page {i+1} image placement: {e}")
+
+        # ── Render Claude-extracted text/shape/table overlays ─────────────────
         for el in spec.get("elements", []):
             try:
                 _render_element(slide, el)
