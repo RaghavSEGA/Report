@@ -407,8 +407,19 @@ QUARTER_MAP    = {
 
 @st.cache_data(show_spinner=False)
 def load_data(file_bytes: bytes, fname: str) -> pd.DataFrame:
-    df = pd.read_csv(io.BytesIO(file_bytes)) if fname.endswith(".csv") \
-         else pd.read_excel(io.BytesIO(file_bytes))
+    if fname.endswith(".csv"):
+        # Try common encodings in order — Excel exports are often latin-1 / cp1252
+        for enc in ("utf-8", "utf-8-sig", "latin-1", "cp1252"):
+            try:
+                df = pd.read_csv(io.BytesIO(file_bytes), encoding=enc)
+                break
+            except (UnicodeDecodeError, Exception):
+                continue
+        else:
+            # Last-resort: replace undecodable bytes
+            df = pd.read_csv(io.BytesIO(file_bytes), encoding="utf-8", errors="replace")
+    else:
+        df = pd.read_excel(io.BytesIO(file_bytes))
     df.columns = df.columns.str.strip()
     if "Result" in df.columns:
         df["Result"] = (df["Result"].astype(str).str.strip().str.upper()
