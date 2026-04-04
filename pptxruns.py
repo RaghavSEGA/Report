@@ -10,6 +10,12 @@ import hmac
 import random
 import base64
 import pandas as pd
+from storage_pptx import (
+    init_db as _init_pptx_db,
+    get_projects, project_exists, create_project,
+    rename_project, delete_project, load_project, save_project,
+)
+_init_pptx_db()
 import pypdf
 from pptx import Presentation
 from pptx.util import Inches, Pt, Emu
@@ -2230,6 +2236,17 @@ Rules:
                     fname    = f"SEGA_Plan_{_title.replace(' ','_')[:40]}.pptx"
                     st.session_state["pptx_bytes"]    = pptx_out
                     st.session_state["pptx_filename"] = fname
+                    # Auto-save to project
+                    _ap = st.session_state.get("active_project")
+                    if _ap:
+                        save_project(
+                            OWNER, _ap,
+                            business_question=st.session_state.get("project_question", ""),
+                            doc_names=st.session_state.get("project_doc_names", []),
+                            slide_json=st.session_state.get("plan_slide_data") or {},
+                            pptx_bytes=pptx_out,
+                            template_bytes=st.session_state.get("saved_template_bytes"),
+                        )
                     # Keep plan_mode_active so the modal stays open with the download button visible
                     st.rerun()
                 except Exception as _ex:
@@ -3031,6 +3048,186 @@ with st.sidebar:
         st.rerun()
     st.markdown("<hr style='border:none;border-top:1px solid #232640;margin:.5rem 0 1rem;'>", unsafe_allow_html=True)
 
+# ── Shorthand for signed-in owner ────────────────────────────
+OWNER = st.session_state.auth_email
+
+# ─────────────────────────────────────────────────────────────
+# PROJECT MANAGEMENT — sidebar (post-auth)
+# ─────────────────────────────────────────────────────────────
+def _load_project_into_session(project_name: str) -> None:
+    """Pull a saved project's state into st.session_state."""
+    data = load_project(OWNER, project_name)
+    if not data:
+        return
+    st.session_state["active_project"]    = project_name
+    st.session_state["project_question"]  = data.get("business_question", "")
+    st.session_state["project_doc_names"] = data.get("doc_names", [])
+    st.session_state["plan_slide_data"]   = data.get("slide_json") or {}
+    # Restore PPTX bytes if previously generated
+    if data.get("pptx_bytes"):
+        st.session_state["pptx_bytes"] = data["pptx_bytes"]
+    else:
+        st.session_state.pop("pptx_bytes", None)
+    # Restore custom template bytes
+    if data.get("template_bytes"):
+        st.session_state["saved_template_bytes"] = data["template_bytes"]
+    else:
+        st.session_state.pop("saved_template_bytes", None)
+    # Clear stale pipeline state
+    st.session_state["pipeline_steps"] = {
+        "upload": False, "extract": False, "research": False,
+        "analyze": False, "generate": False,
+    }
+
+def _clear_project_session() -> None:
+    """Clear project-scoped session state."""
+    for k in ["active_project", "project_question", "project_doc_names",
+              "plan_slide_data", "pptx_bytes", "saved_template_bytes",
+              "plan_chat", "plan_slide_history", "pipeline_steps",
+              "plan_mode_active"]:
+        st.session_state.pop(k, None)
+
+with st.sidebar:
+    st.markdown(
+        "<div style='font-size:.6rem;font-weight:700;letter-spacing:.12em;"
+        "text-transform:uppercase;color:#475569;margin-bottom:.3rem;'>Projects</div>",
+        unsafe_allow_html=True,
+    )
+
+    _all_projects = get_projects(OWNER)
+    _project_names = [p["name"] for p in _all_projects]
+
+    # Read active project from URL params if present
+    _qp_project = st.query_params.get("project", "")
+    if _qp_project and _qp_project not in _project_names:
+        _qp_project = ""
+
+    # Initialise active_project from URL param on first load
+    if "active_project" not in st.session_state and _qp_project:
+        _load_project_into_session(_qp_project)
+
+    _active = st.session_state.get("active_project", "")
+
+    # ── Project selector ──
+    _select_options = ["— select a project —"] + _project_names + ["＋ New project"]
+    _default_idx = (
+        _select_options.index(_active) if _active in _select_options else 0
+    )
+    _selected = st.selectbox(
+        "project_selector",
+        _select_options,
+        index=_default_idx,
+        label_visibility="collapsed",
+    )
+
+    # Handle selection changes
+    if _selected == "— select a project —":
+        if _active:
+            _clear_project_session()
+            st.query_params.pop("project", None)
+            st.rerun()
+
+    elif _selected == "＋ New project":
+        _new_name = st.text_input(
+            "Project name", placeholder="e.g. STH Competitor Analysis",
+            key="new_project_name_input",
+        )
+        if st.button("Create project", use_container_width=True, type="primary"):
+            _nn = _new_name.strip()
+            if not _nn:
+                st.error("Please enter a project name.")
+            elif project_exists(OWNER, _nn):
+                st.error(f"'{_nn}' already exists.")
+            else:
+                create_project(OWNER, _nn)
+                _clear_project_session()
+                _load_project_into_session(_nn)
+                st.query_params["project"] = _nn
+                st.rerun()
+
+    elif _selected != _active:
+        # User switched to an existing project
+        _clear_project_session()
+        _load_project_into_session(_selected)
+        st.query_params["project"] = _selected
+        st.rerun()
+
+    # ── Project actions (only shown when a project is active) ──
+    if _active and _active in _project_names:
+        _proj_data = next((p for p in _all_projects if p["name"] == _active), {})
+        _updated   = (_proj_data.get("updated_at", "")[:16].replace("T", " ") + " UTC"
+                      if _proj_data.get("updated_at") else "unsaved")
+        st.caption(f"Last saved: {_updated}")
+
+        _col_save, _col_rename, _col_del = st.columns([3, 2, 1])
+
+        with _col_save:
+            if st.button("💾 Save", use_container_width=True, help="Save current state to this project"):
+                save_project(
+                    OWNER, _active,
+                    business_question=st.session_state.get("project_question", ""),
+                    doc_names=st.session_state.get("project_doc_names", []),
+                    slide_json=st.session_state.get("plan_slide_data") or {},
+                    pptx_bytes=st.session_state.get("pptx_bytes"),
+                    template_bytes=st.session_state.get("saved_template_bytes"),
+                )
+                st.toast(f'Saved "{_active}"', icon='✅')
+
+        with _col_rename:
+            if st.button("✏️", help="Rename project", use_container_width=True):
+                st.session_state["_renaming_project"] = True
+
+        with _col_del:
+            if st.button("🗑", help="Delete project", use_container_width=True):
+                st.session_state["_confirm_delete"] = True
+
+        # Rename UI
+        if st.session_state.pop("_renaming_project", False):
+            _rn = st.text_input("New name", value=_active, key="_rename_input")
+            if st.button("Rename", key="_rename_confirm"):
+                try:
+                    rename_project(OWNER, _active, _rn.strip())
+                    _clear_project_session()
+                    _load_project_into_session(_rn.strip())
+                    st.query_params["project"] = _rn.strip()
+                    st.rerun()
+                except ValueError as e:
+                    st.error(str(e))
+
+        # Delete confirmation UI
+        if st.session_state.pop("_confirm_delete", False):
+            st.warning(f"Delete **{_active}**? This cannot be undone.")
+            _dc1, _dc2 = st.columns(2)
+            with _dc1:
+                if st.button("Yes, delete", type="primary", key="_delete_yes"):
+                    delete_project(OWNER, _active)
+                    _clear_project_session()
+                    st.query_params.pop("project", None)
+                    st.rerun()
+            with _dc2:
+                if st.button("Cancel", key="_delete_no"):
+                    st.rerun()
+
+    st.markdown(
+        "<hr style='border:none;border-top:1px solid #1e293b;margin:.75rem 0 .5rem;'>",
+        unsafe_allow_html=True,
+    )
+
+# ── Gate: require an active project before showing the main UI ──
+if not st.session_state.get("active_project"):
+    with st.sidebar:
+        pass  # project selector already shown above
+    st.markdown(
+        "<div style='text-align:center;padding:4rem 2rem;color:#475569;'>"
+        "<div style='font-size:2.5rem;margin-bottom:1rem;'>📁</div>"
+        "<div style='font-size:1.1rem;font-weight:600;color:#94a3b8;margin-bottom:.5rem;'>"
+        "No project selected</div>"
+        "<div style='font-size:.85rem;'>Select an existing project or create a new one in the sidebar to get started.</div>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+    st.stop()
+
 # ─────────────────────────────────────────────────────────────
 # GLOBAL STYLES
 # ─────────────────────────────────────────────────────────────
@@ -3214,6 +3411,7 @@ with col_left:
     )
     if uploaded_files:
         st.caption(f"{len(uploaded_files)} file(s): " + ", ".join(f.name for f in uploaded_files))
+        st.session_state["project_doc_names"] = [f.name for f in uploaded_files]
 
     st.markdown('<div class="section-label" style="margin-top:.75rem;">Data for charts (optional)</div>', unsafe_allow_html=True)
     data_files = st.file_uploader(
@@ -3235,12 +3433,15 @@ with col_left:
     )
     business_question = st.text_area(
         "Business question",
+        value=st.session_state.get("project_question", ""),
         placeholder=(
             "e.g. Compare our internal game's combat mechanics and scope against Sonic Frontiers, "
             "highlighting gaps and opportunities for the executive team…"
         ),
         height=130,
+        key="biz_question_input",
     )
+    st.session_state["project_question"] = business_question
     audience = st.text_input(
         "Presentation audience", value="Executive team",
         placeholder="e.g. Executive team, Product leads, Marketing…",
@@ -3376,6 +3577,8 @@ if run_btn:
             try:
                 _template_file.seek(0)
                 _template_bytes = _template_file.read()
+                # Persist for project Save
+                st.session_state["saved_template_bytes"] = _template_bytes
             except Exception as _e:
                 st.warning(f"Could not read template file: {_e}. Using default SEGA blue template.")
                 _template_bytes = _SEGA_BLUE_TEMPLATE_BYTES
@@ -3465,6 +3668,15 @@ if run_btn:
                     elif etype == "plan_ready":
                         st.session_state["plan_slide_data"] = event[1]
                         st.session_state["plan_mode_active"] = True
+                        # Auto-save slide plan to project
+                        _ap = st.session_state.get("active_project")
+                        if _ap:
+                            save_project(
+                                OWNER, _ap,
+                                business_question=st.session_state.get("project_question", ""),
+                                doc_names=st.session_state.get("project_doc_names", []),
+                                slide_json=event[1],
+                            )
 
                     elif etype == "pptx_bytes_out":
                         fname = f"SEGA_Analysis_{(game_title_display or 'Report').replace(' ','_').replace(',','_')[:50]}.pptx"
