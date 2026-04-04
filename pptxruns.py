@@ -7,6 +7,7 @@ import io
 import time
 import hashlib
 import hmac
+from datetime import datetime, timedelta, timezone
 import random
 import base64
 import pandas as pd
@@ -3014,7 +3015,11 @@ if not st.session_state.auth_verified:
                     st.session_state.otp_code      = ""
                     if _cookie_manager:
                         _token = _sign_cookie(st.session_state.auth_email)
-                        _cookie_manager.set(COOKIE_NAME, _token, expires_at=None, key="set_auth_cookie")
+                        _cookie_manager.set(
+                        COOKIE_NAME, _token,
+                        expires_at=datetime.now(timezone.utc) + timedelta(days=COOKIE_EXPIRY_DAYS),
+                        key="set_auth_cookie",
+                    )
                     st.rerun()
 
             if st.button("← Use a different email", key="auth_back"):
