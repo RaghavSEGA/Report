@@ -40,26 +40,29 @@ def init_db() -> None:
                 owner             TEXT    NOT NULL,
                 name              TEXT    NOT NULL,
                 business_question TEXT    NOT NULL DEFAULT '',
-                game_title        TEXT    NOT NULL DEFAULT '',
-                audience          TEXT    NOT NULL DEFAULT 'Executive team',
                 doc_names         TEXT    NOT NULL DEFAULT '[]',
                 slide_json        TEXT    NOT NULL DEFAULT '{}',
                 pptx_bytes        BLOB,
                 template_bytes    BLOB,
-                plan_chat         TEXT    NOT NULL DEFAULT '[]',
                 created_at        TEXT    NOT NULL,
                 updated_at        TEXT    NOT NULL,
                 PRIMARY KEY (owner, name)
             )
         """)
-        # Migrate: add new columns to existing databases that don't have them yet
+        conn.commit()
+
+    # Run migrations in a fresh connection so PRAGMA table_info reflects
+    # the committed schema (avoids "duplicate column" on partial-migrated DBs)
+    with get_conn() as conn:
         _existing_cols = {r[1] for r in conn.execute("PRAGMA table_info(projects)").fetchall()}
-        if "game_title" not in _existing_cols:
-            conn.execute("ALTER TABLE projects ADD COLUMN game_title TEXT NOT NULL DEFAULT ''")
-        if "audience" not in _existing_cols:
-            conn.execute("ALTER TABLE projects ADD COLUMN audience TEXT NOT NULL DEFAULT 'Executive team'")
-        if "plan_chat" not in _existing_cols:
-            conn.execute("ALTER TABLE projects ADD COLUMN plan_chat TEXT NOT NULL DEFAULT '[]'")
+        migrations = [
+            ("game_title", "ALTER TABLE projects ADD COLUMN game_title TEXT NOT NULL DEFAULT ''"),
+            ("audience",   "ALTER TABLE projects ADD COLUMN audience TEXT NOT NULL DEFAULT 'Executive team'"),
+            ("plan_chat",  "ALTER TABLE projects ADD COLUMN plan_chat TEXT NOT NULL DEFAULT '[]'"),
+        ]
+        for col, sql in migrations:
+            if col not in _existing_cols:
+                conn.execute(sql)
         conn.commit()
 
 
