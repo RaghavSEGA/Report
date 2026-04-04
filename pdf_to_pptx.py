@@ -4,7 +4,7 @@ pdf_to_pptx.py
 Convert a PDF of presentation slides into a fully editable PPTX.
 
 Pipeline:
-  1. Rasterise each PDF page to a PNG (via pdf2image / pdftoppm)
+  1. Rasterise each PDF page to a PNG (via PyMuPDF — no system deps required)
   2. Send each page image to Claude vision with a structured extraction prompt
   3. Claude returns a JSON description of every element (text boxes, tables,
      shapes, colors, fonts, positions)
@@ -356,10 +356,17 @@ def pdf_to_editable_pptx(
     Returns:
         Raw bytes of the generated .pptx file.
     """
-    from pdf2image import convert_from_bytes
+    import fitz  # PyMuPDF — pip install pymupdf
 
-    # ── Rasterise pages ───────────────────────────────────────────────────────
-    images = convert_from_bytes(pdf_bytes, dpi=dpi)
+    # ── Rasterise pages via PyMuPDF (no poppler/system deps required) ─────────
+    import fitz
+    from PIL import Image as _PILImage
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    mat = fitz.Matrix(dpi / 72, dpi / 72)
+    images = []
+    for _pg in doc:
+        pix = _pg.get_pixmap(matrix=mat)
+        images.append(_PILImage.frombytes("RGB", [pix.width, pix.height], pix.samples))
     n = len(images)
 
     # ── Build presentation ────────────────────────────────────────────────────
