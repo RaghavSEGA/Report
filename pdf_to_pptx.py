@@ -1,36 +1,15 @@
 """
-pdf_to_pptx.py
-==============
-Convert a PDF of presentation slides into a fully editable PPTX.
+pdf_to_pptx.py — Convert PDF slides to fully editable PPTX.
 
-Pipeline:
-  1. Rasterise each PDF page to a PNG (via PyMuPDF — no system deps required)
-  2. Send each page image to Claude vision with a structured extraction prompt
-  3. Claude returns a JSON description of every element (text boxes, tables,
-     shapes, colors, fonts, positions)
-  4. Reconstruct each slide in python-pptx using real shapes, text boxes,
-     and native Office tables — fully editable in PowerPoint / Google Slides
-
-Usage (standalone):
-    from pdf_to_pptx import pdf_to_editable_pptx
-    pptx_bytes = pdf_to_editable_pptx(pdf_bytes, api_key="sk-ant-...")
-
-Usage (inside Streamlit):
-    import streamlit as st
-    from pdf_to_pptx import pdf_to_editable_pptx
-    pptx_bytes = pdf_to_editable_pptx(pdf_bytes,
-                                       api_key=st.secrets["ANTHROPIC_API_KEY"],
-                                       progress_cb=st.progress)
+Pipeline per page:
+  1. Rasterise via PyMuPDF (no system deps)
+  2. Detect if page is a full-page raster (NotebookLM/Canva/etc export)
+  3. Send page image to Claude vision → JSON element spec
+  4. Reconstruct as native pptx shapes/text/tables + image crops
 """
-
 from __future__ import annotations
-
-import base64
-import io
-import json
-import re
+import base64, io, json, re
 from typing import Callable
-
 from pptx import Presentation
 from pptx.dml.color import RGBColor
 from pptx.enum.text import PP_ALIGN
@@ -38,382 +17,209 @@ from pptx.oxml.ns import qn
 from pptx.util import Inches, Pt
 from lxml import etree
 
-
-# ── Slide canvas (widescreen 16:9) ───────────────────────────────────────────
 SLIDE_W_IN = 13.33
 SLIDE_H_IN = 7.5
+_ALIGN_MAP = {"left": PP_ALIGN.LEFT, "center": PP_ALIGN.CENTER,
+              "right": PP_ALIGN.RIGHT, "justify": PP_ALIGN.JUSTIFY}
 
-_ALIGN_MAP = {
-    "left":   PP_ALIGN.LEFT,
-    "center": PP_ALIGN.CENTER,
-    "right":  PP_ALIGN.RIGHT,
-    "justify": PP_ALIGN.JUSTIFY,
-}
-
-def _build_extraction_prompt(image_regions: list) -> str:
-    """
-    Build the Claude extraction prompt. If image_regions is provided,
-    tell Claude which areas are already covered by extracted images
-    so it skips recreating them as shapes.
-    """
-    if image_regions:
-        img_note = (
-            "\n\nIMPORTANT — IMAGES ALREADY EXTRACTED:\n"
-            "The following regions contain embedded images that have already been "
-            "extracted and will be placed on the slide automatically. Do NOT try to "
-            "recreate these areas as shapes or text — exclude them from elements:\n"
-        )
-        for r in image_regions:
-            img_note += (
-                f"  - Image at x={r['x_in']:.2f}, y={r['y_in']:.2f}, "
-                f"w={r['w_in']:.2f}, h={r['h_in']:.2f} inches\n"
-            )
-        img_note += (
-            "Only extract text, shapes, and tables that appear ON TOP OF or "
-            "OUTSIDE these image regions (titles, overlaid text, footer bars, "
-            "insight boxes, captions, page numbers).\n"
-        )
-    else:
-        img_note = ""
-
-    return (
-        "Analyze this presentation slide image carefully and extract ALL content "
-        "into a structured JSON object.\n\n"
-        "Return ONLY valid JSON — no markdown fences, no explanation, no preamble.\n\n"
-        "The slide canvas is 13.33 inches wide × 7.5 inches tall. "
-        "Express all positions and sizes in inches from the top-left corner."
-        + img_note +
-        """
-
-Use this exact schema:
+EXTRACTION_PROMPT = """\
+Analyze this presentation slide and extract ALL content as JSON.
+Return ONLY valid JSON — no markdown fences, no explanation.
+Slide is 13.33 inches wide x 7.5 inches tall. All x/y/w/h in inches from top-left.
 
 {
-  "background_color": "hex6 (e.g. FFFFFF)",
+  "background_color": "hex6",
   "elements": [
-    {
-      "type": "shape",
-      "x": 0.0, "y": 0.0, "w": 13.33, "h": 0.5,
-      "fill": "hex6 or null",
-      "border_color": "hex6 or null",
-      "border_pt": 1.0
-    },
-    {
-      "type": "text",
-      "x": 0.0, "y": 0.0, "w": 6.0, "h": 0.6,
-      "text": "exact text content",
-      "font_size": 24.0,
-      "bold": true,
-      "italic": false,
-      "color": "hex6",
-      "bg_color": null,
-      "align": "left",
-      "font": "Calibri"
-    },
-    {
-      "type": "table",
-      "x": 0.0, "y": 1.5, "w": 12.0, "h": 4.0,
-      "col_widths_in": [3.0, 2.5, 2.5, 2.5],
-      "row_heights_in": [0.7, 1.0, 1.0, 1.0],
-      "header_row": {
-        "cells": ["Column 1", "Column 2", "Column 3"],
-        "bg": "hex6", "fg": "hex6", "bold": true, "font_size": 12.0,
-        "cell_overrides": {"2": {"bg": "1565C0", "fg": "FFFFFF", "bold": true}}
-      },
-      "data_rows": [
-        {
-          "cells": ["Row 1 Col 1", "Row 1 Col 2", "Row 1 Col 3"],
-          "bg": "hex6", "fg": "hex6", "bold": false, "font_size": 12.0,
-          "cell_overrides": {"2": {"bg": "1565C0", "fg": "FFFFFF", "bold": true}}
-        }
-      ]
-    }
+    {"type":"shape","x":0.0,"y":6.9,"w":13.33,"h":0.6,"fill":"1565C0","border_color":null,"border_pt":0},
+    {"type":"text","x":0.35,"y":0.1,"w":10.5,"h":0.9,"text":"Title text — \\n for line breaks",
+     "font_size":26.0,"bold":true,"italic":false,"color":"1A3A6B","bg_color":null,"align":"left","font":"Calibri"},
+    {"type":"table","x":0.35,"y":1.6,"w":12.6,"h":4.1,
+     "col_widths_in":[3.5,2.3,2.7,2.7],"row_heights_in":[0.72,1.09,1.09,1.09],
+     "header_row":{"cells":["C1","C2","C3","C4"],"bg":"BDD7EE","fg":"1A3A6B","bold":true,"font_size":12.0,
+       "cell_overrides":{"3":{"bg":"1565C0","fg":"FFFFFF"}}},
+     "data_rows":[
+       {"cells":["A","B","C","D"],"bg":"FFFFFF","fg":"1A1A2E","bold":false,"font_size":12.0,
+        "cell_overrides":{"3":{"bg":"1565C0","fg":"FFFFFF","bold":true}}}]},
+    {"type":"image","x":0.38,"y":2.35,"w":0.9,"h":0.75,"description":"SEGA Genesis controller logo"}
   ]
 }
 
 Rules:
-- Include EVERY visible element outside image regions: colored bars, shapes, text, tables, footers, page numbers
-- Extract exact text — preserve capitalisation, hyphens, line breaks (use \\n)
-- For tables: capture EVERY cell; use cell_overrides for cells with different colors
-- col_widths_in values must sum to approximately the table width w
-- Colors: 6-digit hex without # symbol
-- Order elements back-to-front (backgrounds first, text/tables on top)
+- Emit back-to-front (backgrounds first, text/tables on top).
+- shapes: colored bars, accent panels, bordered boxes, footer bars.
+- text: every title, subtitle, body, bullet, label, footnote, page number.
+  Preserve exact capitalisation and punctuation. Use \\n for line breaks.
+- table: every cell. cell_overrides for cells differing from row defaults.
+  col_widths_in must sum to ~w.
+- image: one entry per logo, photo, icon, illustration visible on the slide.
+  x/y/w/h = where it sits on the slide. DO NOT emit image for the overall
+  slide background — only for distinct inline images (logos, photos, icons).
+- Colors: 6-digit hex, no # prefix.
 """
-    )
 
 
+def _rgb(h: str) -> RGBColor:
+    h = h.lstrip("#")
+    return RGBColor(int(h[0:2],16), int(h[2:4],16), int(h[4:6],16))
 
-def _rgb(hex6: str) -> RGBColor:
-    h = hex6.lstrip("#")
-    return RGBColor(int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+def _page_to_b64(pil_img) -> str:
+    buf = io.BytesIO()
+    pil_img.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode()
 
+def _is_full_page_raster(pdf_imgs: list, threshold: float = 0.65) -> bool:
+    for im in pdf_imgs:
+        frac = (im["w_in"] * im["h_in"]) / (SLIDE_W_IN * SLIDE_H_IN)
+        if frac > threshold:
+            return True
+    return False
 
-def _extract_page_images(fitz_doc, page_index: int, page_w_pt: float, page_h_pt: float) -> list:
-    """
-    Extract all embedded images from a PDF page with their positions in inches.
-    Returns a list of dicts: {bytes, ext, x_in, y_in, w_in, h_in, is_background}
-    """
-    page = fitz_doc[page_index]
-    results = []
-    for img_meta in page.get_images(full=True):
-        xref = img_meta[0]
+def _extract_pdf_images(fitz_doc, page_idx: int) -> list[dict]:
+    page = fitz_doc[page_idx]
+    pw, ph = page.rect.width, page.rect.height
+    out = []
+    for meta in page.get_images(full=True):
+        xref = meta[0]
         try:
-            base_image = fitz_doc.extract_image(xref)
-            rects = page.get_image_rects(xref)
-            for r in rects:
-                x_in = r.x0 / page_w_pt * SLIDE_W_IN
-                y_in = r.y0 / page_h_pt * SLIDE_H_IN
-                w_in = (r.x1 - r.x0) / page_w_pt * SLIDE_W_IN
-                h_in = (r.y1 - r.y0) / page_h_pt * SLIDE_H_IN
-                # A "background" image is one that covers most of the slide
-                is_bg = w_in > SLIDE_W_IN * 0.8 and h_in > SLIDE_H_IN * 0.6
-                results.append({
-                    "bytes": base_image["image"],
-                    "ext":   base_image["ext"],
-                    "x_in": max(0.0, x_in),
-                    "y_in": max(0.0, y_in),
-                    "w_in": w_in,
-                    "h_in": h_in,
-                    "is_background": is_bg,
+            base = fitz_doc.extract_image(xref)
+            for r in page.get_image_rects(xref):
+                out.append({
+                    "bytes": base["image"], "ext": base["ext"],
+                    "x_in": max(0.0, r.x0/pw*SLIDE_W_IN),
+                    "y_in": max(0.0, r.y0/ph*SLIDE_H_IN),
+                    "w_in": (r.x1-r.x0)/pw*SLIDE_W_IN,
+                    "h_in": (r.y1-r.y0)/ph*SLIDE_H_IN,
                 })
         except Exception:
             pass
-    return results
+    return out
 
+def _crop_from_raster(pil_img, el: dict) -> bytes:
+    iw, ih = pil_img.size
+    sx, sy = iw/SLIDE_W_IN, ih/SLIDE_H_IN
+    l = max(0, int(el["x"]*sx));       t = max(0, int(el["y"]*sy))
+    r = min(iw, int((el["x"]+el["w"])*sx)); b = min(ih, int((el["y"]+el["h"])*sy))
+    if r <= l or b <= t:
+        raise ValueError("degenerate crop")
+    buf = io.BytesIO()
+    pil_img.crop((l, t, r, b)).save(buf, format="PNG")
+    return buf.getvalue()
 
-def _add_image_to_slide(slide, img_info: dict) -> None:
-    """Place an extracted PDF image onto a pptx slide at the correct position."""
-    import io as _io
+def _place_image_bytes(slide, img_bytes: bytes, x, y, w, h) -> None:
     from PIL import Image as _PIL
-    from pptx.util import Inches as _In
-
-    raw = img_info["bytes"]
-    # Normalise to PNG so python-pptx can always handle it
     try:
-        pil_img = _PIL.open(_io.BytesIO(raw))
-        buf = _io.BytesIO()
-        pil_img.save(buf, format="PNG")
-        buf.seek(0)
+        pil = _PIL.open(io.BytesIO(img_bytes))
+        buf = io.BytesIO(); pil.save(buf, format="PNG"); buf.seek(0)
     except Exception:
-        buf = _io.BytesIO(raw)
-        buf.seek(0)
+        buf = io.BytesIO(img_bytes); buf.seek(0)
+    slide.shapes.add_picture(buf, Inches(x), Inches(y), Inches(w), Inches(h))
 
-    slide.shapes.add_picture(
-        buf,
-        _In(img_info["x_in"]),
-        _In(img_info["y_in"]),
-        _In(img_info["w_in"]),
-        _In(img_info["h_in"]),
-    )
-
-
-def _extract_slide_json(image_b64: str, api_key: str, model: str,
-                        image_regions: list | None = None) -> dict:
-    """Call Claude vision API and return parsed JSON for one slide."""
+def _extract_slide_json(image_b64: str, api_key: str, model: str) -> dict:
     import anthropic
     client = anthropic.Anthropic(api_key=api_key)
-
-    prompt = _build_extraction_prompt(image_regions or [])
-
     msg = client.messages.create(
-        model=model,
-        max_tokens=4096,
-        messages=[{
-            "role": "user",
-            "content": [
-                {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": "image/png",
-                        "data": image_b64,
-                    },
-                },
-                {"type": "text", "text": prompt},
-            ],
-        }],
+        model=model, max_tokens=4096,
+        messages=[{"role":"user","content":[
+            {"type":"image","source":{"type":"base64","media_type":"image/png","data":image_b64}},
+            {"type":"text","text":EXTRACTION_PROMPT},
+        ]}],
     )
-
     raw = msg.content[0].text.strip()
+    raw = re.sub(r"^```[a-z]*\n?", "", raw)
+    raw = re.sub(r"\n?```$", "", raw)
+    return json.loads(raw.strip())
 
-    # Strip markdown fences if Claude added them
-    if raw.startswith("```"):
-        raw = re.sub(r"^```[a-z]*\n?", "", raw)
-        raw = re.sub(r"\n?```$", "", raw)
-        raw = raw.strip()
+# ── Renderers ─────────────────────────────────────────────────────────────────
 
-    return json.loads(raw)
-
-
-def _render_shape(slide, el: dict) -> None:
-    """Add a colored rectangle / decorative shape."""
-    shape = slide.shapes.add_shape(
-        1,  # MSO_SHAPE_TYPE.RECTANGLE
-        Inches(el["x"]), Inches(el["y"]),
-        Inches(el["w"]), Inches(el["h"]),
-    )
+def _render_shape(slide, el):
+    s = slide.shapes.add_shape(1, Inches(el["x"]), Inches(el["y"]), Inches(el["w"]), Inches(el["h"]))
     fill = el.get("fill")
-    if fill:
-        shape.fill.solid()
-        shape.fill.fore_color.rgb = _rgb(fill)
-    else:
-        shape.fill.background()
-
+    if fill: s.fill.solid(); s.fill.fore_color.rgb = _rgb(fill)
+    else: s.fill.background()
     border = el.get("border_color")
-    if border:
-        shape.line.color.rgb = _rgb(border)
-        shape.line.width = Pt(float(el.get("border_pt", 1.0)))
-    else:
-        shape.line.fill.background()
+    if border: s.line.color.rgb = _rgb(border); s.line.width = Pt(float(el.get("border_pt",1)))
+    else: s.line.fill.background()
 
-
-def _render_text(slide, el: dict) -> None:
-    """Add a text box."""
-    txb = slide.shapes.add_textbox(
-        Inches(el["x"]), Inches(el["y"]),
-        Inches(el["w"]), Inches(el["h"]),
-    )
-    tf = txb.text_frame
-    tf.word_wrap = True
-
+def _render_text(slide, el):
+    txb = slide.shapes.add_textbox(Inches(el["x"]), Inches(el["y"]), Inches(el["w"]), Inches(el["h"]))
+    tf = txb.text_frame; tf.word_wrap = True
     bg = el.get("bg_color")
-    if bg:
-        txb.fill.solid()
-        txb.fill.fore_color.rgb = _rgb(bg)
-    else:
-        txb.fill.background()
-
-    raw_text = el.get("text", "")
-    lines = raw_text.split("\n") if "\n" in raw_text else [raw_text]
-
-    for li, line in enumerate(lines):
-        p = tf.paragraphs[0] if li == 0 else tf.add_paragraph()
-        p.alignment = _ALIGN_MAP.get(el.get("align", "left"), PP_ALIGN.LEFT)
+    if bg: txb.fill.solid(); txb.fill.fore_color.rgb = _rgb(bg)
+    else: txb.fill.background()
+    for li, line in enumerate(str(el.get("text","")).split("\n")):
+        p = tf.paragraphs[0] if li==0 else tf.add_paragraph()
+        p.alignment = _ALIGN_MAP.get(el.get("align","left"), PP_ALIGN.LEFT)
         run = p.add_run()
         run.text = line
-        run.font.name = el.get("font", "Calibri")
-        run.font.bold = bool(el.get("bold", False))
-        run.font.italic = bool(el.get("italic", False))
-        run.font.size = Pt(float(el.get("font_size", 12)))
-        run.font.color.rgb = _rgb(el.get("color", "000000"))
+        run.font.name   = el.get("font","Calibri")
+        run.font.bold   = bool(el.get("bold",False))
+        run.font.italic = bool(el.get("italic",False))
+        run.font.size   = Pt(float(el.get("font_size",12)))
+        run.font.color.rgb = _rgb(el.get("color","000000"))
 
-
-def _set_cell_fill(cell, hex6: str) -> None:
-    """Apply a solid fill color to a table cell."""
-    tc = cell._tc
-    tcPr = tc.get_or_add_tcPr()
-    # Remove any existing fills
-    for existing in tcPr.findall(qn("a:solidFill")):
-        tcPr.remove(existing)
+def _set_cell_fill(cell, h):
+    tc = cell._tc; tcPr = tc.get_or_add_tcPr()
+    for x in tcPr.findall(qn("a:solidFill")): tcPr.remove(x)
     sf = etree.SubElement(tcPr, qn("a:solidFill"))
-    sc = etree.SubElement(sf, qn("a:srgbClr"))
-    sc.set("val", hex6.lstrip("#"))
+    sc = etree.SubElement(sf,   qn("a:srgbClr")); sc.set("val", h.lstrip("#"))
 
-
-def _render_table(slide, el: dict) -> None:
-    """Add a fully styled native Office table."""
-    header = el.get("header_row", {})
-    data_rows = el.get("data_rows", [])
+def _render_table(slide, el):
+    header = el.get("header_row", {}); data_rows = el.get("data_rows", [])
+    hcells = header.get("cells", [])
+    n_cols = len(hcells) or (len(data_rows[0]["cells"]) if data_rows else 1)
     n_rows = (1 if header else 0) + len(data_rows)
-    header_cells = header.get("cells", [])
-    n_cols = len(header_cells) or (len(data_rows[0]["cells"]) if data_rows else 1)
+    tbl = slide.shapes.add_table(n_rows, n_cols,
+        Inches(el["x"]), Inches(el["y"]), Inches(el["w"]), Inches(el["h"])).table
+    for i, cw in enumerate(el.get("col_widths_in",[])[:n_cols]):
+        tbl.columns[i].width = Inches(float(cw))
+    for i, rh in enumerate(el.get("row_heights_in",[])[:n_rows]):
+        tbl.rows[i].height = Inches(float(rh))
 
-    tbl_shape = slide.shapes.add_table(
-        n_rows, n_cols,
-        Inches(el["x"]), Inches(el["y"]),
-        Inches(el["w"]), Inches(el["h"]),
-    )
-    tbl = tbl_shape.table
+    def fc(r, c, text, bg=None, fg="000000", bold=False, fs=12.0, align=PP_ALIGN.CENTER):
+        cell = tbl.cell(r,c); cell.text = ""
+        tf = cell.text_frame; tf.word_wrap = True
+        for li, line in enumerate(str(text).split("\n")):
+            p = tf.paragraphs[0] if li==0 else tf.add_paragraph()
+            p.alignment = align
+            run = p.add_run(); run.text = line
+            run.font.name="Calibri"; run.font.bold=bold
+            run.font.size=Pt(float(fs)); run.font.color.rgb=_rgb(fg)
+        if bg: _set_cell_fill(cell, bg)
 
-    # Column widths
-    col_ws = el.get("col_widths_in", [])
-    if col_ws:
-        for i, cw in enumerate(col_ws[:n_cols]):
-            tbl.columns[i].width = Inches(float(cw))
-
-    # Row heights
-    row_hs = el.get("row_heights_in", [])
-    if row_hs:
-        for i, rh in enumerate(row_hs[:n_rows]):
-            tbl.rows[i].height = Inches(float(rh))
-
-    def fill_cell(r, c, text, bg=None, fg="000000", bold=False,
-                  italic=False, font_size=12.0, align=PP_ALIGN.CENTER):
-        cell = tbl.cell(r, c)
-        cell.text = ""
-        tf = cell.text_frame
-        tf.word_wrap = True
-        p = tf.paragraphs[0]
-        p.alignment = align
-
-        # Handle multi-line cell text
-        lines = str(text).split("\n")
-        for li, line in enumerate(lines):
-            if li > 0:
-                p = tf.add_paragraph()
-                p.alignment = align
-            run = p.add_run()
-            run.text = line
-            run.font.name = "Calibri"
-            run.font.bold = bold
-            run.font.italic = italic
-            run.font.size = Pt(float(font_size))
-            run.font.color.rgb = _rgb(fg)
-
-        if bg:
-            _set_cell_fill(cell, bg)
-
-    # Header row
-    row_offset = 0
+    row_off = 0
     if header:
-        hbg  = header.get("bg", "BDD7EE")
-        hfg  = header.get("fg", "000000")
-        hbold = header.get("bold", True)
-        hsize = float(header.get("font_size", 12))
-        h_overrides = header.get("cell_overrides", {})
-        for c, txt in enumerate(header_cells[:n_cols]):
-            ov = h_overrides.get(str(c), {})
-            fill_cell(0, c, txt,
-                      bg=ov.get("bg", hbg),
-                      fg=ov.get("fg", hfg),
-                      bold=ov.get("bold", hbold),
-                      font_size=ov.get("font_size", hsize),
-                      align=PP_ALIGN.CENTER)
-        row_offset = 1
+        hbg=header.get("bg","BDD7EE"); hfg=header.get("fg","000000")
+        hbold=header.get("bold",True); hsize=float(header.get("font_size",12))
+        hov=header.get("cell_overrides",{})
+        for c, txt in enumerate(hcells[:n_cols]):
+            ov=hov.get(str(c),{})
+            fc(0,c,txt,bg=ov.get("bg",hbg),fg=ov.get("fg",hfg),
+               bold=ov.get("bold",hbold),fs=ov.get("font_size",hsize))
+        row_off=1
 
-    # Data rows
-    for ri, row_def in enumerate(data_rows):
-        cells   = row_def.get("cells", [])
-        rbg     = row_def.get("bg", None)
-        rfg     = row_def.get("fg", "000000")
-        rbold   = row_def.get("bold", False)
-        rsize   = float(row_def.get("font_size", 12))
-        r_overrides = row_def.get("cell_overrides", {})
-        for c, txt in enumerate(cells[:n_cols]):
-            ov = r_overrides.get(str(c), {})
-            fill_cell(row_offset + ri, c, txt,
-                      bg=ov.get("bg", rbg),
-                      fg=ov.get("fg", rfg),
-                      bold=ov.get("bold", rbold),
-                      font_size=ov.get("font_size", rsize),
-                      align=_ALIGN_MAP.get(ov.get("align", "center"), PP_ALIGN.CENTER))
+    for ri, rd in enumerate(data_rows):
+        rbg=rd.get("bg"); rfg=rd.get("fg","000000")
+        rbold=rd.get("bold",False); rsize=float(rd.get("font_size",12))
+        rov=rd.get("cell_overrides",{})
+        for c, txt in enumerate(rd.get("cells",[])[:n_cols]):
+            ov=rov.get(str(c),{})
+            fc(row_off+ri,c,txt,bg=ov.get("bg",rbg),fg=ov.get("fg",rfg),
+               bold=ov.get("bold",rbold),fs=ov.get("font_size",rsize),
+               align=_ALIGN_MAP.get(ov.get("align","center"),PP_ALIGN.CENTER))
 
+def _render_element(slide, el: dict, page_raster=None) -> None:
+    t = el.get("type","shape")
+    if t == "shape":  _render_shape(slide, el)
+    elif t == "text": _render_text(slide, el)
+    elif t == "table":_render_table(slide, el)
+    elif t == "image" and page_raster is not None:
+        try:
+            img_bytes = _crop_from_raster(page_raster, el)
+            _place_image_bytes(slide, img_bytes, el["x"], el["y"], el["w"], el["h"])
+        except Exception:
+            pass
 
-def _render_element(slide, el: dict) -> None:
-    t = el.get("type", "shape")
-    if t == "shape":
-        _render_shape(slide, el)
-    elif t == "text":
-        _render_text(slide, el)
-    elif t == "table":
-        _render_table(slide, el)
-
-
-def _page_to_b64(image) -> str:
-    """PIL Image → base64 PNG string."""
-    buf = io.BytesIO()
-    image.save(buf, format="PNG")
-    return base64.b64encode(buf.getvalue()).decode()
-
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def pdf_to_editable_pptx(
     pdf_bytes: bytes,
@@ -421,89 +227,75 @@ def pdf_to_editable_pptx(
     model: str = "claude-opus-4-5",
     dpi: int = 150,
     progress_cb: Callable | None = None,
-) -> bytes:
+) -> tuple[bytes, list[str]]:
     """
-    Convert a PDF of slides to an editable PPTX.
+    Convert PDF slides to editable PPTX. Returns (pptx_bytes, errors).
 
-    Args:
-        pdf_bytes:   Raw bytes of the input PDF.
-        api_key:     Anthropic API key.
-        model:       Claude model to use for vision extraction.
-        dpi:         Resolution for PDF rasterisation (150 is a good balance).
-        progress_cb: Optional callable(fraction: float) for progress updates.
+    For full-page raster PDFs (NotebookLM, Canva exports):
+      - Claude reconstructs all shapes/text/tables as native elements
+      - Inline images (logos, icons) are cropped from the raster by coordinate
+      - The full-page background image is NOT placed (everything is editable)
 
-    Returns:
-        Raw bytes of the generated .pptx file.
+    For vector PDFs with discrete embedded images:
+      - Embedded images are placed directly from the PDF XObjects
+      - Text/shapes/tables reconstructed as native elements
     """
-    import fitz  # PyMuPDF — pip install pymupdf
-
-    # ── Rasterise pages via PyMuPDF (no poppler/system deps required) ─────────
     import fitz
-    from PIL import Image as _PILImage
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    mat = fitz.Matrix(dpi / 72, dpi / 72)
-    images = []
-    for _pg in doc:
-        pix = _pg.get_pixmap(matrix=mat)
-        images.append(_PILImage.frombytes("RGB", [pix.width, pix.height], pix.samples))
-    n = len(images)
+    from PIL import Image as _PIL
 
-    # ── Build presentation ────────────────────────────────────────────────────
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    mat = fitz.Matrix(dpi/72, dpi/72)
+    page_rasters = []
+    for pg in doc:
+        pix = pg.get_pixmap(matrix=mat)
+        page_rasters.append(_PIL.frombytes("RGB", [pix.width, pix.height], pix.samples))
+
+    n = len(page_rasters)
     prs = Presentation()
     prs.slide_width  = Inches(SLIDE_W_IN)
     prs.slide_height = Inches(SLIDE_H_IN)
-    blank_layout = prs.slide_layouts[6]  # truly blank
+    blank = prs.slide_layouts[6]
+    errors: list[str] = []
 
-    errors = []
-
-    for i, img in enumerate(images):
+    for i, raster in enumerate(page_rasters):
         if progress_cb:
             progress_cb(i / n)
 
-        b64 = _page_to_b64(img)
-
-        # ── Extract embedded images from this PDF page ────────────────────────
-        page     = doc[i]
-        page_w   = page.rect.width
-        page_h   = page.rect.height
-        page_imgs = _extract_page_images(doc, i, page_w, page_h)
-
-        # Tell Claude which regions are already covered by images
-        image_regions = [pi for pi in page_imgs]  # pass all so Claude skips them
+        pdf_imgs      = _extract_pdf_images(doc, i)
+        has_bg_raster = _is_full_page_raster(pdf_imgs)
+        b64           = _page_to_b64(raster)
 
         try:
-            spec = _extract_slide_json(b64, api_key, model, image_regions=image_regions)
+            spec = _extract_slide_json(b64, api_key, model)
         except Exception as e:
-            errors.append(f"Page {i+1}: vision extraction failed — {e}")
-            slide = prs.slides.add_slide(blank_layout)
+            errors.append(f"Page {i+1}: extraction failed — {e}")
+            slide = prs.slides.add_slide(blank)
             txb = slide.shapes.add_textbox(Inches(0.5), Inches(0.5), Inches(12), Inches(1))
-            txb.text_frame.paragraphs[0].add_run().text = f"[Page {i+1} could not be extracted: {e}]"
+            txb.text_frame.paragraphs[0].add_run().text = f"[Page {i+1}: {e}]"
             continue
 
-        slide = prs.slides.add_slide(blank_layout)
+        slide = prs.slides.add_slide(blank)
 
-        # ── Background fill ───────────────────────────────────────────────────
+        # White/colored base
         bg = spec.get("background_color", "FFFFFF")
-        bg_shape = slide.shapes.add_shape(1, 0, 0, prs.slide_width, prs.slide_height)
-        bg_shape.fill.solid()
-        bg_shape.fill.fore_color.rgb = _rgb(bg)
-        bg_shape.line.fill.background()
+        bgs = slide.shapes.add_shape(1, 0, 0, prs.slide_width, prs.slide_height)
+        bgs.fill.solid(); bgs.fill.fore_color.rgb = _rgb(bg); bgs.line.fill.background()
 
-        # ── Place extracted images (back-to-front: backgrounds first) ─────────
-        # Background images go first so overlaid text/shapes appear on top
-        for pi in sorted(page_imgs, key=lambda x: (not x["is_background"],
-                                                     x["w_in"] * x["h_in"]), reverse=True):
-            try:
-                _add_image_to_slide(slide, pi)
-            except Exception as e:
-                errors.append(f"Page {i+1} image placement: {e}")
+        # For vector PDFs: place discrete embedded images before overlays
+        if not has_bg_raster:
+            for pi in pdf_imgs:
+                try:
+                    _place_image_bytes(slide, pi["bytes"],
+                                       pi["x_in"], pi["y_in"], pi["w_in"], pi["h_in"])
+                except Exception as e:
+                    errors.append(f"Page {i+1} image: {e}")
 
-        # ── Render Claude-extracted text/shape/table overlays ─────────────────
+        # Render all elements — pass raster so "image" crops work
         for el in spec.get("elements", []):
             try:
-                _render_element(slide, el)
+                _render_element(slide, el, page_raster=raster)
             except Exception as e:
-                errors.append(f"Page {i+1} element {el.get('type','?')}: {e}")
+                errors.append(f"Page {i+1} {el.get('type','?')}: {e}")
 
     if progress_cb:
         progress_cb(1.0)
