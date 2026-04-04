@@ -40,15 +40,26 @@ def init_db() -> None:
                 owner             TEXT    NOT NULL,
                 name              TEXT    NOT NULL,
                 business_question TEXT    NOT NULL DEFAULT '',
+                game_title        TEXT    NOT NULL DEFAULT '',
+                audience          TEXT    NOT NULL DEFAULT 'Executive team',
                 doc_names         TEXT    NOT NULL DEFAULT '[]',
                 slide_json        TEXT    NOT NULL DEFAULT '{}',
                 pptx_bytes        BLOB,
                 template_bytes    BLOB,
+                plan_chat         TEXT    NOT NULL DEFAULT '[]',
                 created_at        TEXT    NOT NULL,
                 updated_at        TEXT    NOT NULL,
                 PRIMARY KEY (owner, name)
             )
         """)
+        # Migrate: add new columns to existing databases that don't have them yet
+        _existing_cols = {r[1] for r in conn.execute("PRAGMA table_info(projects)").fetchall()}
+        if "game_title" not in _existing_cols:
+            conn.execute("ALTER TABLE projects ADD COLUMN game_title TEXT NOT NULL DEFAULT ''")
+        if "audience" not in _existing_cols:
+            conn.execute("ALTER TABLE projects ADD COLUMN audience TEXT NOT NULL DEFAULT 'Executive team'")
+        if "plan_chat" not in _existing_cols:
+            conn.execute("ALTER TABLE projects ADD COLUMN plan_chat TEXT NOT NULL DEFAULT '[]'")
         conn.commit()
 
 
@@ -58,8 +69,8 @@ def get_projects(owner: str) -> list[dict]:
     """Return all projects for this owner, ordered by updated_at desc."""
     with get_conn() as conn:
         rows = conn.execute(
-            """SELECT name, business_question, doc_names, slide_json,
-                      pptx_bytes, template_bytes, created_at, updated_at
+            """SELECT name, business_question, game_title, audience, doc_names, slide_json,
+                      pptx_bytes, template_bytes, plan_chat, created_at, updated_at
                FROM projects
                WHERE owner = ?
                ORDER BY updated_at DESC""",
@@ -85,9 +96,9 @@ def create_project(owner: str, name: str) -> None:
     with get_conn() as conn:
         conn.execute(
             """INSERT INTO projects
-               (owner, name, business_question, doc_names, slide_json,
+               (owner, name, business_question, game_title, audience, doc_names, slide_json,
                 pptx_bytes, template_bytes, created_at, updated_at)
-               VALUES (?, ?, '', '[]', '{}', NULL, NULL, ?, ?)""",
+               VALUES (?, ?, '', '', 'Executive team', '[]', '{}', NULL, NULL, ?, ?)""",
             (owner, name, ts, ts),
         )
         conn.commit()
@@ -120,8 +131,8 @@ def load_project(owner: str, name: str) -> dict | None:
     """Load a project's full state. Returns None if not found."""
     with get_conn() as conn:
         row = conn.execute(
-            """SELECT name, business_question, doc_names, slide_json,
-                      pptx_bytes, template_bytes, created_at, updated_at
+            """SELECT name, business_question, game_title, audience, doc_names, slide_json,
+                      pptx_bytes, template_bytes, plan_chat, created_at, updated_at
                FROM projects WHERE owner = ? AND name = ?""",
             (owner, name),
         ).fetchone()
@@ -131,6 +142,7 @@ def load_project(owner: str, name: str) -> dict | None:
     # Parse JSON fields
     d["doc_names"]  = json.loads(d["doc_names"]  or "[]")
     d["slide_json"] = json.loads(d["slide_json"] or "{}")
+    d["plan_chat"]  = json.loads(d["plan_chat"]  or "[]")
     return d
 
 
@@ -139,8 +151,11 @@ def save_project(
     name: str,
     *,
     business_question: str | None = None,
+    game_title: str | None = None,
+    audience: str | None = None,
     doc_names: list[str] | None = None,
     slide_json: dict | None = None,
+    plan_chat: list | None = None,
     pptx_bytes: bytes | None = None,
     template_bytes: bytes | None = None,
     clear_pptx: bool = False,
@@ -155,8 +170,11 @@ def save_project(
     existing = load_project(owner, name) or {}
 
     bq  = business_question if business_question is not None else existing.get("business_question", "")
+    gt  = game_title if game_title is not None else existing.get("game_title", "")
+    aud = audience if audience is not None else existing.get("audience", "Executive team")
     dns = json.dumps(doc_names if doc_names is not None else existing.get("doc_names", []))
     sj  = json.dumps(slide_json if slide_json is not None else existing.get("slide_json", {}))
+    pc  = json.dumps(plan_chat if plan_chat is not None else existing.get("plan_chat", []))
     pb  = None if clear_pptx else (pptx_bytes if pptx_bytes is not None else existing.get("pptx_bytes"))
     tb  = None if clear_template else (template_bytes if template_bytes is not None else existing.get("template_bytes"))
 
@@ -166,16 +184,19 @@ def save_project(
     with get_conn() as conn:
         conn.execute(
             """INSERT INTO projects
-               (owner, name, business_question, doc_names, slide_json,
-                pptx_bytes, template_bytes, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+               (owner, name, business_question, game_title, audience, doc_names, slide_json,
+                pptx_bytes, template_bytes, plan_chat, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(owner, name) DO UPDATE SET
                    business_question = excluded.business_question,
+                   game_title        = excluded.game_title,
+                   audience          = excluded.audience,
                    doc_names         = excluded.doc_names,
                    slide_json        = excluded.slide_json,
                    pptx_bytes        = excluded.pptx_bytes,
                    template_bytes    = excluded.template_bytes,
+                   plan_chat         = excluded.plan_chat,
                    updated_at        = excluded.updated_at""",
-            (owner, name, bq, dns, sj, pb, tb, created, ts),
+            (owner, name, bq, gt, aud, dns, sj, pb, tb, pc, created, ts),
         )
         conn.commit()

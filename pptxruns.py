@@ -723,6 +723,121 @@ def _render_chart_png(chart_spec: dict, width_px=860, height_px=480) -> bytes:
     plt.close(fig)
     buf.seek(0)
     return buf.read()
+
+def _add_native_chart(slide, chart_spec: dict, left_in, top_in, width_in, height_in):
+    """
+    Add a fully editable native Office XML chart to a slide using python-pptx.
+    Falls back to PNG if chart_spec is malformed or type is unsupported.
+    Returns True on success, False on fallback.
+    """
+    from pptx.util import Inches as _In2, Pt as _Pt2
+    from pptx.chart.data import ChartData as _CD
+    from pptx.enum.chart import XL_CHART_TYPE as _XCT
+    from pptx.dml.color import RGBColor as _RGB2
+
+    spec       = chart_spec or {}
+    ctype_str  = spec.get("chart_type", "bar").lower()
+    categories = spec.get("categories") or []
+    series     = spec.get("series") or []
+    colors_raw = spec.get("colors") or ["003D7A","ED7D31","22AA66","CC2244","8B5CF6","0EA5E9"]
+    title_txt  = spec.get("title", "")
+    x_label    = spec.get("x_label", "")
+    y_label    = spec.get("y_label", "")
+
+    # Map JSON chart_type → XL_CHART_TYPE
+    _TYPE_MAP = {
+        "bar":            _XCT.COLUMN_CLUSTERED,   # vertical bars
+        "horizontal_bar": _XCT.BAR_CLUSTERED,       # horizontal bars
+        "line":           _XCT.LINE_MARKERS,
+        "scatter":        _XCT.XY_SCATTER_LINES,
+        "pie":            _XCT.PIE,
+    }
+    xl_type = _TYPE_MAP.get(ctype_str)
+    if xl_type is None or not series:
+        return False
+
+    def _hex_to_rgb(h):
+        h = h.lstrip("#")
+        if len(h) == 6:
+            return _RGB2(int(h[0:2],16), int(h[2:4],16), int(h[4:6],16))
+        return _RGB2(0x00, 0x55, 0xAA)
+
+    try:
+        cd = _CD()
+        if ctype_str == "pie":
+            # Pie: one series, categories = slice labels
+            cd.categories = categories or [s.get("label","") for s in series]
+            vals = [float(v) for v in (series[0].get("values") or [])]
+            cd.add_series(series[0].get("label",""), vals)
+        elif ctype_str == "scatter":
+            # XY scatter needs XyChartData
+            from pptx.chart.data import XyChartData as _XYD
+            cd = _XYD()
+            for s in series:
+                ser = cd.add_series(s.get("label",""))
+                vals = [float(v) for v in (s.get("values") or [])]
+                xs   = list(range(len(vals))) if not categories else                        [float(c) if str(c).replace(".","").replace("-","").isdigit()
+                        else i for i, c in enumerate(categories)]
+                for x, y in zip(xs[:len(vals)], vals):
+                    ser.add_data_point(x, y)
+        else:
+            cd.categories = categories
+            for s in series:
+                vals = [float(v) for v in (s.get("values") or [])]
+                cd.add_series(s.get("label",""), vals)
+
+        graphic_frame = slide.shapes.add_chart(
+            xl_type,
+            _In2(left_in), _In2(top_in), _In2(width_in), _In2(height_in),
+            cd,
+        )
+        chart = graphic_frame.chart
+
+        # Title
+        if title_txt:
+            chart.has_title = True
+            chart.chart_title.text_frame.text = title_txt
+            chart.chart_title.text_frame.paragraphs[0].runs[0].font.size = _Pt2(14)
+            chart.chart_title.text_frame.paragraphs[0].runs[0].font.bold = True
+
+        # Legend
+        chart.has_legend = len(series) > 1 or ctype_str == "pie"
+
+        # Axis labels (not for pie/scatter)
+        if ctype_str not in ("pie", "scatter"):
+            try:
+                if x_label and hasattr(chart, "category_axis"):
+                    chart.category_axis.axis_title.text_frame.text = x_label
+                    chart.category_axis.has_title = True
+                if y_label and hasattr(chart, "value_axis"):
+                    chart.value_axis.axis_title.text_frame.text = y_label
+                    chart.value_axis.has_title = True
+            except Exception:
+                pass
+
+        # Series colors
+        if ctype_str == "pie":
+            try:
+                for i, point in enumerate(chart.series[0].points):
+                    point.format.fill.solid()
+                    point.format.fill.fore_color.rgb = _hex_to_rgb(colors_raw[i % len(colors_raw)])
+            except Exception:
+                pass
+        else:
+            for i, ser in enumerate(chart.series):
+                try:
+                    ser.format.fill.solid()
+                    ser.format.fill.fore_color.rgb = _hex_to_rgb(colors_raw[i % len(colors_raw)])
+                    if ctype_str == "line":
+                        ser.format.line.color.rgb = _hex_to_rgb(colors_raw[i % len(colors_raw)])
+                except Exception:
+                    pass
+
+        return True
+
+    except Exception:
+        return False
+
 def _slide_chart(prs, s: dict, C: dict):
     """
     Chart slide: title bar + full-width chart image + optional caption.
@@ -755,16 +870,24 @@ def _slide_chart(prs, s: dict, C: dict):
     chart_top = 0.78
     chart_h   = H_IN - chart_top - (0.55 if caption_text else 0.25)
 
-    try:
-        png_bytes  = _render_chart_png(chart_spec,
-                                        width_px=int((W_IN-0.6)*96),
-                                        height_px=int(chart_h*96))
-        slide.shapes.add_picture(_io.BytesIO(png_bytes),
-                                  Inches(0.3), Inches(chart_top),
-                                  Inches(W_IN-0.6), Inches(chart_h))
-    except Exception as e:
-        err_box = slide.shapes.add_textbox(Inches(1), Inches(2), Inches(W_IN-2), Inches(1.5))
-        err_box.text_frame.paragraphs[0].add_run().text = f"Chart render error: {e}"
+    # Try native Office XML chart first (editable in PowerPoint)
+    _native_ok = _add_native_chart(
+        slide, chart_spec,
+        left_in=0.3, top_in=chart_top,
+        width_in=W_IN-0.6, height_in=chart_h,
+    )
+    if not _native_ok:
+        # Fallback: matplotlib PNG
+        try:
+            png_bytes = _render_chart_png(chart_spec,
+                                          width_px=int((W_IN-0.6)*96),
+                                          height_px=int(chart_h*96))
+            slide.shapes.add_picture(_io.BytesIO(png_bytes),
+                                      Inches(0.3), Inches(chart_top),
+                                      Inches(W_IN-0.6), Inches(chart_h))
+        except Exception as e:
+            err_box = slide.shapes.add_textbox(Inches(1), Inches(2), Inches(W_IN-2), Inches(1.5))
+            err_box.text_frame.paragraphs[0].add_run().text = f"Chart render error: {e}"
 
     if caption_text:
         cap_box = slide.shapes.add_textbox(
@@ -1411,17 +1534,24 @@ def _generate_from_template(slide_data: dict, template_bytes: bytes) -> bytes:
 
             chart_top = 0.78
             chart_h   = H - chart_top - (0.60 if caption_text else 0.25)
-            try:
-                png_bytes = _render_chart_png(chart_spec,
-                                               width_px=int(CW*96),
-                                               height_px=int(chart_h*96))
-                new_slide.shapes.add_picture(
-                    _ioC.BytesIO(png_bytes),
-                    _In(CX), _In(chart_top), _In(CW), _In(chart_h)
-                )
-            except Exception as _ce:
-                eb = new_slide.shapes.add_textbox(_In(CX), _In(2), _In(CW), _In(1.5))
-                eb.text_frame.paragraphs[0].add_run().text = f"Chart render error: {_ce}"
+            # Try native Office XML chart first (editable in PowerPoint)
+            _native_ok = _add_native_chart(
+                new_slide, chart_spec,
+                left_in=CX, top_in=chart_top,
+                width_in=CW, height_in=chart_h,
+            )
+            if not _native_ok:
+                try:
+                    png_bytes = _render_chart_png(chart_spec,
+                                                   width_px=int(CW*96),
+                                                   height_px=int(chart_h*96))
+                    new_slide.shapes.add_picture(
+                        _ioC.BytesIO(png_bytes),
+                        _In(CX), _In(chart_top), _In(CW), _In(chart_h)
+                    )
+                except Exception as _ce:
+                    eb = new_slide.shapes.add_textbox(_In(CX), _In(2), _In(CW), _In(1.5))
+                    eb.text_frame.paragraphs[0].add_run().text = f"Chart render error: {_ce}"
 
             if caption_text:
                 _txb(new_slide, CX, H-0.65, CW, 0.5, caption_text, size=9, italic=True,
@@ -2034,7 +2164,6 @@ def _render_plan_modal(template_bytes_ref):
     # Initialise state
     if "plan_chat"          not in st.session_state: st.session_state["plan_chat"]          = []
     if "plan_slide_history" not in st.session_state: st.session_state["plan_slide_history"] = []
-    if "plan_chat_clear_input" not in st.session_state: st.session_state["plan_chat_clear_input"] = False
 
     # ── Undo button ───────────────────────────────────────────────────────────
     undo_col, _ = st.columns([1, 5])
@@ -2066,27 +2195,21 @@ def _render_plan_modal(template_bytes_ref):
         )
 
     # ── Input row ─────────────────────────────────────────────────────────────
-    # Clear the input box by cycling the key after a send
-    _input_key = f"plan_chat_input_{'b' if st.session_state.get('plan_chat_clear_input') else 'a'}"
+    # st.chat_input is native Streamlit — it reliably clears itself after submit
+    # and fires correctly on Enter as well as the send button.
+    chat_input = st.chat_input(
+        "e.g. Make slide 3 a comparison table, add a chart slide about revenue…",
+        key="plan_chat_input",
+    )
 
-    chat_col, btn_col = st.columns([5, 1])
-    with chat_col:
-        chat_input = st.text_input(
-            "chat", label_visibility="collapsed",
-            placeholder="e.g. Make slide 3 a comparison table, add a chart slide about revenue…",
-            key=_input_key,
-        )
-    with btn_col:
-        send_btn = st.button("Send", key="plan_chat_send", use_container_width=True, type="primary")
-
-    # Clear + undo strip below input
+    # Clear chat button
     if st.session_state.get("plan_chat"):
         if st.button("🗑 Clear chat", key="plan_chat_clear", use_container_width=False):
             st.session_state["plan_chat"] = []
             st.rerun()
 
     # ── Handle send ───────────────────────────────────────────────────────────
-    if send_btn and chat_input.strip():
+    if chat_input and chat_input.strip():
         import json as _json, html as _html_mod
 
         # Save current slides to undo history before any change
@@ -2144,7 +2267,7 @@ Rules:
             try:
                 client = _make_anthropic_client()
                 _api_msg = client.messages.create(
-                    model="claude-sonnet-4-6",
+                    model=st.session_state.get("_selected_model", "claude-sonnet-4-5"),
                     max_tokens=6000,
                     system=_system,
                     messages=_messages,
@@ -2201,14 +2324,12 @@ Rules:
                     "_raw_reply": _raw,   # stored for accurate multi-turn context
                 })
                 # Flip the key to clear the input box on next render
-                st.session_state["plan_chat_clear_input"] = not st.session_state.get("plan_chat_clear_input", False)
                 st.rerun()
 
             except _json.JSONDecodeError:
                 _display = _raw if _raw else "Could not parse Claude's response."
                 st.session_state["plan_chat"].append({"role": "user",      "content": chat_input.strip()})
                 st.session_state["plan_chat"].append({"role": "assistant", "content": _display, "_raw_reply": _display})
-                st.session_state["plan_chat_clear_input"] = not st.session_state.get("plan_chat_clear_input", False)
                 st.rerun()
             except Exception as _ce:
                 st.error(f"Chat error: {_ce}")
@@ -2243,8 +2364,11 @@ Rules:
                         save_project(
                             OWNER, _ap,
                             business_question=st.session_state.get("project_question", ""),
+                            game_title=st.session_state.get("project_game_title", ""),
+                            audience=st.session_state.get("project_audience", "Executive team"),
                             doc_names=st.session_state.get("project_doc_names", []),
                             slide_json=st.session_state.get("plan_slide_data") or {},
+                            plan_chat=st.session_state.get("plan_chat", []),
                             pptx_bytes=pptx_out,
                             template_bytes=st.session_state.get("saved_template_bytes"),
                         )
@@ -2584,8 +2708,8 @@ def run_pipeline(model, uploaded_files, game_title, business_question, audience,
                 f"{len(data_summary):,} characters of exact data sent to Claude for chart generation"
             ))
 
-
-        analysis_prompt = f"""You are a senior game industry analyst at SEGA.
+    # analysis_prompt defined unconditionally so it exists whether or not data_files
+    analysis_prompt = f"""You are a senior game industry analyst at SEGA.
 Analyse the following and produce a JSON object for a {slide_count}-slide executive presentation.
 
 ## INTERNAL GAME DOCUMENTS:
@@ -2930,10 +3054,18 @@ for _k, _v in [
     if _k not in st.session_state:
         st.session_state[_k] = _v
 
-# If valid cookie found, mark as verified
+# If valid cookie found, mark as verified and roll the expiry forward
 if _cookie_email and not st.session_state.auth_verified:
     st.session_state.auth_verified = True
     st.session_state.auth_email    = _cookie_email
+    # Roll cookie: re-issue with a fresh 7-day window from now
+    if _cookie_manager:
+        _rolled_token = _sign_cookie(_cookie_email)
+        _cookie_manager.set(
+            COOKIE_NAME, _rolled_token,
+            expires_at=datetime.now(timezone.utc) + timedelta(days=COOKIE_EXPIRY_DAYS),
+            key="roll_auth_cookie",
+        )
 
 # ── Render login gate if not verified ────────────────────────
 if not st.session_state.auth_verified:
@@ -3067,7 +3199,10 @@ def _load_project_into_session(project_name: str) -> None:
     st.session_state["active_project"]    = project_name
     st.session_state["project_question"]  = data.get("business_question", "")
     st.session_state["project_doc_names"] = data.get("doc_names", [])
+    st.session_state["project_game_title"] = data.get("game_title", "")
+    st.session_state["project_audience"]   = data.get("audience", "Executive team")
     st.session_state["plan_slide_data"]   = data.get("slide_json") or {}
+    st.session_state["plan_chat"]         = data.get("plan_chat", [])
     # Restore PPTX bytes if previously generated
     if data.get("pptx_bytes"):
         st.session_state["pptx_bytes"] = data["pptx_bytes"]
@@ -3087,6 +3222,7 @@ def _load_project_into_session(project_name: str) -> None:
 def _clear_project_session() -> None:
     """Clear project-scoped session state."""
     for k in ["active_project", "project_question", "project_doc_names",
+              "project_game_title", "project_audience",
               "plan_slide_data", "pptx_bytes", "saved_template_bytes",
               "plan_chat", "plan_slide_history", "pipeline_steps",
               "plan_mode_active"]:
@@ -3171,8 +3307,11 @@ with st.sidebar:
                 save_project(
                     OWNER, _active,
                     business_question=st.session_state.get("project_question", ""),
+                    game_title=st.session_state.get("project_game_title", ""),
+                    audience=st.session_state.get("project_audience", "Executive team"),
                     doc_names=st.session_state.get("project_doc_names", []),
                     slide_json=st.session_state.get("plan_slide_data") or {},
+                    plan_chat=st.session_state.get("plan_chat", []),
                     pptx_bytes=st.session_state.get("pptx_bytes"),
                     template_bytes=st.session_state.get("saved_template_bytes"),
                 )
@@ -3185,6 +3324,21 @@ with st.sidebar:
         with _col_del:
             if st.button("🗑", help="Delete project", use_container_width=True):
                 st.session_state["_confirm_delete"] = True
+
+        # Reset output — clears generated PPTX and slide plan from DB
+        if st.session_state.get("pptx_bytes") or st.session_state.get("plan_slide_data"):
+            if st.button("🔄 Reset output", use_container_width=True,
+                         help="Clear the generated PPTX and slide outline so you can run fresh"):
+                st.session_state.pop("pptx_bytes", None)
+                st.session_state.pop("pptx_filename", None)
+                st.session_state.pop("plan_slide_data", None)
+                st.session_state.pop("plan_mode_active", None)
+                st.session_state.pop("plan_chat", None)
+                st.session_state.pop("plan_slide_history", None)
+                st.session_state.pop("pipeline_steps", None)
+                save_project(OWNER, _active, slide_json={}, plan_chat=[],
+                             clear_pptx=True)
+                st.rerun()
 
         # Rename UI
         if st.session_state.pop("_renaming_project", False):
@@ -3341,11 +3495,12 @@ with st.sidebar:
         "Model", ["claude-sonnet-4-5", "claude-opus-4-5", "claude-haiku-4-5-20251001"],
         label_visibility="hidden",
     )
+    st.session_state["_selected_model"] = model
 
     st.markdown('<span class="sidebar-section">Options</span>', unsafe_allow_html=True)
     web_search_enabled = st.checkbox("Web search for reference game", value=True)
     plan_mode          = True  # always on — pipeline stops at outline for review
-    slide_count        = st.slider("Target slides", 6, 20, 10)
+    slide_count        = st.slider("Target slides", 6, 20, 12)
 
     st.markdown('<span class="sidebar-section">Template</span>', unsafe_allow_html=True)
 
@@ -3434,8 +3589,11 @@ with col_left:
 
     game_title = st.text_input(
         "Reference / competitor game titles (comma-separated for multiple)",
+        value=st.session_state.get("project_game_title", ""),
         placeholder="e.g. Mario Odyssey, Astro Bot, Hollow Knight — separate multiple with commas",
+        key="game_title_input",
     )
+    st.session_state["project_game_title"] = game_title
     business_question = st.text_area(
         "Business question",
         value=st.session_state.get("project_question", ""),
@@ -3448,9 +3606,12 @@ with col_left:
     )
     st.session_state["project_question"] = business_question
     audience = st.text_input(
-        "Presentation audience", value="Executive team",
+        "Presentation audience",
+        value=st.session_state.get("project_audience", "Executive team"),
         placeholder="e.g. Executive team, Product leads, Marketing…",
+        key="audience_input",
     )
+    st.session_state["project_audience"] = audience
 
     run_btn = st.button("⚡ Run analysis", use_container_width=True, type="primary")
 
@@ -3553,9 +3714,10 @@ _RL_MAX_TRIES = 5    # max retries before giving up
 # PIPELINE  (parallel extraction + research, streaming analysis)
 # ─────────────────────────────────────────────────────────────
 
-# Characters of document context to send.  Keeping this under ~8 000 chars
-# (~2 000 tokens) leaves plenty of headroom on the 30 000 input-token/min limit.
-_MAX_DOC_CHARS = 8_000
+# Characters of document context to send.
+# 60 000 chars ≈ 15 000 tokens — plenty for most PDFs while staying well under
+# Sonnet's 200k context window.  Rate-limit headroom is managed by model choice.
+_MAX_DOC_CHARS = 60_000
 
 
 
@@ -3679,12 +3841,18 @@ if run_btn:
                             save_project(
                                 OWNER, _ap,
                                 business_question=st.session_state.get("project_question", ""),
+                                game_title=st.session_state.get("project_game_title", ""),
+                                audience=st.session_state.get("project_audience", "Executive team"),
                                 doc_names=st.session_state.get("project_doc_names", []),
                                 slide_json=event[1],
+                                plan_chat=st.session_state.get("plan_chat", []),
                             )
 
                     elif etype == "pptx_bytes_out":
-                        fname = f"SEGA_Analysis_{(game_title_display or 'Report').replace(' ','_').replace(',','_')[:50]}.pptx"
+                        _gt_disp = ", ".join(
+                            g.strip() for g in (game_title or "").split(",") if g.strip()
+                        ) or "Report"
+                        fname = f"SEGA_Analysis_{_gt_disp.replace(' ','_').replace(',','_')[:50]}.pptx"
                         st.session_state["pptx_bytes"]    = event[1]
                         st.session_state["pptx_filename"] = fname
 
