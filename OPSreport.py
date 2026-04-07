@@ -178,16 +178,16 @@ claude_key = st.secrets.get("ANTHROPIC_API_KEY", "")
 # OTP / SES AUTH
 # ─────────────────────────────────────────────────────────────
 
-ALLOWED_DOMAIN     = "@segaamerica.com"
-OTP_EXPIRY_SECS    = 600
-COOKIE_EXPIRY_DAYS = 7
-COOKIE_NAME        = "sega_tracker_auth"
+ALLOWED_DOMAIN    = "@segaamerica.com"
+OTP_EXPIRY_SECS   = 600
+TOKEN_EXPIRY_DAYS = 7
 
 
 def _send_otp(email: str, code: str) -> bool:
     """Send a 6-digit OTP via AWS SES."""
     try:
         import boto3
+        from botocore.exceptions import ClientError
         ses = boto3.client(
             "ses",
             region_name=st.secrets.get("AWS_SES_REGION", "us-east-1"),
@@ -224,25 +224,29 @@ def _send_otp(email: str, code: str) -> bool:
             },
         )
         return True
+    except ClientError as e:
+        st.error(f"SES error: {e.response['Error']['Message']}")
+        return False
     except Exception as e:
         st.error(f"Failed to send email: {e}")
         return False
 
 
-def _sign_cookie(email: str) -> str:
-    """Return a base64-encoded HMAC-signed token: email|expiry|signature."""
-    secret  = st.secrets.get("COOKIE_SIGNING_KEY", "change-this-secret")
-    expiry  = int(time.time()) + (COOKIE_EXPIRY_DAYS * 86400)
+# ── Token helpers (URL query param approach — no cookie library) ──
+def _make_token(email: str) -> str:
+    """Create a signed URL token: base64(email|expiry|hmac)."""
+    secret  = st.secrets.get("COOKIE_SIGNING_KEY", "fallback-change-this")
+    expiry  = int(time.time()) + (TOKEN_EXPIRY_DAYS * 86400)
     payload = f"{email}|{expiry}"
     sig     = hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
     return base64.urlsafe_b64encode(f"{payload}|{sig}".encode()).decode()
 
 
-def _verify_cookie(token: str) -> str | None:
-    """Verify signed cookie. Returns email string if valid, else None."""
+def _verify_token(token: str) -> str | None:
+    """Verify token. Returns email if valid, None otherwise."""
     try:
-        secret  = st.secrets.get("COOKIE_SIGNING_KEY", "change-this-secret")
-        decoded = base64.urlsafe_b64decode(token.encode()).decode()
+        secret   = st.secrets.get("COOKIE_SIGNING_KEY", "fallback-change-this")
+        decoded  = base64.urlsafe_b64decode(token.encode()).decode()
         email, expiry_str, sig = decoded.rsplit("|", 2)
         payload  = f"{email}|{expiry_str}"
         expected = hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
@@ -255,31 +259,25 @@ def _verify_cookie(token: str) -> str | None:
         return None
 
 
-# ── Cookie manager (extra-streamlit-components) ───────────────
-try:
-    import extra_streamlit_components as stx
-    _cookie_mgr = stx.CookieManager(key="tracker_cookies")
-    _existing   = _cookie_mgr.get(COOKIE_NAME)
-except Exception:
-    _cookie_mgr = None
-    _existing   = None
-
-_cookie_email = _verify_cookie(_existing) if _existing else None
+# ── Read token from URL query param ──────────────────────────
+_url_token   = st.query_params.get("t", "")
+_token_email = _verify_token(_url_token) if _url_token else None
 
 # ── Session state defaults ────────────────────────────────────
-_defaults = {
-    "auth_verified": False, "auth_email": "",
+for k, v in {
+    "auth_verified": False, "auth_email": "", "auth_token": "",
     "otp_code": "", "otp_email": "", "otp_expiry": 0,
     "otp_sent": False, "otp_attempts": 0,
     "chat_history": [], "chat_pending": False,
-}
-for k, v in _defaults.items():
+}.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
-if _cookie_email and not st.session_state.auth_verified:
+# If valid token in URL, mark as verified
+if _token_email and not st.session_state.auth_verified:
     st.session_state.auth_verified = True
-    st.session_state.auth_email    = _cookie_email
+    st.session_state.auth_email    = _token_email
+    st.session_state.auth_token    = _url_token
 
 # ─────────────────────────────────────────────────────────────
 # LOGIN GATE
@@ -300,8 +298,8 @@ if not st.session_state.auth_verified:
         </div>""", unsafe_allow_html=True)
 
         if not st.session_state.otp_sent:
-            email_in = st.text_input("Email", placeholder="you@segaamerica.com",
-                                     label_visibility="collapsed", key="login_email")
+            email_in = st.text_input("Email address", placeholder="you@segaamerica.com",
+                                     label_visibility="collapsed", key="auth_email_input")
             if st.button("Send verification code", key="btn_send"):
                 addr = email_in.strip().lower()
                 if not addr.endswith(ALLOWED_DOMAIN):
@@ -318,25 +316,26 @@ if not st.session_state.auth_verified:
         else:
             st.info(f"Code sent to **{st.session_state.otp_email}** — check your inbox.")
             code_in = st.text_input("6-digit code", placeholder="123456",
-                                    label_visibility="collapsed", max_chars=6, key="login_code")
+                                    label_visibility="collapsed", max_chars=6, key="auth_code_input")
             if st.button("Verify code", key="btn_verify"):
                 if st.session_state.otp_attempts >= 5:
                     st.error("Too many attempts. Please request a new code.")
                     st.session_state.otp_sent = False
                 elif time.time() > st.session_state.otp_expiry:
-                    st.error("Code expired. Please request a new one.")
+                    st.error("Code has expired. Please request a new one.")
                     st.session_state.otp_sent = False
                 elif code_in.strip() != st.session_state.otp_code:
                     st.session_state.otp_attempts += 1
                     rem = 5 - st.session_state.otp_attempts
                     st.error(f"Incorrect code. {rem} attempt{'s' if rem != 1 else ''} remaining.")
                 else:
+                    # Success — generate token and inject into URL
                     st.session_state.auth_verified = True
                     st.session_state.auth_email    = st.session_state.otp_email
-                    st.session_state.otp_code      = ""   # clear from state
-                    if _cookie_mgr:
-                        tok = _sign_cookie(st.session_state.auth_email)
-                        _cookie_mgr.set(COOKIE_NAME, tok, expires_at=None, key="set_ck")
+                    st.session_state.otp_code      = ""
+                    _token = _make_token(st.session_state.auth_email)
+                    st.session_state.auth_token    = _token
+                    st.query_params["t"] = _token
                     st.rerun()
 
             if st.button("← Use a different email", key="btn_back"):
@@ -345,8 +344,8 @@ if not st.session_state.auth_verified:
                 st.rerun()
 
         st.markdown(
-            f'<div class="auth-note">Restricted to {ALLOWED_DOMAIN} only. '
-            f'Codes expire in 10 minutes.</div>',
+            f'<div class="auth-note">Restricted to {ALLOWED_DOMAIN} addresses only.<br>'
+            f'Codes expire after 10 minutes.</div>',
             unsafe_allow_html=True,
         )
     st.stop()
@@ -363,17 +362,21 @@ with st.sidebar:
         f'</div>', unsafe_allow_html=True,
     )
     if st.button("Sign out", key="sign_out"):
-        if _cookie_mgr:
-            _cookie_mgr.delete(COOKIE_NAME, key="del_ck")
-        for k in ["auth_verified", "auth_email", "otp_sent", "otp_code",
-                  "otp_email", "otp_expiry", "otp_attempts"]:
+        st.query_params.clear()
+        for k in ["auth_verified", "auth_email", "auth_token", "otp_sent",
+                  "otp_code", "otp_email", "otp_expiry", "otp_attempts"]:
             st.session_state[k] = False if k == "auth_verified" else ""
         st.rerun()
 
     st.markdown("---")
-    st.markdown("### 📁 Data Source")
-    uploaded = st.file_uploader("Upload Excel / CSV", type=["xlsx", "xls", "csv"],
-                                help="Upload the latest export of your tracker spreadsheet.")
+    st.markdown("### 📁 Fiscal Year")
+    fy_choice = st.radio(
+        "Select dataset",
+        ["FY26", "FY27"],
+        horizontal=True,
+        label_visibility="collapsed",
+        key="fy_choice",
+    )
     st.markdown("---")
 
 # ─────────────────────────────────────────────────────────────
@@ -384,7 +387,7 @@ st.markdown("""
 <div class="topbar">
   <div class="topbar-logo"><span class="seg">SEGA</span> SUBMISSION TRACKER</div>
   <div class="topbar-divider"></div>
-  <div class="topbar-label">Platform Operations · FY26</div>
+  <div class="topbar-label">Platform Operations</div>
   <div class="topbar-pill">Internal</div>
 </div>
 """, unsafe_allow_html=True)
@@ -439,6 +442,23 @@ def opts(series) -> list:
     return ["All"] + sorted(series.dropna().astype(str).unique())
 
 
+# ── Local CSV paths (relative to repo root) ───────────────────
+DATA_FILES = {
+    "FY26": "data/fy26.csv",
+    "FY27": "data/fy27.csv",
+}
+
+@st.cache_data(show_spinner=False)
+def load_local(path: str) -> pd.DataFrame:
+    """Load a bundled CSV from the repo, trying multiple encodings."""
+    for enc in ("utf-8", "utf-8-sig", "latin-1", "cp1252"):
+        try:
+            return load_data(open(path, "rb").read(), path)
+        except UnicodeDecodeError:
+            continue
+    return load_data(open(path, "rb").read(), path)
+
+
 # ─────────────────────────────────────────────────────────────
 # TABS
 # ─────────────────────────────────────────────────────────────
@@ -450,22 +470,20 @@ tab_dash, tab_chat = st.tabs(["📊  Dashboard", "💬  Ask Claude"])
 # ══════════════════════════════════════════════════════════════
 
 with tab_dash:
-    if uploaded is None:
-        st.markdown("""
-        <div style="text-align:center;padding:5rem 2rem;">
-          <div style="font-family:'Inter Tight',sans-serif;font-size:1.6rem;font-weight:900;
-                      letter-spacing:-.02em;color:var(--border-hi);">UPLOAD YOUR TRACKER FILE</div>
-          <div style="font-size:.88rem;color:var(--muted);max-width:420px;margin:.75rem auto;line-height:1.65;">
-            Use the sidebar uploader to load your Excel or CSV submission tracker.
-            <br><br><strong>Expected columns:</strong><br>
-            Codename · Product · Sub # · Ver # · Region · 1st Party · Platform ·
-            Product Code · Submitter · Sub Date · Result · Result Date · Days in Test ·
-            Fail Reason · Notes
-          </div>
-        </div>""", unsafe_allow_html=True)
-        st.stop()
+    fy = st.session_state.get("fy_choice", "FY26")
+    data_path = DATA_FILES[fy]
 
-    df_raw = load_data(uploaded.getvalue(), uploaded.name)
+    try:
+        df_raw = load_local(data_path)
+    except FileNotFoundError:
+        st.error(
+            f"Data file not found: `{data_path}`\n\n"
+            f"Make sure `{data_path}` exists in your repository."
+        )
+        st.stop()
+    except Exception as e:
+        st.error(f"Failed to load {data_path}: {e}")
+        st.stop()
 
     # ── Sidebar filters ───────────────────────────────────────
     with st.sidebar:
@@ -626,7 +644,7 @@ with tab_dash:
     st.download_button(
         "⬇️ Download filtered data (.xlsx)",
         data=buf.getvalue(),
-        file_name="filtered_submissions.xlsx",
+        file_name=f"{fy.lower()}_filtered_submissions.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
@@ -660,19 +678,17 @@ COOKIE_SIGNING_KEY     = "some-long-random-secret"
 
     # Build data context for Claude
     def _data_context() -> str:
-        if uploaded is None:
-            return "No data has been uploaded yet."
         try:
             snap = df.head(300).to_csv(index=False)
             return (
-                f"Submission tracker — {len(df)} rows after current filters.\n\n"
+                f"{fy} Submission tracker — {len(df)} rows after current filters.\n\n"
                 f"CSV sample (up to 300 rows):\n{snap}"
             )
         except Exception:
             return "Data available but could not be serialised."
 
     SYSTEM = f"""You are an internal data analyst for SEGA America's Platform Operations team.
-You help the team understand their FY26 1st-party submission tracker.
+You help the team understand their {fy} 1st-party submission tracker.
 
 {_data_context()}
 
@@ -729,7 +745,7 @@ If you cannot answer from the available data, say so clearly."""
 
 st.markdown("""
 <div class="footer">
-  <div class="footer-brand">SEGA SUBMISSION TRACKER · FY26</div>
+  <div class="footer-brand">SEGA SUBMISSION TRACKER</div>
   <div class="footer-note">Powered by Claude · Data processed locally · Internal use only</div>
 </div>
 """, unsafe_allow_html=True)
