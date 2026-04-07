@@ -373,16 +373,16 @@ claude_key = st.secrets.get("ANTHROPIC_API_KEY", "")
 # OTP / SES AUTH
 # ─────────────────────────────────────────────────────────────
 
-ALLOWED_DOMAIN     = "@segaamerica.com"
+ALLOWED_DOMAINS    = {"@segaamerica.com", "@sega.com", "@sega.co.uk"}
 OTP_EXPIRY_SECS    = 600   # 10 minutes
-COOKIE_EXPIRY_DAYS = 7
-COOKIE_NAME        = "sega_ratings_auth"
+TOKEN_EXPIRY_DAYS  = 7
 
 
 def _send_otp(email: str, code: str) -> bool:
     """Send a 6-digit OTP via AWS SES. Returns True on success."""
     try:
         import boto3
+        from botocore.exceptions import ClientError
         ses = boto3.client(
             "ses",
             region_name=st.secrets.get("AWS_SES_REGION", "us-east-1"),
@@ -419,25 +419,29 @@ def _send_otp(email: str, code: str) -> bool:
             },
         )
         return True
+    except ClientError as e:
+        st.error(f"SES error: {e.response['Error']['Message']}")
+        return False
     except Exception as e:
         st.error(f"Failed to send email: {e}")
         return False
 
 
-def _sign_cookie(email: str) -> str:
-    """Return a base64-encoded HMAC-signed token: email|expiry|signature."""
-    secret  = st.secrets.get("COOKIE_SIGNING_KEY", "change-this-secret")
-    expiry  = int(time.time()) + (COOKIE_EXPIRY_DAYS * 86400)
+# ── Token helpers (URL query param approach — no cookie library) ──
+def _make_token(email: str) -> str:
+    """Create a signed URL token: base64(email|expiry|hmac)."""
+    secret  = st.secrets.get("COOKIE_SIGNING_KEY", "fallback-change-this")
+    expiry  = int(time.time()) + (TOKEN_EXPIRY_DAYS * 86400)
     payload = f"{email}|{expiry}"
     sig     = hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
     return base64.urlsafe_b64encode(f"{payload}|{sig}".encode()).decode()
 
 
-def _verify_cookie(token: str) -> str | None:
-    """Verify signed cookie. Returns email if valid, else None."""
+def _verify_token(token: str) -> str | None:
+    """Verify token. Returns email if valid, None otherwise."""
     try:
-        secret  = st.secrets.get("COOKIE_SIGNING_KEY", "change-this-secret")
-        decoded = base64.urlsafe_b64decode(token.encode()).decode()
+        secret   = st.secrets.get("COOKIE_SIGNING_KEY", "fallback-change-this")
+        decoded  = base64.urlsafe_b64decode(token.encode()).decode()
         email, expiry_str, sig = decoded.rsplit("|", 2)
         payload  = f"{email}|{expiry_str}"
         expected = hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
@@ -450,23 +454,16 @@ def _verify_cookie(token: str) -> str | None:
         return None
 
 
-# ── Cookie manager ────────────────────────────────────────────
-try:
-    import extra_streamlit_components as stx
-    _cookie_mgr = stx.CookieManager(key="ratings_cookies")
-    _existing   = _cookie_mgr.get(COOKIE_NAME)
-except Exception:
-    _cookie_mgr = None
-    _existing   = None
-
-_cookie_email = _verify_cookie(_existing) if _existing else None
+# ── Read token from URL query param ──────────────────────────
+_url_token   = st.query_params.get("t", "")
+_token_email = _verify_token(_url_token) if _url_token else None
 
 # ─────────────────────────────────────────────────────────────
 # SESSION STATE
 # ─────────────────────────────────────────────────────────────
 
 for k, v in [
-    ("auth_verified", False), ("auth_email", ""),
+    ("auth_verified", False), ("auth_email", ""), ("auth_token", ""),
     ("otp_code", ""), ("otp_email", ""), ("otp_expiry", 0),
     ("otp_sent", False), ("otp_attempts", 0),
     ("chat_history", []), ("chat_pending", False), ("pending_prompt", ""),
@@ -474,9 +471,11 @@ for k, v in [
     if k not in st.session_state:
         st.session_state[k] = v
 
-if _cookie_email and not st.session_state.auth_verified:
+# If valid token in URL, mark as verified
+if _token_email and not st.session_state.auth_verified:
     st.session_state.auth_verified = True
-    st.session_state.auth_email    = _cookie_email
+    st.session_state.auth_email    = _token_email
+    st.session_state.auth_token    = _url_token
 
 # ─────────────────────────────────────────────────────────────
 # LOGIN GATE
@@ -496,12 +495,12 @@ if not st.session_state.auth_verified:
         </div>""", unsafe_allow_html=True)
 
         if not st.session_state.otp_sent:
-            email_in = st.text_input("Email", placeholder="you@segaamerica.com",
-                                     label_visibility="collapsed", key="login_email")
+            email_in = st.text_input("Email address", placeholder="you@segaamerica.com",
+                                     label_visibility="collapsed", key="auth_email_input")
             if st.button("Send verification code", key="btn_send"):
                 addr = email_in.strip().lower()
-                if not addr.endswith(ALLOWED_DOMAIN):
-                    st.error(f"Access restricted to {ALLOWED_DOMAIN} addresses.")
+                if not any(addr.endswith(d) for d in ALLOWED_DOMAINS):
+                    st.error("Access restricted to @segaamerica.com, @sega.com, and @sega.co.uk addresses.")
                 else:
                     code = str(random.randint(100000, 999999))
                     if _send_otp(addr, code):
@@ -514,25 +513,26 @@ if not st.session_state.auth_verified:
         else:
             st.info(f"Code sent to **{st.session_state.otp_email}** — check your inbox.")
             code_in = st.text_input("6-digit code", placeholder="123456",
-                                    label_visibility="collapsed", max_chars=6, key="login_code")
+                                    label_visibility="collapsed", max_chars=6, key="auth_code_input")
             if st.button("Verify code", key="btn_verify"):
                 if st.session_state.otp_attempts >= 5:
                     st.error("Too many attempts. Please request a new code.")
                     st.session_state.otp_sent = False
                 elif time.time() > st.session_state.otp_expiry:
-                    st.error("Code expired. Please request a new one.")
+                    st.error("Code has expired. Please request a new one.")
                     st.session_state.otp_sent = False
                 elif code_in.strip() != st.session_state.otp_code:
                     st.session_state.otp_attempts += 1
                     rem = 5 - st.session_state.otp_attempts
                     st.error(f"Incorrect code. {rem} attempt{'s' if rem != 1 else ''} remaining.")
                 else:
+                    # Success — generate token and inject into URL
                     st.session_state.auth_verified = True
                     st.session_state.auth_email    = st.session_state.otp_email
                     st.session_state.otp_code      = ""
-                    if _cookie_mgr:
-                        tok = _sign_cookie(st.session_state.auth_email)
-                        _cookie_mgr.set(COOKIE_NAME, tok, expires_at=None, key="set_ck")
+                    _token = _make_token(st.session_state.auth_email)
+                    st.session_state.auth_token    = _token
+                    st.query_params["t"] = _token
                     st.rerun()
 
             if st.button("← Use a different email", key="btn_back"):
@@ -541,8 +541,8 @@ if not st.session_state.auth_verified:
                 st.rerun()
 
         st.markdown(
-            f'<div class="auth-note">Restricted to {ALLOWED_DOMAIN} only. '
-            f'Codes expire in 10 minutes.</div>',
+            '<div class="auth-note">Restricted to @segaamerica.com, @sega.com, and @sega.co.uk.<br>'
+            'Codes expire after 10 minutes.</div>',
             unsafe_allow_html=True,
         )
     st.stop()
@@ -637,10 +637,9 @@ with st.sidebar:
         f'</div>', unsafe_allow_html=True,
     )
     if st.button("Sign out", key="sign_out"):
-        if _cookie_mgr:
-            _cookie_mgr.delete(COOKIE_NAME, key="del_ck")
-        for k in ["auth_verified", "auth_email", "otp_sent", "otp_code",
-                  "otp_email", "otp_expiry", "otp_attempts"]:
+        st.query_params.clear()
+        for k in ["auth_verified", "auth_email", "auth_token", "otp_sent",
+                  "otp_code", "otp_email", "otp_expiry", "otp_attempts"]:
             st.session_state[k] = False if k == "auth_verified" else ""
         st.rerun()
 
