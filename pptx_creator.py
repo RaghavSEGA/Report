@@ -1203,10 +1203,39 @@ with _tab_transfer:
             _tx_log("🤖 Extracting slide content with Claude…", "spin")
 
             # Build a text dump of the source
+            # Patterns that identify footer/watermark/chrome text to skip
+            _SKIP_PATTERNS = {
+                "SEGA POWERPOINT CREATOR", "SEGA INTELLIGENCE ANALYZER",
+                "POWERPOINT CREATOR", "INTELLIGENCE ANALYZER",
+                "SEGA CONFIDENTIAL", "CONFIDENTIAL",
+            }
+
+            def _is_footer_shape(shape, slide_w, slide_h):
+                """True if this shape looks like a footer/watermark (thin, near bottom or top edge)."""
+                if not shape.has_text_frame:
+                    return False
+                txt = shape.text_frame.text.strip().upper()
+                if not txt:
+                    return True  # blank shape
+                if txt in _SKIP_PATTERNS or any(p in txt for p in _SKIP_PATTERNS):
+                    return True
+                # Very thin shapes near slide bottom (bottom 10%) are usually footers
+                try:
+                    bottom = shape.top + shape.height
+                    if shape.height < slide_h * 0.07 and bottom > slide_h * 0.88:
+                        return True
+                except Exception:
+                    pass
+                return False
+
             src_dump_parts = []
             for i, slide in enumerate(src_prs.slides, 1):
                 lines = [f"SLIDE {i}"]
+                sw = src_prs.slide_width
+                sh = src_prs.slide_height
                 for shape in slide.shapes:
+                    if _is_footer_shape(shape, sw, sh):
+                        continue
                     if shape.has_text_frame:
                         for para in shape.text_frame.paragraphs:
                             t = para.text.strip()
@@ -1231,51 +1260,35 @@ with _tab_transfer:
 
             src_dump = "\n\n".join(src_dump_parts)
 
-            # Build a layout map from the template
-            tmpl_prs = _pptx_lib.Presentation(io.BytesIO(_tmpl_bytes))
-            layout_info = []
-            for j, layout in enumerate(tmpl_prs.slide_layouts):
-                ph_names = []
-                for ph in layout.placeholders:
-                    ph_names.append(f"idx={ph.placeholder_format.idx} type={ph.placeholder_format.type} name={ph.name}")
-                layout_info.append(f"LAYOUT {j}: {layout.name} | placeholders: {'; '.join(ph_names) or 'none'}")
-            layout_dump = "\n".join(layout_info)
-
             n_src_slides = len(src_prs.slides)
-            n_layouts    = len(tmpl_prs.slide_layouts)
 
-            xfer_prompt = f"""You are a presentation editor. Given a source presentation's content and a target template's available layouts, produce a JSON mapping.
+            xfer_prompt = f"""You are a presentation editor. Extract and rewrite the content of each source slide for a new context.
 
 SOURCE SLIDES (total {n_src_slides}):
 {src_dump}
 
-TARGET TEMPLATE LAYOUTS (total {n_layouts}):
-{layout_dump}
+For each source slide produce a JSON object with:
+- "slide": slide number (1-based)
+- "placeholders": dict where key "0" = slide title, key "1" = all body content as newline-separated lines
+- "speaker_notes": verbatim speaker notes if present, else ""
 
-For each source slide, output a JSON object in the array below. Choose the best-matching layout index from the target template. Extract all text for each placeholder. If the slide has a chart, include chart_title, categories, and series.
-
-Return ONLY a valid JSON array (no markdown, no explanation):
+Return ONLY a valid JSON array, no markdown, no explanation:
 [
   {{
     "slide": 1,
-    "layout_idx": 0,
     "placeholders": {{
-      "0": "Title text here",
-      "1": "Body / subtitle text here"
+      "0": "Title text",
+      "1": "Line 1\\nLine 2\\nLine 3"
     }},
-    "chart_title": "",
-    "chart_categories": [],
-    "chart_series": [],
     "speaker_notes": ""
   }}
 ]
 
 Rules:
-- layout_idx must be a valid index (0 to {n_layouts - 1})
-- Use placeholder idx as the key in "placeholders"
-- Bullet lists go in the body placeholder, separated by \\n
-- Keep all factual content — do not invent or summarise
-- speaker_notes: copy verbatim from source if present, else ""
+- Keep ALL factual content — do not invent, summarise or drop data
+- "0" must be the slide title only (short, no bullets)
+- "1" contains all body text as newline-separated lines (strip leading bullet chars)
+- speaker_notes: copy verbatim from source NOTES lines if present
 """
             client = _make_anthropic_client()
             xfer_resp = client.messages.create(
@@ -1290,179 +1303,178 @@ Rules:
             slide_map = json.loads(raw_xfer)
             _tx_log(f"✅ Content mapped — {len(slide_map)} slides", "log")
 
-            # ── Build output PPTX from template ───────────────────────────────
+            # ── Build output PPTX by cloning source slides + replacing text ────
+            # Strategy: copy the source PPTX as a ZIP, then for each slide
+            # do an XML text-node replacement of old→new content.
+            # This preserves ALL backgrounds, images, shapes, and master graphics.
             _tx_log("🖥️ Building new PPTX…", "spin")
-            out_prs = _pptx_lib.Presentation(io.BytesIO(_tmpl_bytes))
 
-            from pptx.util import Inches, Pt, Emu
-            from pptx.dml.color import RGBColor
-            from pptx.enum.text import PP_ALIGN
-            import lxml.etree as etree
+            import zipfile, copy, re as _re
+            import lxml.etree as _etree
 
-            # Slide dimensions
-            SW = out_prs.slide_width
-            SH = out_prs.slide_height
-
-            # Remove any default blank slides that came with the template
-            _R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
-            while len(out_prs.slides) > 0:
-                sldId_el = out_prs.slides._sldIdLst[0]
-                rId = sldId_el.get(f"{{{_R_NS}}}id") or sldId_el.get("r:id")
-                if rId:
-                    try:
-                        out_prs.part.drop_rel(rId)
-                    except Exception:
-                        pass
-                del out_prs.slides._sldIdLst[0]
-
-            layouts = out_prs.slide_layouts
-
-            def _add_textbox(slide, left, top, width, height,
-                             text, font_size=18, bold=False,
-                             color="FFFFFF", align=PP_ALIGN.LEFT,
-                             word_wrap=True):
-                """Add a text box with given content and style."""
-                txBox = slide.shapes.add_textbox(
-                    Emu(left), Emu(top), Emu(width), Emu(height)
-                )
-                tf = txBox.text_frame
-                tf.word_wrap = word_wrap
-                tf.auto_size = None
-                p = tf.paragraphs[0]
-                p.alignment = align
-                run = p.add_run()
-                run.text = str(text)
-                run.font.size = Pt(font_size)
-                run.font.bold = bold
-                run.font.color.rgb = RGBColor.from_string(color)
-                return txBox
-
-            def _add_bullets(slide, left, top, width, height,
-                              lines, font_size=14, color="D0E4FF",
-                              bullet_color="00CCFF"):
-                """Add a text box with bullet lines."""
-                txBox = slide.shapes.add_textbox(
-                    Emu(left), Emu(top), Emu(width), Emu(height)
-                )
-                tf = txBox.text_frame
-                tf.word_wrap = True
-                for i, line in enumerate(lines):
-                    if not line.strip():
+            # First build a per-slide old→new text replacement map from slide_map
+            # We need to know what text was on each source slide so we can replace it
+            # Re-extract source slide texts (same logic as above, already done in src_dump)
+            src_slide_texts = []  # list of lists of (shape_idx, para_idx, old_text)
+            for slide in src_prs.slides:
+                slide_texts = []
+                sw, sh = src_prs.slide_width, src_prs.slide_height
+                for si, shape in enumerate(slide.shapes):
+                    if _is_footer_shape(shape, sw, sh):
                         continue
-                    p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
-                    p.space_before = Pt(3)
-                    p.alignment = PP_ALIGN.LEFT
-                    run = p.add_run()
-                    # Strip leading bullet chars if present
-                    clean = line.lstrip("•·-– ").strip()
-                    run.text = f"▸  {clean}"
-                    run.font.size = Pt(font_size)
-                    run.font.color.rgb = RGBColor.from_string(color)
-                return txBox
+                    if shape.has_text_frame:
+                        for pi, para in enumerate(shape.text_frame.paragraphs):
+                            t = para.text.strip()
+                            if t:
+                                slide_texts.append(t)
+                src_slide_texts.append(slide_texts)
 
-            # Layout regions (as fractions of slide size)
-            # Title zone: top strip ~15% height
-            # Body zone: remaining ~75% height with margins
-            MARGIN   = int(SW * 0.05)   # 5% side margin
-            T_TOP    = int(SH * 0.06)
-            T_HEIGHT = int(SH * 0.15)
-            T_WIDTH  = int(SW * 0.90)
-            B_TOP    = int(SH * 0.24)
-            B_HEIGHT = int(SH * 0.68)
-            B_WIDTH  = int(SW * 0.90)
+            # Open source as ZIP and clone it
+            src_zip_buf  = io.BytesIO(_src_bytes)
+            out_zip_buf  = io.BytesIO()
 
-            for entry in slide_map:
-                layout_idx = min(int(entry.get("layout_idx", 0)), len(layouts) - 1)
-                layout     = layouts[layout_idx]
-                new_slide  = out_prs.slides.add_slide(layout)
+            # Helper: given new content for a slide, build a flat list of replacement strings
+            def _new_texts_for_entry(entry):
+                ph = entry.get("placeholders", {})
+                # Clean footer lines
+                cleaned = {}
+                for k, v in ph.items():
+                    lines_out = []
+                    for ln in str(v).split("\n"):
+                        up = ln.strip().upper().lstrip("▸►•·▶➤➜–—- ")
+                        if any(pat in up for pat in _SKIP_PATTERNS):
+                            continue
+                        if ln.strip():
+                            lines_out.append(ln.strip())
+                    cleaned[k] = lines_out
+                # Flatten all values into ordered list
+                result = []
+                for k in sorted(cleaned.keys(), key=lambda x: int(x) if x.isdigit() else 999):
+                    result.extend(cleaned[k])
+                return result
 
-                # Gather all text content
-                ph_data   = entry.get("placeholders", {})
-                all_texts = [str(v).strip() for v in ph_data.values() if str(v).strip()]
+            # XML namespace for DrawingML text runs
+            _A_NS  = "http://schemas.openxmlformats.org/drawingml/2006/main"
+            _T_TAG = f"{{{_A_NS}}}t"
 
-                # Heuristic: longest short string is title, rest is body
-                title_text = ""
-                body_lines = []
+            def _replace_texts_in_xml(xml_bytes, old_texts, new_texts):
+                """
+                In the slide XML, replace text runs in order.
+                old_texts: flat list of strings that were on the slide
+                new_texts: flat list of replacement strings
+                Skips footer/watermark strings. Extra old texts get blanked.
+                Extra new texts are ignored (no room).
+                """
+                try:
+                    root = _etree.fromstring(xml_bytes)
+                except Exception:
+                    return xml_bytes
 
-                if all_texts:
-                    # Title = first value (Claude puts title in idx "0")
-                    title_text = ph_data.get("0", "") or all_texts[0]
-                    # Body = idx "1" or everything else joined
-                    raw_body = ph_data.get("1", "")
-                    if not raw_body:
-                        raw_body = "\n".join(all_texts[1:])
-                    body_lines = [l for l in str(raw_body).split("\n") if l.strip()]
+                # Collect all <a:t> elements that have non-empty text
+                # and don't match footer patterns
+                t_nodes = []
+                for node in root.iter(_T_TAG):
+                    txt = (node.text or "").strip()
+                    if not txt:
+                        continue
+                    up = txt.upper().lstrip("▸►•·▶➤➜–—- ")
+                    if any(pat in up for pat in _SKIP_PATTERNS):
+                        node.text = ""
+                        continue
+                    t_nodes.append(node)
 
-                # Try to fill standard placeholders first (works for normal templates)
-                filled_ph = set()
-                for ph in new_slide.placeholders:
-                    idx_str = str(ph.placeholder_format.idx)
-                    text = ph_data.get(idx_str, "")
-                    if text and ph.has_text_frame:
-                        tf = ph.text_frame
-                        tf.clear()
-                        lines = str(text).split("\n")
-                        for li, line in enumerate(lines):
-                            para = tf.paragraphs[0] if li == 0 else tf.add_paragraph()
-                            para.text = line
-                        filled_ph.add(idx_str)
+                # Match old_texts to t_nodes by position
+                # For each old text, find the t_node that contains it and replace
+                new_idx = 0
+                used = set()
+                for oi, old in enumerate(old_texts):
+                    if new_idx >= len(new_texts):
+                        # No more new content — blank remaining old text nodes
+                        for node in t_nodes:
+                            if id(node) not in used and old in (node.text or ""):
+                                node.text = ""
+                                used.add(id(node))
+                                break
+                        continue
+                    # Find the first unused t_node whose text matches or is substring
+                    for node in t_nodes:
+                        if id(node) in used:
+                            continue
+                        if old in (node.text or "") or (node.text or "") in old:
+                            node.text = new_texts[new_idx]
+                            used.add(id(node))
+                            new_idx += 1
+                            break
 
-                # If no placeholders were filled (custom/graphic template),
-                # add text boxes directly onto the slide
-                if not filled_ph:
-                    if title_text:
-                        _add_textbox(
-                            new_slide,
-                            left=MARGIN, top=T_TOP,
-                            width=T_WIDTH, height=T_HEIGHT,
-                            text=title_text,
-                            font_size=28, bold=True,
-                            color="FFFFFF",
-                            align=PP_ALIGN.LEFT,
-                        )
-                    if body_lines:
-                        _add_bullets(
-                            new_slide,
-                            left=MARGIN, top=B_TOP,
-                            width=B_WIDTH, height=B_HEIGHT,
-                            lines=body_lines,
-                            font_size=15,
-                            color="D0E4FF",
-                        )
-                    elif len(all_texts) > 1:
-                        # Plain body text (subtitle, stats, etc.)
-                        body_text = "\n".join(all_texts[1:])
-                        _add_textbox(
-                            new_slide,
-                            left=MARGIN, top=B_TOP,
-                            width=B_WIDTH, height=B_HEIGHT,
-                            text=body_text,
-                            font_size=16, bold=False,
-                            color="D0E4FF",
-                        )
+                return _etree.tostring(root, xml_declaration=True,
+                                       encoding="UTF-8", standalone=True)
 
-                # Speaker notes
-                notes_text = entry.get("speaker_notes", "")
-                if notes_text and _tx_notes:
-                    try:
-                        new_slide.notes_slide.notes_text_frame.text = str(notes_text)
-                    except Exception:
-                        pass
+            with zipfile.ZipFile(src_zip_buf, "r") as zin, \
+                 zipfile.ZipFile(out_zip_buf, "w", zipfile.ZIP_DEFLATED) as zout:
+
+                all_names = zin.namelist()
+                # Find slide XML files in order
+                slide_xmls = sorted(
+                    [n for n in all_names
+                     if _re.match(r"ppt/slides/slide\d+\.xml$", n)],
+                    key=lambda x: int(_re.search(r"\d+", x.split("/")[-1]).group())
+                )
+
+                for name in all_names:
+                    data = zin.read(name)
+
+                    if name in slide_xmls:
+                        slide_i = slide_xmls.index(name)  # 0-based
+                        if slide_i < len(slide_map):
+                            entry     = slide_map[slide_i]
+                            old_texts = src_slide_texts[slide_i] if slide_i < len(src_slide_texts) else []
+                            new_texts = _new_texts_for_entry(entry)
+                            data = _replace_texts_in_xml(data, old_texts, new_texts)
+
+                            # Handle speaker notes in the notes XML
+                            notes_name = f"ppt/notesSlides/notesSlide{slide_i+1}.xml"
+                            notes_text = entry.get("speaker_notes", "")
+                            # (notes are written below when we encounter the notes file)
+
+                    zout.writestr(name, data)
+
+            # Now re-open the output ZIP to patch notes slides
+            if any(entry.get("speaker_notes") for entry in slide_map):
+                _tx_log("📝 Writing speaker notes…", "spin")
+                out_zip_buf.seek(0)
+                tmp_buf = io.BytesIO()
+                with zipfile.ZipFile(out_zip_buf, "r") as zin2, \
+                     zipfile.ZipFile(tmp_buf, "w", zipfile.ZIP_DEFLATED) as zout2:
+                    for name in zin2.namelist():
+                        data = zin2.read(name)
+                        m = _re.match(r"ppt/notesSlides/notesSlide(\d+)\.xml$", name)
+                        if m:
+                            idx = int(m.group(1)) - 1
+                            if idx < len(slide_map):
+                                nt = slide_map[idx].get("speaker_notes", "")
+                                if nt and _tx_notes:
+                                    try:
+                                        root = _etree.fromstring(data)
+                                        for node in root.iter(_T_TAG):
+                                            if node.text and node.text.strip():
+                                                node.text = nt
+                                                nt = ""  # only replace first text node
+                                        data = _etree.tostring(
+                                            root, xml_declaration=True,
+                                            encoding="UTF-8", standalone=True)
+                                    except Exception:
+                                        pass
+                        zout2.writestr(name, data)
+                out_zip_buf = tmp_buf
+
+            out_bytes = out_zip_buf.getvalue()
 
             # ── Save output ────────────────────────────────────────────────────
-            _tx_log("💾 Finalising…", "spin")
-            out_buf = io.BytesIO()
-            out_prs.save(out_buf)
-            out_bytes = out_buf.getvalue()
-
             _tx_fname = _tx_source.name.rsplit(".", 1)[0] + "_transferred.pptx"
             st.session_state["tx_pptx_bytes"]    = out_bytes
             st.session_state["tx_pptx_filename"] = _tx_fname
 
-            _tx_log(
-                f"✅ Done — {len(slide_map)} slides transferred to new template",
-                "log",
-            )
+            _tx_log(f"✅ Done — {len(slide_map)} slides transferred", "log")
             _tx_out_area.download_button(
                 "⬇️ Download converted PPTX",
                 data=out_bytes,
