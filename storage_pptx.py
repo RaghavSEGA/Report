@@ -118,7 +118,10 @@ def get_projects(owner: str) -> list:
                    FROM pptx_projects WHERE owner = %s ORDER BY name""",
                 (owner,)
             )
-            return [dict(r) for r in cur.fetchall()]
+            return [
+                {**dict(r), "updated_at": r["updated_at"].isoformat() if r["updated_at"] else ""}
+                for r in cur.fetchall()
+            ]
 
 
 def project_exists(owner: str, name: str) -> bool:
