@@ -769,6 +769,11 @@ def _load_project(owner: str, name: str):
     st.session_state["plan_chat"]           = data.get("plan_chat", [])
     st.session_state["pptx_bytes"]          = data.get("pptx_bytes") or None
     st.session_state["saved_template_bytes"] = data.get("template_bytes") or None
+    # Remove the key entirely if None so download buttons stay hidden
+    if st.session_state["pptx_bytes"] is None:
+        st.session_state.pop("pptx_bytes", None)
+    if st.session_state["saved_template_bytes"] is None:
+        st.session_state.pop("saved_template_bytes", None)
     if st.session_state["plan_slide_data"]:
         st.session_state["plan_mode_active"] = True
 
@@ -1030,7 +1035,7 @@ with _tab_pdf:
                                 type="primary", disabled=not _pdf_file)
     with _pdf_out:
         _pdf_area = st.empty()
-        if "pdf_pptx_bytes" in st.session_state:
+        if st.session_state.get("pdf_pptx_bytes"):
             _pdf_area.download_button(
                 "⬇️ Download editable PPTX",
                 data=st.session_state["pdf_pptx_bytes"],
@@ -1142,7 +1147,7 @@ with _tab_transfer:
         _tx_out_area = st.empty()
         _tx_log_area = st.empty()
 
-        if "tx_pptx_bytes" in st.session_state and not _tx_btn:
+        if st.session_state.get("tx_pptx_bytes") and not _tx_btn:
             _tx_out_area.download_button(
                 "⬇️ Download converted PPTX",
                 data=st.session_state["tx_pptx_bytes"],
@@ -1562,7 +1567,7 @@ The pipeline will:<br>
 </div>
 """, unsafe_allow_html=True)
 
-        if "pptx_bytes" in st.session_state and not run_btn:
+        if st.session_state.get("pptx_bytes") and not run_btn:
             download_area.download_button(
                 "⬇️ Download previous PPTX",
                 data=st.session_state["pptx_bytes"],
@@ -1662,7 +1667,7 @@ The pipeline will:<br>
                 with output_area.container():
                     _render_plan_modal(st.session_state.get("template_upload"))
 
-            if "pptx_bytes" in st.session_state:
+            if st.session_state.get("pptx_bytes"):
                 with download_area.container():
                     st.success("Presentation ready!")
                     st.download_button(
