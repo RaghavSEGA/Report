@@ -707,14 +707,18 @@ If you cannot answer from the available data, say so clearly."""
         st.session_state.chat_pending = False
         try:
             import anthropic
-            client   = anthropic.Anthropic(api_key=claude_key)
+            client = anthropic.AnthropicBedrock(
+    aws_access_key   = st.secrets.get("AWS_ACCESS_KEY_ID_API", ""),
+    aws_secret_key   = st.secrets.get("AWS_SECRET_ACCESS_KEY_API", ""),
+    aws_region       = st.secrets.get("AWS_BEDROCK_REGION", "us-east-1"),
+)
             api_msgs = [{"role": m["role"], "content": m["content"]}
                         for m in st.session_state.chat_history]
             with st.chat_message("assistant"):
                 reply = ""
                 ph    = st.empty()
                 with client.messages.stream(
-                    model="claude-sonnet-4-20250514",
+                    model="us.anthropic.claude-sonnet-4-6",
                     max_tokens=1024,
                     system=SYSTEM,
                     messages=api_msgs,
