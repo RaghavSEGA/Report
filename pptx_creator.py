@@ -888,7 +888,11 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-_tab_main, _tab_pdf = st.tabs(["📊 Create Presentation", "📄 PDF → Editable PPTX"])
+_tab_main, _tab_pdf, _tab_transfer = st.tabs([
+    "📊 Create Presentation",
+    "📄 PDF → Editable PPTX",
+    "🔄 Template Transfer",
+])
 
 with _tab_pdf:
     st.markdown(
@@ -952,6 +956,296 @@ with _tab_pdf:
             st.rerun()
         except Exception as _ex:
             st.error(f"Conversion failed: {_ex}")
+
+with _tab_transfer:
+    st.markdown(
+        "<div style='font-size:.85rem;color:#94a3b8;margin-bottom:1.25rem'>"
+        "Re-skin an existing presentation into a new template. Upload your source "
+        "<code>.pptx</code> and a target template — Claude will map every slide's "
+        "content (text, bullets, speaker notes, chart titles) into the new layout, "
+        "preserving the narrative while adopting the new brand."
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+    _tx_col1, _tx_col2 = st.columns(2, gap="large")
+    with _tx_col1:
+        st.markdown(
+            "<div style='font-size:.72rem;font-weight:700;letter-spacing:.07em;"
+            "text-transform:uppercase;color:#6366f1;margin-bottom:.4rem'>"
+            "Source presentation</div>",
+            unsafe_allow_html=True,
+        )
+        _tx_source = st.file_uploader(
+            "Source PPTX", type=["pptx"],
+            label_visibility="hidden", key="tx_source_upload",
+        )
+        st.markdown(
+            "<div style='font-size:.72rem;font-weight:700;letter-spacing:.07em;"
+            "text-transform:uppercase;color:#6366f1;margin:.9rem 0 .4rem'>"
+            "Target template</div>",
+            unsafe_allow_html=True,
+        )
+        _tx_template = st.file_uploader(
+            "Target template PPTX", type=["pptx"],
+            label_visibility="hidden", key="tx_template_upload",
+        )
+        st.markdown(
+            "<div style='font-size:.72rem;font-weight:700;letter-spacing:.07em;"
+            "text-transform:uppercase;color:#6366f1;margin:.9rem 0 .4rem'>"
+            "Options</div>",
+            unsafe_allow_html=True,
+        )
+        _tx_model = st.selectbox(
+            "Model", ["claude-sonnet-4-5", "claude-opus-4-5", "claude-haiku-4-5-20251001"],
+            key="tx_model",
+        )
+        _tx_preserve_charts = st.checkbox(
+            "Preserve chart data", value=True,
+            help="Keep chart categories and series values from the source.",
+            key="tx_preserve_charts",
+        )
+        _tx_notes = st.checkbox(
+            "Copy speaker notes", value=True,
+            help="Transfer speaker notes to matching slides.",
+            key="tx_notes",
+        )
+        _tx_btn = st.button(
+            "⚡ Transfer to new template",
+            use_container_width=True, type="primary",
+            disabled=not (_tx_source and _tx_template),
+            key="tx_run_btn",
+        )
+
+    with _tx_col2:
+        st.markdown(
+            "<div style='font-size:.72rem;font-weight:700;letter-spacing:.07em;"
+            "text-transform:uppercase;color:#6366f1;margin-bottom:.4rem'>"
+            "Output</div>",
+            unsafe_allow_html=True,
+        )
+        _tx_out_area = st.empty()
+        _tx_log_area = st.empty()
+
+        if "tx_pptx_bytes" in st.session_state and not _tx_btn:
+            _tx_out_area.download_button(
+                "⬇️ Download converted PPTX",
+                data=st.session_state["tx_pptx_bytes"],
+                file_name=st.session_state.get("tx_pptx_filename", "transferred.pptx"),
+                mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                use_container_width=True,
+            )
+        elif not _tx_btn:
+            _tx_out_area.markdown(
+                "<div class='status-card'>"
+                "<div class='status-card-label'>How it works</div>"
+                "<div style='color:#475569;font-size:.82rem;line-height:1.9'>"
+                "1. Upload your existing presentation<br>"
+                "2. Upload the target brand template<br>"
+                "3. Claude extracts all content from the source<br>"
+                "4. Remaps each slide into the best-matching layout<br>"
+                "5. Delivers a fully styled PPTX in the new template"
+                "</div></div>",
+                unsafe_allow_html=True,
+            )
+
+    # ── Transfer handler ───────────────────────────────────────────────────────
+    if _tx_btn and _tx_source and _tx_template:
+        _tx_logs = []
+
+        def _tx_log(msg: str, kind: str = "log"):
+            _tx_logs.append((kind, msg))
+            _tx_log_area.markdown(
+                "<div style='background:#0f172a;border:1px solid #1e293b;border-radius:8px;"
+                "padding:.85rem 1.1rem;font-size:.8rem;font-family:monospace;color:#94a3b8;"
+                "max-height:360px;overflow-y:auto;line-height:1.75'>"
+                + "".join(
+                    f"<div style='border-left:2px solid "
+                    f"{'#6366f1' if k=='spin' else '#1e3a5f'};padding-left:.6rem;"
+                    f"margin-bottom:.35rem'>{m}</div>"
+                    for k, m in _tx_logs[-12:]
+                )
+                + "</div>",
+                unsafe_allow_html=True,
+            )
+
+        try:
+            import pptx as _pptx_lib
+            from pptx.util import Inches, Pt, Emu
+            from pptx.enum.text import PP_ALIGN
+            import copy, textwrap
+
+            _tx_log("📂 Reading source presentation…", "spin")
+            _tx_source.seek(0)
+            _src_bytes = _tx_source.read()
+            src_prs = _pptx_lib.Presentation(io.BytesIO(_src_bytes))
+
+            _tx_log("🎨 Reading target template…", "spin")
+            _tx_template.seek(0)
+            _tmpl_bytes = _tx_template.read()
+
+            # ── Extract content from source via Claude ─────────────────────────
+            _tx_log("🤖 Extracting slide content with Claude…", "spin")
+
+            # Build a text dump of the source
+            src_dump_parts = []
+            for i, slide in enumerate(src_prs.slides, 1):
+                lines = [f"SLIDE {i}"]
+                for shape in slide.shapes:
+                    if shape.has_text_frame:
+                        for para in shape.text_frame.paragraphs:
+                            t = para.text.strip()
+                            if t:
+                                lines.append(f"  TEXT: {t}")
+                    if hasattr(shape, "chart"):
+                        try:
+                            chart = shape.chart
+                            lines.append(f"  CHART_TYPE: {chart.chart_type}")
+                            lines.append(f"  CHART_TITLE: {chart.has_title and chart.chart_title.text_frame.text or ''}")
+                            for series in chart.series:
+                                vals = [str(v) for v in series.values]
+                                lines.append(f"  SERIES: {series.name} = {', '.join(vals[:8])}")
+                        except Exception:
+                            pass
+                if slide.has_notes_slide and _tx_notes:
+                    notes_tf = slide.notes_slide.notes_text_frame
+                    notes_t = notes_tf.text.strip() if notes_tf else ""
+                    if notes_t:
+                        lines.append(f"  NOTES: {notes_t}")
+                src_dump_parts.append("\n".join(lines))
+
+            src_dump = "\n\n".join(src_dump_parts)
+
+            # Build a layout map from the template
+            tmpl_prs = _pptx_lib.Presentation(io.BytesIO(_tmpl_bytes))
+            layout_info = []
+            for j, layout in enumerate(tmpl_prs.slide_layouts):
+                ph_names = []
+                for ph in layout.placeholders:
+                    ph_names.append(f"idx={ph.placeholder_format.idx} type={ph.placeholder_format.type} name={ph.name}")
+                layout_info.append(f"LAYOUT {j}: {layout.name} | placeholders: {'; '.join(ph_names) or 'none'}")
+            layout_dump = "\n".join(layout_info)
+
+            n_src_slides = len(src_prs.slides)
+            n_layouts    = len(tmpl_prs.slide_layouts)
+
+            xfer_prompt = f"""You are a presentation editor. Given a source presentation's content and a target template's available layouts, produce a JSON mapping.
+
+SOURCE SLIDES (total {n_src_slides}):
+{src_dump}
+
+TARGET TEMPLATE LAYOUTS (total {n_layouts}):
+{layout_dump}
+
+For each source slide, output a JSON object in the array below. Choose the best-matching layout index from the target template. Extract all text for each placeholder. If the slide has a chart, include chart_title, categories, and series.
+
+Return ONLY a valid JSON array (no markdown, no explanation):
+[
+  {{
+    "slide": 1,
+    "layout_idx": 0,
+    "placeholders": {{
+      "0": "Title text here",
+      "1": "Body / subtitle text here"
+    }},
+    "chart_title": "",
+    "chart_categories": [],
+    "chart_series": [],
+    "speaker_notes": ""
+  }}
+]
+
+Rules:
+- layout_idx must be a valid index (0 to {n_layouts - 1})
+- Use placeholder idx as the key in "placeholders"
+- Bullet lists go in the body placeholder, separated by \\n
+- Keep all factual content — do not invent or summarise
+- speaker_notes: copy verbatim from source if present, else ""
+"""
+            client = _make_anthropic_client()
+            xfer_resp = client.messages.create(
+                model=_tx_model, max_tokens=8000,
+                system="Return only valid JSON. No markdown fences.",
+                messages=[{"role": "user", "content": xfer_prompt}],
+            )
+            raw_xfer = xfer_resp.content[0].text.strip()
+            if raw_xfer.startswith("```"):
+                raw_xfer = raw_xfer.split("\n", 1)[1].rsplit("```", 1)[0]
+
+            slide_map = json.loads(raw_xfer)
+            _tx_log(f"✅ Content mapped — {len(slide_map)} slides", "log")
+
+            # ── Build output PPTX from template ───────────────────────────────
+            _tx_log("🖥️ Building new PPTX…", "spin")
+            out_prs = _pptx_lib.Presentation(io.BytesIO(_tmpl_bytes))
+
+            # Remove any default blank slides that came with the template
+            xml_slides = out_prs.slides._sldIdLst
+            while len(out_prs.slides) > 0:
+                rId = out_prs.slides._sldIdLst[0].get("r:id")
+                out_prs.part.drop_rel(rId)
+                del out_prs.slides._sldIdLst[0]
+
+            layouts = out_prs.slide_layouts
+
+            for entry in slide_map:
+                layout_idx = min(int(entry.get("layout_idx", 0)), len(layouts) - 1)
+                layout     = layouts[layout_idx]
+                new_slide  = out_prs.slides.add_slide(layout)
+
+                placeholders_data = entry.get("placeholders", {})
+                for ph in new_slide.placeholders:
+                    ph_idx = str(ph.placeholder_format.idx)
+                    text   = placeholders_data.get(ph_idx, "")
+                    if text and ph.has_text_frame:
+                        tf = ph.text_frame
+                        tf.clear()
+                        lines = str(text).split("\n")
+                        for li, line in enumerate(lines):
+                            if li == 0:
+                                tf.paragraphs[0].text = line
+                            else:
+                                p = tf.add_paragraph()
+                                p.text = line
+
+                # Speaker notes
+                notes_text = entry.get("speaker_notes", "")
+                if notes_text and _tx_notes:
+                    try:
+                        notes_slide = new_slide.notes_slide
+                        notes_slide.notes_text_frame.text = str(notes_text)
+                    except Exception:
+                        pass
+
+            # ── Save output ────────────────────────────────────────────────────
+            _tx_log("💾 Finalising…", "spin")
+            out_buf = io.BytesIO()
+            out_prs.save(out_buf)
+            out_bytes = out_buf.getvalue()
+
+            _tx_fname = _tx_source.name.rsplit(".", 1)[0] + "_transferred.pptx"
+            st.session_state["tx_pptx_bytes"]    = out_bytes
+            st.session_state["tx_pptx_filename"] = _tx_fname
+
+            _tx_log(
+                f"✅ Done — {len(slide_map)} slides transferred to new template",
+                "log",
+            )
+            _tx_out_area.download_button(
+                "⬇️ Download converted PPTX",
+                data=out_bytes,
+                file_name=_tx_fname,
+                mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                use_container_width=True,
+            )
+
+        except json.JSONDecodeError as _je:
+            st.error(f"Failed to parse Claude's layout mapping: {_je}")
+        except Exception as _te:
+            import traceback
+            st.error(f"Template transfer failed: {_te}")
+            st.code(traceback.format_exc())
+
 
 with _tab_main:
     col_left, col_right = st.columns([1.1, 0.9], gap="large")
