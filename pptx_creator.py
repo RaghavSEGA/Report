@@ -25,8 +25,6 @@ from pptxruns import (
     extract_text_from_file,
     _make_anthropic_client,
     _render_plan_modal,
-    _sign_cookie, _verify_cookie,
-    _send_otp,
 )
 
 # ── Storage ───────────────────────────────────────────────────────────────────
@@ -39,9 +37,8 @@ _init_db()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 _MAX_DOC_CHARS     = 60_000
-COOKIE_EXPIRY_DAYS = 7
-COOKIE_NAME        = "pptx_creator_auth"
 OTP_EXPIRY_SECS    = 600
+COOKIE_EXPIRY_DAYS = 1  # kept for storage_pptx compatibility
 
 # Auth: set ALLOWED_DOMAIN in secrets to restrict (e.g. "@mycompany.com")
 # Leave blank or omit to allow any email address.
@@ -74,47 +71,105 @@ THEME_PRESETS = {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Auth helpers (cookie rolling, OTP — same pattern as pptxruns)
+# Auth — URL query-param token (no cookie library needed)
+# Same pattern as documentcompare.py
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _auth_gate():
-    """
-    Show login UI if not authenticated. Returns True if authenticated.
-    Handles: cookie check, OTP send, OTP verify.
-    """
-    # Init cookie manager
-    _cm = None
-    _existing = None
+OTP_EXPIRY_SECS    = 600   # 10 minutes
+TOKEN_EXPIRY_DAYS  = 1     # token survives 1 day in the URL
+
+def _send_otp(email: str, code: str) -> bool:
+    """Send OTP via AWS SES. Returns True on success."""
     try:
-        import extra_streamlit_components as stx
-        _cm = stx.CookieManager(key="pptx_creator_cookies")
-        _existing = _cm.get(COOKIE_NAME)
-    except Exception:
-        pass
-
-    _cookie_email = _verify_cookie(_existing) if _existing else None
-
-    for k, v in [
-        ("auth_verified", False), ("auth_email", ""),
-        ("otp_code", ""), ("otp_email", ""), ("otp_expiry", 0),
-        ("otp_sent", False), ("otp_attempts", 0),
-    ]:
-        if k not in st.session_state:
-            st.session_state[k] = v
-
-    if _cookie_email and not st.session_state.auth_verified:
-        st.session_state.auth_verified = True
-        st.session_state.auth_email    = _cookie_email
-        # Roll cookie
-        if _cm:
-            _cm.set(COOKIE_NAME, _sign_cookie(_cookie_email),
-                    expires_at=datetime.now(timezone.utc) + timedelta(days=COOKIE_EXPIRY_DAYS),
-                    key="roll_cookie")
-
-    if st.session_state.auth_verified:
+        import boto3
+        from botocore.exceptions import ClientError
+        ses = boto3.client(
+            "ses",
+            region_name=st.secrets.get("AWS_SES_REGION", "us-east-1"),
+            aws_access_key_id=st.secrets.get("AWS_ACCESS_KEY_ID", ""),
+            aws_secret_access_key=st.secrets.get("AWS_SECRET_ACCESS_KEY", ""),
+        )
+        ses.send_email(
+            Source=st.secrets.get("EMAIL_FROM", "noreply@example.com"),
+            Destination={"ToAddresses": [email]},
+            Message={
+                "Subject": {"Data": "PowerPoint Creator — Your verification code", "Charset": "UTF-8"},
+                "Body": {
+                    "Text": {
+                        "Data": f"Your PowerPoint Creator verification code is: {code}\n\nExpires in 10 minutes.",
+                        "Charset": "UTF-8",
+                    },
+                    "Html": {
+                        "Data": f"""
+                        <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:32px 24px;">
+                          <div style="font-size:22px;font-weight:700;color:#6366f1;margin-bottom:4px;">✨ PowerPoint Creator</div>
+                          <div style="font-size:14px;color:#444;margin-bottom:28px;">Verification code</div>
+                          <div style="font-size:42px;font-weight:900;letter-spacing:0.18em;color:#1a1a2e;
+                                      background:#f0f4ff;border-radius:8px;padding:18px 24px;
+                                      display:inline-block;margin-bottom:24px;">{code}</div>
+                          <div style="font-size:12px;color:#888;">
+                            Expires in 10 minutes.<br>If you didn't request this, ignore this email.
+                          </div>
+                        </div>""",
+                        "Charset": "UTF-8",
+                    },
+                },
+            },
+        )
         return True
+    except Exception as e:
+        st.error(f"Failed to send email: {e}")
+        return False
 
-    # ── Login form ────────────────────────────────────────────────────────────
+
+def _make_token(email: str) -> str:
+    """Create a signed URL token valid for TOKEN_EXPIRY_DAYS: base64(email|expiry|hmac)."""
+    secret  = st.secrets.get("COOKIE_SIGNING_KEY", "fallback-change-this")
+    expiry  = int(time.time()) + (TOKEN_EXPIRY_DAYS * 86400)
+    payload = f"{email}|{expiry}"
+    sig     = hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    return base64.urlsafe_b64encode(f"{payload}|{sig}".encode()).decode()
+
+
+def _verify_token(token: str) -> str | None:
+    """Verify token. Returns email if valid and unexpired, else None."""
+    try:
+        secret   = st.secrets.get("COOKIE_SIGNING_KEY", "fallback-change-this")
+        decoded  = base64.urlsafe_b64decode(token.encode()).decode()
+        email, expiry_str, sig = decoded.rsplit("|", 2)
+        payload  = f"{email}|{expiry_str}"
+        expected = hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected):
+            return None
+        if int(time.time()) > int(expiry_str):
+            return None
+        return email
+    except Exception:
+        return None
+
+
+# ── Read token from URL on every page load ────────────────────────────────────
+_url_token   = st.query_params.get("t", "")
+_token_email = _verify_token(_url_token) if _url_token else None
+
+# ── Session state init ────────────────────────────────────────────────────────
+for _k, _v in [
+    ("auth_verified", False), ("auth_email", ""),
+    ("auth_token", ""),
+    ("otp_code", ""), ("otp_email", ""), ("otp_expiry", 0),
+    ("otp_sent", False), ("otp_attempts", 0),
+]:
+    if _k not in st.session_state:
+        st.session_state[_k] = _v
+
+# If valid token in URL, auto-authenticate
+if _token_email and not st.session_state.auth_verified:
+    st.session_state.auth_verified = True
+    st.session_state.auth_email    = _token_email
+    st.session_state.auth_token    = _url_token
+
+# ── Login gate ────────────────────────────────────────────────────────────────
+if not st.session_state.auth_verified:
     st.markdown("""
     <style>
     .login-wrap{max-width:400px;margin:3rem auto;padding:2rem;
@@ -128,50 +183,64 @@ def _auth_gate():
     </div>
     """, unsafe_allow_html=True)
 
-    with st.form("login_form"):
-        email = st.text_input("Email address", placeholder="you@yourcompany.com")
-        send  = st.form_submit_button("Send verification code", use_container_width=True)
+    if not st.session_state.otp_sent:
+        with st.form("login_form"):
+            _email_input = st.text_input("Email address", placeholder="you@yourcompany.com")
+            _send_btn    = st.form_submit_button("Send verification code", use_container_width=True)
 
-    if send and email:
-        if ALLOWED_DOMAIN and not email.lower().endswith(ALLOWED_DOMAIN.lower()):
-            st.error(f"Only {ALLOWED_DOMAIN} addresses are allowed.")
-            return False
-        code = str(hash(time.time()) % 900000 + 100000)
-        if _send_otp(email, code):
-            st.session_state.otp_code    = code
-            st.session_state.otp_email   = email
-            st.session_state.otp_expiry  = time.time() + OTP_EXPIRY_SECS
-            st.session_state.otp_sent    = True
-            st.session_state.otp_attempts = 0
-            st.rerun()
-        else:
-            st.error("Failed to send email. Check AWS SES config.")
-
-    if st.session_state.otp_sent:
+        if _send_btn and _email_input:
+            if ALLOWED_DOMAIN and not _email_input.lower().endswith(ALLOWED_DOMAIN.lower()):
+                st.error(f"Only {ALLOWED_DOMAIN} addresses are allowed.")
+            else:
+                _code = str(hash(time.time()) % 900000 + 100000)
+                if _send_otp(_email_input.strip().lower(), _code):
+                    st.session_state.otp_code     = _code
+                    st.session_state.otp_email    = _email_input.strip().lower()
+                    st.session_state.otp_expiry   = time.time() + OTP_EXPIRY_SECS
+                    st.session_state.otp_sent     = True
+                    st.session_state.otp_attempts = 0
+                    st.rerun()
+    else:
+        st.info(f"Code sent to **{st.session_state.otp_email}** — check your inbox.")
         with st.form("otp_form"):
-            otp_in = st.text_input("Enter 6-digit code", max_chars=6)
-            verify = st.form_submit_button("Verify", use_container_width=True, type="primary")
+            _code_input = st.text_input("Enter 6-digit code", max_chars=6, key="auth_code_input")
+            _verify_btn = st.form_submit_button("Verify code", use_container_width=True, type="primary")
 
-        if verify:
-            if time.time() > st.session_state.otp_expiry:
-                st.error("Code expired. Please request a new one.")
-                st.session_state.otp_sent = False
-            elif st.session_state.otp_attempts >= 5:
+        if _verify_btn and _code_input:
+            if st.session_state.otp_attempts >= 5:
                 st.error("Too many attempts. Please request a new code.")
                 st.session_state.otp_sent = False
-            elif otp_in.strip() == st.session_state.otp_code:
+            elif time.time() > st.session_state.otp_expiry:
+                st.error("Code expired. Please request a new one.")
+                st.session_state.otp_sent = False
+            elif _code_input.strip() != st.session_state.otp_code:
+                st.session_state.otp_attempts += 1
+                _rem = 5 - st.session_state.otp_attempts
+                st.error(f"Incorrect code. {_rem} attempt{'s' if _rem != 1 else ''} remaining.")
+            else:
+                # Success — generate token and inject into URL so it survives refreshes
                 st.session_state.auth_verified = True
                 st.session_state.auth_email    = st.session_state.otp_email
-                if _cm:
-                    _cm.set(COOKIE_NAME, _sign_cookie(st.session_state.otp_email),
-                            expires_at=datetime.now(timezone.utc) + timedelta(days=COOKIE_EXPIRY_DAYS),
-                            key="set_cookie")
+                st.session_state.otp_code      = ""
+                _token = _make_token(st.session_state.auth_email)
+                st.session_state.auth_token    = _token
+                st.query_params["t"] = _token
                 st.rerun()
-            else:
-                st.session_state.otp_attempts += 1
-                st.error(f"Incorrect code ({5 - st.session_state.otp_attempts} attempts left).")
 
-    return False
+        _back_col, _ = st.columns([1, 1])
+        with _back_col:
+            if st.button("← Use a different email", key="auth_back"):
+                st.session_state.otp_sent = False
+                st.session_state.otp_code = ""
+                st.rerun()
+
+    if ALLOWED_DOMAIN:
+        st.markdown(
+            f"<div style='text-align:center;font-size:.72rem;color:#475569;margin-top:1rem'>"
+            f"Restricted to {ALLOWED_DOMAIN} addresses · Codes expire after 10 minutes</div>",
+            unsafe_allow_html=True,
+        )
+    st.stop()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -707,10 +776,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ── Auth gate ─────────────────────────────────────────────────────────────────
-if not _auth_gate():
-    st.stop()
-
+# Auth is handled inline above — st.stop() is called there if not verified.
 OWNER = st.session_state.auth_email
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
@@ -721,14 +787,9 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
     if st.button("Sign out", use_container_width=True):
-        try:
-            import extra_streamlit_components as stx
-            cm = stx.CookieManager(key="signout_cookies")
-            cm.delete(COOKIE_NAME, key="del_cookie")
-        except Exception:
-            pass
-        for k in ["auth_verified", "auth_email", "otp_sent", "otp_code"]:
+        for k in ["auth_verified", "auth_email", "auth_token", "otp_sent", "otp_code"]:
             st.session_state.pop(k, None)
+        st.query_params.clear()
         st.rerun()
 
     st.divider()
