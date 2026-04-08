@@ -1294,6 +1294,15 @@ Rules:
             _tx_log("🖥️ Building new PPTX…", "spin")
             out_prs = _pptx_lib.Presentation(io.BytesIO(_tmpl_bytes))
 
+            from pptx.util import Inches, Pt, Emu
+            from pptx.dml.color import RGBColor
+            from pptx.enum.text import PP_ALIGN
+            import lxml.etree as etree
+
+            # Slide dimensions
+            SW = out_prs.slide_width
+            SH = out_prs.slide_height
+
             # Remove any default blank slides that came with the template
             _R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
             while len(out_prs.slides) > 0:
@@ -1308,32 +1317,135 @@ Rules:
 
             layouts = out_prs.slide_layouts
 
+            def _add_textbox(slide, left, top, width, height,
+                             text, font_size=18, bold=False,
+                             color="FFFFFF", align=PP_ALIGN.LEFT,
+                             word_wrap=True):
+                """Add a text box with given content and style."""
+                txBox = slide.shapes.add_textbox(
+                    Emu(left), Emu(top), Emu(width), Emu(height)
+                )
+                tf = txBox.text_frame
+                tf.word_wrap = word_wrap
+                tf.auto_size = None
+                p = tf.paragraphs[0]
+                p.alignment = align
+                run = p.add_run()
+                run.text = str(text)
+                run.font.size = Pt(font_size)
+                run.font.bold = bold
+                run.font.color.rgb = RGBColor.from_string(color)
+                return txBox
+
+            def _add_bullets(slide, left, top, width, height,
+                              lines, font_size=14, color="D0E4FF",
+                              bullet_color="00CCFF"):
+                """Add a text box with bullet lines."""
+                txBox = slide.shapes.add_textbox(
+                    Emu(left), Emu(top), Emu(width), Emu(height)
+                )
+                tf = txBox.text_frame
+                tf.word_wrap = True
+                for i, line in enumerate(lines):
+                    if not line.strip():
+                        continue
+                    p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
+                    p.space_before = Pt(3)
+                    p.alignment = PP_ALIGN.LEFT
+                    run = p.add_run()
+                    # Strip leading bullet chars if present
+                    clean = line.lstrip("•·-– ").strip()
+                    run.text = f"▸  {clean}"
+                    run.font.size = Pt(font_size)
+                    run.font.color.rgb = RGBColor.from_string(color)
+                return txBox
+
+            # Layout regions (as fractions of slide size)
+            # Title zone: top strip ~15% height
+            # Body zone: remaining ~75% height with margins
+            MARGIN   = int(SW * 0.05)   # 5% side margin
+            T_TOP    = int(SH * 0.06)
+            T_HEIGHT = int(SH * 0.15)
+            T_WIDTH  = int(SW * 0.90)
+            B_TOP    = int(SH * 0.24)
+            B_HEIGHT = int(SH * 0.68)
+            B_WIDTH  = int(SW * 0.90)
+
             for entry in slide_map:
                 layout_idx = min(int(entry.get("layout_idx", 0)), len(layouts) - 1)
                 layout     = layouts[layout_idx]
                 new_slide  = out_prs.slides.add_slide(layout)
 
-                placeholders_data = entry.get("placeholders", {})
+                # Gather all text content
+                ph_data   = entry.get("placeholders", {})
+                all_texts = [str(v).strip() for v in ph_data.values() if str(v).strip()]
+
+                # Heuristic: longest short string is title, rest is body
+                title_text = ""
+                body_lines = []
+
+                if all_texts:
+                    # Title = first value (Claude puts title in idx "0")
+                    title_text = ph_data.get("0", "") or all_texts[0]
+                    # Body = idx "1" or everything else joined
+                    raw_body = ph_data.get("1", "")
+                    if not raw_body:
+                        raw_body = "\n".join(all_texts[1:])
+                    body_lines = [l for l in str(raw_body).split("\n") if l.strip()]
+
+                # Try to fill standard placeholders first (works for normal templates)
+                filled_ph = set()
                 for ph in new_slide.placeholders:
-                    ph_idx = str(ph.placeholder_format.idx)
-                    text   = placeholders_data.get(ph_idx, "")
+                    idx_str = str(ph.placeholder_format.idx)
+                    text = ph_data.get(idx_str, "")
                     if text and ph.has_text_frame:
                         tf = ph.text_frame
                         tf.clear()
                         lines = str(text).split("\n")
                         for li, line in enumerate(lines):
-                            if li == 0:
-                                tf.paragraphs[0].text = line
-                            else:
-                                p = tf.add_paragraph()
-                                p.text = line
+                            para = tf.paragraphs[0] if li == 0 else tf.add_paragraph()
+                            para.text = line
+                        filled_ph.add(idx_str)
+
+                # If no placeholders were filled (custom/graphic template),
+                # add text boxes directly onto the slide
+                if not filled_ph:
+                    if title_text:
+                        _add_textbox(
+                            new_slide,
+                            left=MARGIN, top=T_TOP,
+                            width=T_WIDTH, height=T_HEIGHT,
+                            text=title_text,
+                            font_size=28, bold=True,
+                            color="FFFFFF",
+                            align=PP_ALIGN.LEFT,
+                        )
+                    if body_lines:
+                        _add_bullets(
+                            new_slide,
+                            left=MARGIN, top=B_TOP,
+                            width=B_WIDTH, height=B_HEIGHT,
+                            lines=body_lines,
+                            font_size=15,
+                            color="D0E4FF",
+                        )
+                    elif len(all_texts) > 1:
+                        # Plain body text (subtitle, stats, etc.)
+                        body_text = "\n".join(all_texts[1:])
+                        _add_textbox(
+                            new_slide,
+                            left=MARGIN, top=B_TOP,
+                            width=B_WIDTH, height=B_HEIGHT,
+                            text=body_text,
+                            font_size=16, bold=False,
+                            color="D0E4FF",
+                        )
 
                 # Speaker notes
                 notes_text = entry.get("speaker_notes", "")
                 if notes_text and _tx_notes:
                     try:
-                        notes_slide = new_slide.notes_slide
-                        notes_slide.notes_text_frame.text = str(notes_text)
+                        new_slide.notes_slide.notes_text_frame.text = str(notes_text)
                     except Exception:
                         pass
 
