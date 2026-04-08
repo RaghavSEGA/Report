@@ -1315,63 +1315,62 @@ Rules:
             # First build a per-slide old→new text replacement map from slide_map
             # We need to know what text was on each source slide so we can replace it
             # Re-extract source slide texts (same logic as above, already done in src_dump)
-            src_slide_texts = []  # list of lists of (shape_idx, para_idx, old_text)
-            for slide in src_prs.slides:
-                slide_texts = []
-                sw, sh = src_prs.slide_width, src_prs.slide_height
-                for si, shape in enumerate(slide.shapes):
-                    if _is_footer_shape(shape, sw, sh):
-                        continue
-                    if shape.has_text_frame:
-                        for pi, para in enumerate(shape.text_frame.paragraphs):
-                            t = para.text.strip()
-                            if t:
-                                slide_texts.append(t)
-                src_slide_texts.append(slide_texts)
+            # Collect ordered <a:t> text values per slide (keep bullets/prefix as-is)
+            # These are used only for Claude's context — XML replacement is purely positional
+            src_slide_texts = []
+            _A_NS  = "http://schemas.openxmlformats.org/drawingml/2006/main"
+            _T_TAG = f"{{{_A_NS}}}t"
+            import zipfile as _zf, re as _re
+            import lxml.etree as _etree
+
+            src_zip_buf = io.BytesIO(_src_bytes)
+            with _zf.ZipFile(src_zip_buf, "r") as _z:
+                _all_names = _z.namelist()
+                _slide_xmls = sorted(
+                    [n for n in _all_names if _re.match(r"ppt/slides/slide\d+\.xml$", n)],
+                    key=lambda x: int(_re.search(r"\d+", x.split("/")[-1]).group())
+                )
+                for sxml in _slide_xmls:
+                    root = _etree.fromstring(_z.read(sxml))
+                    nodes_on_slide = []
+                    for node in root.iter(_T_TAG):
+                        txt = (node.text or "").strip()
+                        if not txt:
+                            continue
+                        up = txt.upper().lstrip("▸►•·▶➤➜–—- ")
+                        if any(pat in up for pat in _SKIP_PATTERNS):
+                            continue
+                        nodes_on_slide.append(txt)
+                    src_slide_texts.append(nodes_on_slide)
 
             # Open source as ZIP and clone it
             src_zip_buf  = io.BytesIO(_src_bytes)
             out_zip_buf  = io.BytesIO()
 
-            # Helper: given new content for a slide, build a flat list of replacement strings
+            # Helper: flatten Claude's placeholders into ordered list of new strings
             def _new_texts_for_entry(entry):
                 ph = entry.get("placeholders", {})
-                # Clean footer lines
-                cleaned = {}
-                for k, v in ph.items():
-                    lines_out = []
-                    for ln in str(v).split("\n"):
+                result = []
+                for k in sorted(ph.keys(), key=lambda x: int(x) if x.isdigit() else 999):
+                    for ln in str(ph[k]).split("\n"):
                         up = ln.strip().upper().lstrip("▸►•·▶➤➜–—- ")
                         if any(pat in up for pat in _SKIP_PATTERNS):
                             continue
                         if ln.strip():
-                            lines_out.append(ln.strip())
-                    cleaned[k] = lines_out
-                # Flatten all values into ordered list
-                result = []
-                for k in sorted(cleaned.keys(), key=lambda x: int(x) if x.isdigit() else 999):
-                    result.extend(cleaned[k])
+                            result.append(ln.strip())
                 return result
 
-            # XML namespace for DrawingML text runs
-            _A_NS  = "http://schemas.openxmlformats.org/drawingml/2006/main"
-            _T_TAG = f"{{{_A_NS}}}t"
-
-            def _replace_texts_in_xml(xml_bytes, old_texts, new_texts):
+            def _replace_texts_in_xml(xml_bytes, new_texts):
                 """
-                In the slide XML, replace text runs in order.
-                old_texts: flat list of strings that were on the slide
-                new_texts: flat list of replacement strings
-                Skips footer/watermark strings. Extra old texts get blanked.
-                Extra new texts are ignored (no room).
+                Positional replacement: collect all non-empty, non-footer <a:t> nodes
+                in document order, replace them 1-to-1 with new_texts.
+                Extra old nodes beyond len(new_texts) are blanked.
                 """
                 try:
                     root = _etree.fromstring(xml_bytes)
                 except Exception:
                     return xml_bytes
 
-                # Collect all <a:t> elements that have non-empty text
-                # and don't match footer patterns
                 t_nodes = []
                 for node in root.iter(_T_TAG):
                     txt = (node.text or "").strip()
@@ -1379,44 +1378,25 @@ Rules:
                         continue
                     up = txt.upper().lstrip("▸►•·▶➤➜–—- ")
                     if any(pat in up for pat in _SKIP_PATTERNS):
-                        node.text = ""
+                        node.text = ""  # wipe footer
                         continue
                     t_nodes.append(node)
 
-                # Match old_texts to t_nodes by position
-                # For each old text, find the t_node that contains it and replace
-                new_idx = 0
-                used = set()
-                for oi, old in enumerate(old_texts):
-                    if new_idx >= len(new_texts):
-                        # No more new content — blank remaining old text nodes
-                        for node in t_nodes:
-                            if id(node) not in used and old in (node.text or ""):
-                                node.text = ""
-                                used.add(id(node))
-                                break
-                        continue
-                    # Find the first unused t_node whose text matches or is substring
-                    for node in t_nodes:
-                        if id(node) in used:
-                            continue
-                        if old in (node.text or "") or (node.text or "") in old:
-                            node.text = new_texts[new_idx]
-                            used.add(id(node))
-                            new_idx += 1
-                            break
+                for i, node in enumerate(t_nodes):
+                    if i < len(new_texts):
+                        node.text = new_texts[i]
+                    else:
+                        node.text = ""  # blank any extra old nodes
 
                 return _etree.tostring(root, xml_declaration=True,
                                        encoding="UTF-8", standalone=True)
 
-            with zipfile.ZipFile(src_zip_buf, "r") as zin, \
-                 zipfile.ZipFile(out_zip_buf, "w", zipfile.ZIP_DEFLATED) as zout:
+            with _zf.ZipFile(src_zip_buf, "r") as zin, \
+                 _zf.ZipFile(out_zip_buf, "w", _zf.ZIP_DEFLATED) as zout:
 
                 all_names = zin.namelist()
-                # Find slide XML files in order
                 slide_xmls = sorted(
-                    [n for n in all_names
-                     if _re.match(r"ppt/slides/slide\d+\.xml$", n)],
+                    [n for n in all_names if _re.match(r"ppt/slides/slide\d+\.xml$", n)],
                     key=lambda x: int(_re.search(r"\d+", x.split("/")[-1]).group())
                 )
 
@@ -1424,17 +1404,11 @@ Rules:
                     data = zin.read(name)
 
                     if name in slide_xmls:
-                        slide_i = slide_xmls.index(name)  # 0-based
+                        slide_i = slide_xmls.index(name)
                         if slide_i < len(slide_map):
                             entry     = slide_map[slide_i]
-                            old_texts = src_slide_texts[slide_i] if slide_i < len(src_slide_texts) else []
                             new_texts = _new_texts_for_entry(entry)
-                            data = _replace_texts_in_xml(data, old_texts, new_texts)
-
-                            # Handle speaker notes in the notes XML
-                            notes_name = f"ppt/notesSlides/notesSlide{slide_i+1}.xml"
-                            notes_text = entry.get("speaker_notes", "")
-                            # (notes are written below when we encounter the notes file)
+                            data = _replace_texts_in_xml(data, new_texts)
 
                     zout.writestr(name, data)
 
@@ -1443,8 +1417,8 @@ Rules:
                 _tx_log("📝 Writing speaker notes…", "spin")
                 out_zip_buf.seek(0)
                 tmp_buf = io.BytesIO()
-                with zipfile.ZipFile(out_zip_buf, "r") as zin2, \
-                     zipfile.ZipFile(tmp_buf, "w", zipfile.ZIP_DEFLATED) as zout2:
+                with _zf.ZipFile(out_zip_buf, "r") as zin2, \
+                     _zf.ZipFile(tmp_buf, "w", _zf.ZIP_DEFLATED) as zout2:
                     for name in zin2.namelist():
                         data = zin2.read(name)
                         m = _re.match(r"ppt/notesSlides/notesSlide(\d+)\.xml$", name)
