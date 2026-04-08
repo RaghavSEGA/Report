@@ -1,5 +1,5 @@
 """
-pptx_creator.py — General-purpose AI PowerPoint Creator
+pptx_creator.py — SEGA PowerPoint Creator
 A standalone Streamlit app for generating polished presentations on any topic.
 
 Reuses the PPTX rendering engine from pptxruns.py (generate_pptx,
@@ -37,7 +37,6 @@ _init_db()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 _MAX_DOC_CHARS     = 60_000
-OTP_EXPIRY_SECS    = 600
 COOKIE_EXPIRY_DAYS = 1  # kept for storage_pptx compatibility
 
 # Auth: set ALLOWED_DOMAIN in secrets to restrict (e.g. "@mycompany.com")
@@ -58,16 +57,16 @@ PURPOSE_PRESETS = {
     "General / Other":      "Balanced professional presentation suited to the audience and topic.",
 }
 
-# ── Theme presets (not SEGA-specific) ─────────────────────────────────────────
+# ── SEGA brand theme presets ──────────────────────────────────────────────────
 THEME_PRESETS = {
-    "Corporate Blue":    {"primary": "1A3A6B", "accent": "0099CC"},
-    "Executive Dark":    {"primary": "1E2761", "accent": "CADCFC"},
-    "Forest & Moss":     {"primary": "2C5F2D", "accent": "97BC62"},
-    "Charcoal Minimal":  {"primary": "36454F", "accent": "A8C0CC"},
-    "Coral Energy":      {"primary": "F96167", "accent": "2F3C7E"},
-    "Warm Terracotta":   {"primary": "B85042", "accent": "A7BEAE"},
-    "Teal Trust":        {"primary": "028090", "accent": "02C39A"},
-    "Berry & Cream":     {"primary": "6D2E46", "accent": "ECE2D0"},
+    "SEGA Classic":      {"primary": "0033AA", "accent": "00CCFF"},   # deep blue + cyan
+    "SEGA Midnight":     {"primary": "040A1C", "accent": "F5C242"},   # near-black + gold
+    "SEGA Electric":     {"primary": "0055AA", "accent": "FFD700"},   # royal blue + gold
+    "SEGA Stealth":      {"primary": "0A0F1E", "accent": "00CCFF"},   # dark navy + cyan
+    "SEGA Prestige":     {"primary": "1A2A4A", "accent": "D0E4FF"},   # slate blue + ice
+    "SEGA Arcade":       {"primary": "0033AA", "accent": "EE3355"},   # blue + red pop
+    "SEGA Light":        {"primary": "0055AA", "accent": "0033AA"},   # blue on white
+    "SEGA Monochrome":   {"primary": "1A1A2E", "accent": "8899BB"},   # near-black + muted
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -93,22 +92,37 @@ def _send_otp(email: str, code: str) -> bool:
             Source=st.secrets.get("EMAIL_FROM", "noreply@example.com"),
             Destination={"ToAddresses": [email]},
             Message={
-                "Subject": {"Data": "PowerPoint Creator — Your verification code", "Charset": "UTF-8"},
+                "Subject": {"Data": "SEGA PowerPoint Creator — Your verification code", "Charset": "UTF-8"},
                 "Body": {
                     "Text": {
-                        "Data": f"Your PowerPoint Creator verification code is: {code}\n\nExpires in 10 minutes.",
+                        "Data": f"Your SEGA PowerPoint Creator verification code is: {code}\n\nExpires in 10 minutes.\nIf you didn't request this, you can safely ignore this email.",
                         "Charset": "UTF-8",
                     },
                     "Html": {
                         "Data": f"""
-                        <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:32px 24px;">
-                          <div style="font-size:22px;font-weight:700;color:#6366f1;margin-bottom:4px;">✨ PowerPoint Creator</div>
-                          <div style="font-size:14px;color:#444;margin-bottom:28px;">Verification code</div>
-                          <div style="font-size:42px;font-weight:900;letter-spacing:0.18em;color:#1a1a2e;
-                                      background:#f0f4ff;border-radius:8px;padding:18px 24px;
-                                      display:inline-block;margin-bottom:24px;">{code}</div>
-                          <div style="font-size:12px;color:#888;">
-                            Expires in 10 minutes.<br>If you didn't request this, ignore this email.
+                        <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;
+                                    background:#040A1C;border:1px solid #0033AA;border-top:3px solid #0055AA;
+                                    border-radius:10px;overflow:hidden;">
+                          <div style="padding:28px 32px 16px;border-bottom:1px solid rgba(0,102,204,0.3);">
+                            <div style="font-family:'Arial Black',Arial,sans-serif;font-size:26px;
+                                        font-weight:900;letter-spacing:.15em;color:#FFFFFF;">SEGA</div>
+                            <div style="font-size:11px;letter-spacing:.3em;color:#00CCFF;
+                                        text-transform:uppercase;margin-top:2px;">PowerPoint Creator</div>
+                          </div>
+                          <div style="padding:28px 32px 32px;">
+                            <div style="font-size:14px;color:#D0E4FF;margin-bottom:20px;">
+                              Your verification code is:
+                            </div>
+                            <div style="font-size:44px;font-weight:900;letter-spacing:.2em;color:#FFFFFF;
+                                        background:rgba(0,85,170,0.35);border:1px solid rgba(0,204,255,0.3);
+                                        border-radius:8px;padding:16px 24px;display:inline-block;
+                                        margin-bottom:24px;font-family:'Arial Black',Arial,sans-serif;">
+                              {code}
+                            </div>
+                            <div style="font-size:12px;color:#8899BB;line-height:1.6;">
+                              Expires in 10 minutes.<br>
+                              If you didn't request this, you can safely ignore this email.
+                            </div>
                           </div>
                         </div>""",
                         "Charset": "UTF-8",
@@ -172,14 +186,47 @@ if _token_email and not st.session_state.auth_verified:
 if not st.session_state.auth_verified:
     st.markdown("""
     <style>
-    .login-wrap{max-width:400px;margin:3rem auto;padding:2rem;
-        background:#1e293b;border-radius:12px;border:1px solid #334155}
-    .login-title{font-size:1.5rem;font-weight:700;color:#f1f5f9;margin-bottom:.25rem}
-    .login-sub{font-size:.85rem;color:#94a3b8;margin-bottom:1.5rem}
+    @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@700;900&family=Rajdhani:wght@400;600&display=swap');
+    .login-outer{
+        min-height:80vh;display:flex;align-items:center;justify-content:center;
+        background:linear-gradient(135deg,#040A1C 0%,#0D1B3E 50%,#040A1C 100%);
+    }
+    .login-wrap{
+        max-width:420px;width:100%;padding:2.5rem 2rem;
+        background:rgba(0,30,80,0.6);
+        border:1px solid rgba(0,102,204,0.45);
+        border-top:3px solid #0055AA;
+        border-radius:12px;
+        backdrop-filter:blur(12px);
+        box-shadow:0 0 40px rgba(0,85,170,0.25);
+    }
+    .login-logo{
+        font-family:'Orbitron',monospace;font-size:2.4rem;font-weight:900;
+        letter-spacing:.15em;color:#FFFFFF;
+        text-shadow:0 0 20px #0055AA,0 0 40px #00CCFF;
+        margin-bottom:.2rem;text-align:center;
+    }
+    .login-sub{
+        font-family:'Orbitron',monospace;font-size:.65rem;font-weight:700;
+        letter-spacing:.35em;color:#00CCFF;text-transform:uppercase;
+        text-align:center;margin-bottom:.35rem;
+    }
+    .login-divider{
+        border:none;border-top:1px solid rgba(0,102,204,0.35);margin:1.2rem 0;
+    }
+    .login-title{
+        font-family:'Rajdhani',sans-serif;font-size:1rem;font-weight:600;
+        color:#D0E4FF;text-align:center;margin-bottom:1.5rem;
+        letter-spacing:.04em;
+    }
     </style>
-    <div class="login-wrap">
-      <div class="login-title">✨ PowerPoint Creator</div>
-      <div class="login-sub">Sign in to continue</div>
+    <div class="login-outer">
+      <div class="login-wrap">
+        <div class="login-logo">SEGA</div>
+        <div class="login-sub">PowerPoint Creator</div>
+        <hr class="login-divider"/>
+        <div class="login-title">Sign in with your SEGA America email</div>
+      </div>
     </div>
     """, unsafe_allow_html=True)
 
@@ -236,7 +283,7 @@ if not st.session_state.auth_verified:
 
     if ALLOWED_DOMAIN:
         st.markdown(
-            f"<div style='text-align:center;font-size:.72rem;color:#475569;margin-top:1rem'>"
+            f"<div style='text-align:center;font-size:.72rem;color:#6080A8;margin-top:1rem'>"
             f"Restricted to {ALLOWED_DOMAIN} addresses · Codes expire after 10 minutes</div>",
             unsafe_allow_html=True,
         )
@@ -678,17 +725,17 @@ def _render_log(log_lines: list) -> str:
     CSS = (
         "<style>"
         "@keyframes _sp{to{transform:rotate(360deg)}}"
-        "._lw{background:#0f172a;border:1px solid #1e293b;border-radius:8px;"
+        "._lw{background:#040A1C;border:1px solid #0A1832;border-radius:8px;"
         "padding:1rem 1.25rem;font-size:.82rem;"
         "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;"
-        "color:#94a3b8;max-height:480px;overflow-y:auto;line-height:1.7}"
-        "._lw b{color:#e2e8f0}._lw i{color:#60a5fa}"
-        "._ld{color:#64748b;font-size:.76rem;display:block;margin-top:.15rem}"
-        "._le{border-left:2px solid #1e3a5f;padding-left:.6rem;margin-bottom:.5rem}"
-        "._la{border-left:2px solid #6366f1;padding-left:.6rem;"
+        "color:#8899BB;max-height:480px;overflow-y:auto;line-height:1.7}"
+        "._lw b{color:#D0E4FF}._lw i{color:#00CCFF}"
+        "._ld{color:#4A6A9A;font-size:.76rem;display:block;margin-top:.15rem}"
+        "._le{border-left:2px solid #0A1A3A;padding-left:.6rem;margin-bottom:.5rem}"
+        "._la{border-left:2px solid #0055AA;padding-left:.6rem;"
         "margin-bottom:.5rem;display:flex;align-items:flex-start;gap:.55rem}"
         "._lr{flex-shrink:0;width:14px;height:14px;margin-top:3px;"
-        "border:2px solid rgba(99,102,241,.25);border-top-color:#6366f1;"
+        "border:2px solid rgba(0,85,170,0.25);border-top-color:#00CCFF;"
         "border-radius:50%;animation:_sp .8s linear infinite}"
         "._lt{flex:1}"
         "</style>"
@@ -715,7 +762,7 @@ def _load_project(owner: str, name: str):
     st.session_state["active_project"]      = name
     st.session_state["proj_topic"]          = data.get("business_question", "")
     st.session_state["proj_purpose"]        = data.get("audience", "General / Other")
-    st.session_state["proj_industry"]       = data.get("game_title", "")
+    st.session_state["proj_industry"]       = data.get("industry", data.get("game_title", ""))
     st.session_state["proj_audience"]       = data.get("audience", "")
     st.session_state["project_doc_names"]   = data.get("doc_names", [])
     st.session_state["plan_slide_data"]     = data.get("slide_json") or {}
@@ -730,7 +777,7 @@ def _save_project(owner: str, name: str):
     save_project(
         owner, name,
         business_question = st.session_state.get("proj_topic", ""),
-        game_title        = st.session_state.get("proj_industry", ""),
+        game_title        = st.session_state.get("proj_industry", ""),  # storage_pptx compat
         audience          = st.session_state.get("proj_audience", ""),
         doc_names         = st.session_state.get("project_doc_names", []),
         slide_json        = st.session_state.get("plan_slide_data") or {},
@@ -755,24 +802,28 @@ def _clear_project():
 # ─────────────────────────────────────────────────────────────────────────────
 
 st.set_page_config(
-    page_title="PowerPoint Creator",
-    page_icon="✨",
+    page_title="SEGA PowerPoint Creator",
+    page_icon="🎮",
     layout="wide",
 )
 
 st.markdown("""
 <style>
-.section-label{font-size:.72rem;font-weight:700;letter-spacing:.08em;
-    text-transform:uppercase;color:#6366f1;margin:.9rem 0 .35rem}
-.sidebar-section{font-size:.68rem;font-weight:700;letter-spacing:.07em;
-    text-transform:uppercase;color:#6366f1;display:block;margin:.8rem 0 .3rem}
-.step-row{font-size:.78rem;padding:.18rem 0;color:#64748b}
-.step-done{color:#22c55e}
-.step-pending{color:#475569}
-.status-card{background:#1e293b;border:1px solid #334155;border-radius:8px;
-    padding:1.25rem 1.5rem;margin-top:.5rem}
-.status-card-label{font-size:.68rem;font-weight:700;letter-spacing:.08em;
-    text-transform:uppercase;color:#6366f1;margin-bottom:.5rem}
+@import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@700;900&family=Rajdhani:wght@400;600&display=swap');
+.section-label{font-size:.72rem;font-weight:700;letter-spacing:.1em;
+    text-transform:uppercase;color:#00CCFF;margin:.9rem 0 .35rem;
+    font-family:'Rajdhani',sans-serif;}
+.sidebar-section{font-size:.65rem;font-weight:700;letter-spacing:.12em;
+    text-transform:uppercase;color:#00CCFF;display:block;margin:.8rem 0 .3rem;
+    font-family:'Rajdhani',sans-serif;}
+.step-row{font-size:.78rem;padding:.18rem 0;color:#4A6A9A}
+.step-done{color:#22DD88}
+.step-pending{color:#6080A8}
+.status-card{background:#0A1832;border:1px solid #0D2860;border-top:2px solid #0055AA;
+    border-radius:8px;padding:1.25rem 1.5rem;margin-top:.5rem}
+.status-card-label{font-size:.65rem;font-weight:700;letter-spacing:.12em;
+    text-transform:uppercase;color:#00CCFF;margin-bottom:.5rem;
+    font-family:'Rajdhani',sans-serif;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -782,8 +833,11 @@ OWNER = st.session_state.auth_email
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown(
-        f"<div style='font-size:.78rem;color:#94a3b8;margin-bottom:1rem'>"
-        f"Signed in as <b style='color:#e2e8f0'>{OWNER}</b></div>",
+        "<div style='font-family:\"Arial Black\",Arial,sans-serif;font-size:.65rem;"
+        "letter-spacing:.2em;color:#00CCFF;text-transform:uppercase;"
+        "margin-bottom:.1rem'>SEGA America</div>"
+        f"<div style='font-size:.75rem;color:#8899BB;margin-bottom:1rem'>"
+        f"{OWNER}</div>",
         unsafe_allow_html=True,
     )
     if st.button("Sign out", use_container_width=True):
@@ -874,7 +928,7 @@ with st.sidebar:
     # ── Model ────────────────────────────────────────────────────────────────
     st.markdown('<span class="sidebar-section">Model</span>', unsafe_allow_html=True)
     model = st.selectbox(
-        "Model", ["claude-sonnet-4-5", "claude-opus-4-5", "claude-haiku-4-5-20251001"],
+        "Model", ["claude-sonnet-4-6", "claude-opus-4-6", "claude-haiku-4-5-20251001"],
         label_visibility="hidden",
     )
     st.session_state["_selected_model"] = model
@@ -926,13 +980,13 @@ if not _active:
 
     st.markdown("""
     <div style='max-width:520px;margin:4rem auto;text-align:center'>
-      <div style='font-size:2.5rem;margin-bottom:1rem'>✨</div>
-      <h2 style='color:#e2e8f0;margin-bottom:.5rem'>PowerPoint Creator</h2>
-      <p style='color:#64748b;margin-bottom:2rem'>
+      <div style='font-family:"Arial Black",Arial,sans-serif;font-size:2rem;font-weight:900;letter-spacing:.15em;color:#FFFFFF;text-shadow:0 0 15px #0055AA;margin-bottom:.5rem'>SEGA</div>
+      <h2 style='color:#D0E4FF;margin-bottom:.5rem'>PowerPoint Creator</h2>
+      <p style='color:#4A6A9A;margin-bottom:2rem'>
         AI-powered presentations for any topic — market analysis, project proposals,
         executive briefings, research summaries, and more.
       </p>
-      <p style='color:#94a3b8;font-size:.85rem'>
+      <p style='color:#8899BB;font-size:.85rem'>
         Select an existing project or create a new one in the sidebar to get started.
       </p>
     </div>
@@ -941,8 +995,8 @@ if not _active:
 
 # ── Page header ────────────────────────────────────────────────────────────────
 st.markdown(
-    f"<h1>✨ PowerPoint Creator</h1>"
-    f"<div style='font-size:.78rem;color:#475569;margin-bottom:1.5rem'>"
+    f"<h1>🎮 SEGA PowerPoint Creator</h1>"
+    f"<div style='font-size:.78rem;color:#6080A8;margin-bottom:1.5rem'>"
     f"Project: <b>{_active}</b> &nbsp;·&nbsp; "
     f"Upload documents &nbsp;·&nbsp; Describe your goal &nbsp;·&nbsp; Generate a polished PPTX"
     f"</div>",
@@ -957,7 +1011,7 @@ _tab_main, _tab_pdf, _tab_transfer = st.tabs([
 
 with _tab_pdf:
     st.markdown(
-        "<div style='font-size:.85rem;color:#94a3b8;margin-bottom:1rem'>"
+        "<div style='font-size:.85rem;color:#8899BB;margin-bottom:1rem'>"
         "Upload any PDF of slides and convert it to a fully editable PPTX — "
         "works even on image-only exports from Canva, Google Slides, or NotebookLM."
         "</div>",
@@ -968,7 +1022,7 @@ with _tab_pdf:
         _pdf_file  = st.file_uploader("PDF", type=["pdf"],
                                        label_visibility="hidden", key="pdf_upload")
         _pdf_model = st.selectbox("Vision model",
-                                   ["claude-opus-4-5", "claude-sonnet-4-5"],
+                                   ["claude-opus-4-6", "claude-sonnet-4-6"],
                                    key="pdf_vision_model")
         _pdf_dpi   = st.select_slider("Quality (DPI)",
                                        options=[96,120,150,200], value=150, key="pdf_dpi")
@@ -994,8 +1048,8 @@ with _tab_pdf:
         def _plog(m):
             _ll.append(m)
             _la.markdown(
-                "<div style='background:#0f172a;border-radius:6px;padding:.75rem;"
-                "font-size:.8rem;color:#94a3b8;font-family:monospace'>"
+                "<div style='background:#040A1C;border-radius:6px;padding:.75rem;"
+                "font-size:.8rem;color:#8899BB;font-family:monospace'>"
                 + "".join(f"<div>{x}</div>" for x in _ll[-12:]) + "</div>",
                 unsafe_allow_html=True)
         def _pprog(f):
@@ -1020,7 +1074,7 @@ with _tab_pdf:
 
 with _tab_transfer:
     st.markdown(
-        "<div style='font-size:.85rem;color:#94a3b8;margin-bottom:1.25rem'>"
+        "<div style='font-size:.85rem;color:#8899BB;margin-bottom:1.25rem'>"
         "Re-skin an existing presentation into a new template. Upload your source "
         "<code>.pptx</code> and a target template — Claude will map every slide's "
         "content (text, bullets, speaker notes, chart titles) into the new layout, "
@@ -1033,7 +1087,7 @@ with _tab_transfer:
     with _tx_col1:
         st.markdown(
             "<div style='font-size:.72rem;font-weight:700;letter-spacing:.07em;"
-            "text-transform:uppercase;color:#6366f1;margin-bottom:.4rem'>"
+            "text-transform:uppercase;color:#0055AA;margin-bottom:.4rem'>"
             "Source presentation</div>",
             unsafe_allow_html=True,
         )
@@ -1043,7 +1097,7 @@ with _tab_transfer:
         )
         st.markdown(
             "<div style='font-size:.72rem;font-weight:700;letter-spacing:.07em;"
-            "text-transform:uppercase;color:#6366f1;margin:.9rem 0 .4rem'>"
+            "text-transform:uppercase;color:#0055AA;margin:.9rem 0 .4rem'>"
             "Target template</div>",
             unsafe_allow_html=True,
         )
@@ -1053,12 +1107,12 @@ with _tab_transfer:
         )
         st.markdown(
             "<div style='font-size:.72rem;font-weight:700;letter-spacing:.07em;"
-            "text-transform:uppercase;color:#6366f1;margin:.9rem 0 .4rem'>"
+            "text-transform:uppercase;color:#0055AA;margin:.9rem 0 .4rem'>"
             "Options</div>",
             unsafe_allow_html=True,
         )
         _tx_model = st.selectbox(
-            "Model", ["claude-sonnet-4-5", "claude-opus-4-5", "claude-haiku-4-5-20251001"],
+            "Model", ["claude-sonnet-4-6", "claude-opus-4-6", "claude-haiku-4-5-20251001"],
             key="tx_model",
         )
         _tx_preserve_charts = st.checkbox(
@@ -1081,7 +1135,7 @@ with _tab_transfer:
     with _tx_col2:
         st.markdown(
             "<div style='font-size:.72rem;font-weight:700;letter-spacing:.07em;"
-            "text-transform:uppercase;color:#6366f1;margin-bottom:.4rem'>"
+            "text-transform:uppercase;color:#0055AA;margin-bottom:.4rem'>"
             "Output</div>",
             unsafe_allow_html=True,
         )
@@ -1100,7 +1154,7 @@ with _tab_transfer:
             _tx_out_area.markdown(
                 "<div class='status-card'>"
                 "<div class='status-card-label'>How it works</div>"
-                "<div style='color:#475569;font-size:.82rem;line-height:1.9'>"
+                "<div style='color:#6080A8;font-size:.82rem;line-height:1.9'>"
                 "1. Upload your existing presentation<br>"
                 "2. Upload the target brand template<br>"
                 "3. Claude extracts all content from the source<br>"
@@ -1117,12 +1171,12 @@ with _tab_transfer:
         def _tx_log(msg: str, kind: str = "log"):
             _tx_logs.append((kind, msg))
             _tx_log_area.markdown(
-                "<div style='background:#0f172a;border:1px solid #1e293b;border-radius:8px;"
-                "padding:.85rem 1.1rem;font-size:.8rem;font-family:monospace;color:#94a3b8;"
+                "<div style='background:#040A1C;border:1px solid #0A1832;border-radius:8px;"
+                "padding:.85rem 1.1rem;font-size:.8rem;font-family:monospace;color:#8899BB;"
                 "max-height:360px;overflow-y:auto;line-height:1.75'>"
                 + "".join(
                     f"<div style='border-left:2px solid "
-                    f"{'#6366f1' if k=='spin' else '#1e3a5f'};padding-left:.6rem;"
+                    f"{'#0055AA' if k=='spin' else '#0A1A3A'};padding-left:.6rem;"
                     f"margin-bottom:.35rem'>{m}</div>"
                     for k, m in _tx_logs[-12:]
                 )
@@ -1241,10 +1295,15 @@ Rules:
             out_prs = _pptx_lib.Presentation(io.BytesIO(_tmpl_bytes))
 
             # Remove any default blank slides that came with the template
-            xml_slides = out_prs.slides._sldIdLst
+            _R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
             while len(out_prs.slides) > 0:
-                rId = out_prs.slides._sldIdLst[0].get("r:id")
-                out_prs.part.drop_rel(rId)
+                sldId_el = out_prs.slides._sldIdLst[0]
+                rId = sldId_el.get(f"{{{_R_NS}}}id") or sldId_el.get("r:id")
+                if rId:
+                    try:
+                        out_prs.part.drop_rel(rId)
+                    except Exception:
+                        pass
                 del out_prs.slides._sldIdLst[0]
 
             layouts = out_prs.slide_layouts
@@ -1393,8 +1452,8 @@ with _tab_main:
             output_area.markdown("""
 <div class="status-card">
 <div class="status-card-label">Ready</div>
-<div class="status-card-value" style="color:#475569;font-size:.82rem;line-height:1.9">
-Fill in the details on the left and click <strong style="color:#e2e8f0">Generate presentation</strong>.<br><br>
+<div class="status-card-value" style="color:#6080A8;font-size:.82rem;line-height:1.9">
+Fill in the details on the left and click <strong style="color:#D0E4FF">Generate presentation</strong>.<br><br>
 The pipeline will:<br>
 &nbsp;1. Extract your uploaded documents<br>
 &nbsp;2. Search the web for current data on your topic<br>
