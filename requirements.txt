@@ -13,3 +13,4 @@ plotly>=5.18.0
 matplotlib
 pdf2image
 pymupdf
+psycopg2-binary>=2.9.9

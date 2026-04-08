@@ -1,205 +1,233 @@
 """
-storage_pptx.py
-===============
-SQLite-backed project storage for the SEGA PowerPoint Creator.
-Mirrors the pattern from the Twitter Sentiment tool's storage.py.
+storage_pptx.py — Supabase/Postgres-backed persistence for the SEGA PowerPoint Creator.
 
-Each project is scoped to an owner (email address) and stores:
-  - name            : project display name
-  - business_question: the question used to drive the analysis
-  - doc_names       : JSON list of uploaded document filenames
-  - slide_json      : JSON string of the slide plan (plan_slide_data)
-  - pptx_bytes      : raw bytes of the generated PPTX (nullable)
-  - template_bytes  : raw bytes of the custom template (nullable)
-  - created_at      : ISO timestamp
-  - updated_at      : ISO timestamp
+Connection is via DATABASE_URL in st.secrets (standard Postgres DSN).
+Example secrets.toml entry:
+    DATABASE_URL = "postgresql://user:password@host:5432/dbname"
+
+On Supabase: use the "Session mode" connection string from
+Settings → Database → Connection string → URI (port 5432, NOT 6543).
+
+Tables created on first run:
+  - pptx_projects  : project metadata + slide JSON + chat history
+  - (pptx_bytes and template_bytes are stored as base64 TEXT to avoid
+     bytea encoding complexity — they are typically <5 MB each)
 """
 
-import sqlite3
 import json
-from pathlib import Path
-from datetime import datetime, timezone
-
-DB_PATH = Path("sega_pptx.db")
-
-
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+import base64
+import streamlit as st
+import psycopg2
+import psycopg2.extras
+from contextlib import contextmanager
 
 
-def get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+# ── Connection ────────────────────────────────────────────────────────────────
 
-
-def init_db() -> None:
-    with get_conn() as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS projects (
-                owner             TEXT    NOT NULL,
-                name              TEXT    NOT NULL,
-                business_question TEXT    NOT NULL DEFAULT '',
-                doc_names         TEXT    NOT NULL DEFAULT '[]',
-                slide_json        TEXT    NOT NULL DEFAULT '{}',
-                pptx_bytes        BLOB,
-                template_bytes    BLOB,
-                created_at        TEXT    NOT NULL,
-                updated_at        TEXT    NOT NULL,
-                PRIMARY KEY (owner, name)
-            )
-        """)
+@contextmanager
+def _get_conn():
+    """Yield a psycopg2 connection from the DATABASE_URL secret."""
+    url = st.secrets.get("DATABASE_URL", "")
+    if not url:
+        raise RuntimeError(
+            "DATABASE_URL not set in secrets.toml.\n"
+            "Add: DATABASE_URL = \"postgresql://user:pass@host:5432/dbname\""
+        )
+    conn = psycopg2.connect(
+        url,
+        sslmode="require",
+        options="-c statement_timeout=30000",
+    )
+    conn.autocommit = False
+    psycopg2.extras.register_default_jsonb(conn)
+    try:
+        yield conn
         conn.commit()
-
-    # Run migrations in a fresh connection so PRAGMA table_info reflects
-    # the committed schema (avoids "duplicate column" on partial-migrated DBs)
-    with get_conn() as conn:
-        _existing_cols = {r[1] for r in conn.execute("PRAGMA table_info(projects)").fetchall()}
-        migrations = [
-            ("game_title", "ALTER TABLE projects ADD COLUMN game_title TEXT NOT NULL DEFAULT ''"),
-            ("audience",   "ALTER TABLE projects ADD COLUMN audience TEXT NOT NULL DEFAULT 'Executive team'"),
-            ("plan_chat",  "ALTER TABLE projects ADD COLUMN plan_chat TEXT NOT NULL DEFAULT '[]'"),
-        ]
-        for col, sql in migrations:
-            if col not in _existing_cols:
-                conn.execute(sql)
-        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
-# ── CRUD ──────────────────────────────────────────────────────
+# ── Schema ────────────────────────────────────────────────────────────────────
+
+def init_db():
+    """Create tables if they don't exist. Safe to call on every startup."""
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS pptx_projects (
+                    owner           TEXT    NOT NULL,
+                    name            TEXT    NOT NULL,
+                    business_question TEXT  DEFAULT '',
+                    game_title      TEXT    DEFAULT '',
+                    audience        TEXT    DEFAULT '',
+                    doc_names       JSONB   DEFAULT '[]',
+                    slide_json      JSONB   DEFAULT '{}',
+                    plan_chat       JSONB   DEFAULT '[]',
+                    pptx_b64        TEXT    DEFAULT NULL,
+                    template_b64    TEXT    DEFAULT NULL,
+                    updated_at      TIMESTAMPTZ DEFAULT NOW(),
+                    PRIMARY KEY (owner, name)
+                )
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_pptx_projects_owner
+                ON pptx_projects (owner)
+            """)
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _b64enc(data: bytes | None) -> str | None:
+    if not data:
+        return None
+    return base64.b64encode(data).decode("ascii")
+
+
+def _b64dec(s: str | None) -> bytes | None:
+    if not s:
+        return None
+    return base64.b64decode(s.encode("ascii"))
+
+
+# ── Projects ──────────────────────────────────────────────────────────────────
 
 def get_projects(owner: str) -> list[dict]:
-    """Return all projects for this owner, ordered by updated_at desc."""
-    with get_conn() as conn:
-        rows = conn.execute(
-            """SELECT name, business_question, game_title, audience, doc_names, slide_json,
-                      pptx_bytes, template_bytes, plan_chat, created_at, updated_at
-               FROM projects
-               WHERE owner = ?
-               ORDER BY updated_at DESC""",
-            (owner,),
-        ).fetchall()
+    """Return list of {name, ...metadata} for this owner, sorted by name."""
+    with _get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                SELECT name, business_question, game_title, audience,
+                       doc_names, updated_at
+                FROM pptx_projects
+                WHERE owner = %s
+                ORDER BY name
+            """, (owner,))
+            rows = cur.fetchall()
     return [dict(r) for r in rows]
 
 
 def project_exists(owner: str, name: str) -> bool:
-    with get_conn() as conn:
-        row = conn.execute(
-            "SELECT 1 FROM projects WHERE owner = ? AND name = ?",
-            (owner, name),
-        ).fetchone()
-    return row is not None
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM pptx_projects WHERE owner = %s AND name = %s",
+                (owner, name)
+            )
+            return cur.fetchone() is not None
 
 
-def create_project(owner: str, name: str) -> None:
-    """Create a blank project. Raises ValueError if name already taken."""
-    if project_exists(owner, name):
-        raise ValueError(f"A project named '{name}' already exists.")
-    ts = _now()
-    with get_conn() as conn:
-        conn.execute(
-            """INSERT INTO projects
-               (owner, name, business_question, game_title, audience, doc_names, slide_json,
-                pptx_bytes, template_bytes, created_at, updated_at)
-               VALUES (?, ?, '', '', 'Executive team', '[]', '{}', NULL, NULL, ?, ?)""",
-            (owner, name, ts, ts),
-        )
-        conn.commit()
+def create_project(owner: str, name: str):
+    """Insert a new blank project row."""
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO pptx_projects (owner, name)
+                VALUES (%s, %s)
+                ON CONFLICT (owner, name) DO NOTHING
+            """, (owner, name))
 
 
-def rename_project(owner: str, old_name: str, new_name: str) -> None:
-    """Rename a project. Raises ValueError if new_name already taken."""
-    if old_name == new_name:
-        return
-    if project_exists(owner, new_name):
-        raise ValueError(f"A project named '{new_name}' already exists.")
-    with get_conn() as conn:
-        conn.execute(
-            "UPDATE projects SET name = ?, updated_at = ? WHERE owner = ? AND name = ?",
-            (new_name, _now(), owner, old_name),
-        )
-        conn.commit()
+def rename_project(owner: str, old_name: str, new_name: str):
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE pptx_projects SET name = %s, updated_at = NOW()
+                WHERE owner = %s AND name = %s
+            """, (new_name, owner, old_name))
 
 
-def delete_project(owner: str, name: str) -> None:
-    with get_conn() as conn:
-        conn.execute(
-            "DELETE FROM projects WHERE owner = ? AND name = ?",
-            (owner, name),
-        )
-        conn.commit()
+def delete_project(owner: str, name: str):
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM pptx_projects WHERE owner = %s AND name = %s",
+                (owner, name)
+            )
 
 
 def load_project(owner: str, name: str) -> dict | None:
-    """Load a project's full state. Returns None if not found."""
-    with get_conn() as conn:
-        row = conn.execute(
-            """SELECT name, business_question, game_title, audience, doc_names, slide_json,
-                      pptx_bytes, template_bytes, plan_chat, created_at, updated_at
-               FROM projects WHERE owner = ? AND name = ?""",
-            (owner, name),
-        ).fetchone()
+    """
+    Return all project data including binary blobs (decoded from base64).
+    Returns None if project doesn't exist.
+    """
+    with _get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                SELECT business_question, game_title, audience,
+                       doc_names, slide_json, plan_chat,
+                       pptx_b64, template_b64
+                FROM pptx_projects
+                WHERE owner = %s AND name = %s
+            """, (owner, name))
+            row = cur.fetchone()
     if not row:
         return None
-    d = dict(row)
-    # Parse JSON fields
-    d["doc_names"]  = json.loads(d["doc_names"]  or "[]")
-    d["slide_json"] = json.loads(d["slide_json"] or "{}")
-    d["plan_chat"]  = json.loads(d["plan_chat"]  or "[]")
-    return d
+    return {
+        "business_question": row["business_question"] or "",
+        "game_title":        row["game_title"] or "",
+        "audience":          row["audience"] or "",
+        "doc_names":         row["doc_names"] or [],
+        "slide_json":        row["slide_json"] or {},
+        "plan_chat":         row["plan_chat"] or [],
+        "pptx_bytes":        _b64dec(row["pptx_b64"]),
+        "template_bytes":    _b64dec(row["template_b64"]),
+    }
 
 
 def save_project(
     owner: str,
     name: str,
-    *,
-    business_question: str | None = None,
-    game_title: str | None = None,
-    audience: str | None = None,
-    doc_names: list[str] | None = None,
-    slide_json: dict | None = None,
-    plan_chat: list | None = None,
+    business_question: str = "",
+    game_title: str = "",
+    audience: str = "",
+    doc_names: list = None,
+    slide_json: dict = None,
+    plan_chat: list = None,
     pptx_bytes: bytes | None = None,
     template_bytes: bytes | None = None,
     clear_pptx: bool = False,
-    clear_template: bool = False,
-) -> None:
+):
     """
-    Upsert a project's state. Only provided (non-None) fields are updated.
-    Pass clear_pptx=True to NULL out saved PPTX bytes.
-    Pass clear_template=True to NULL out saved template bytes.
+    Upsert all project fields.
+    Pass clear_pptx=True to null out the stored PPTX without providing new bytes.
     """
-    # Load existing row to merge
-    existing = load_project(owner, name) or {}
+    pptx_b64     = None if clear_pptx else _b64enc(pptx_bytes)
+    template_b64 = _b64enc(template_bytes)
 
-    bq  = business_question if business_question is not None else existing.get("business_question", "")
-    gt  = game_title if game_title is not None else existing.get("game_title", "")
-    aud = audience if audience is not None else existing.get("audience", "Executive team")
-    dns = json.dumps(doc_names if doc_names is not None else existing.get("doc_names", []))
-    sj  = json.dumps(slide_json if slide_json is not None else existing.get("slide_json", {}))
-    pc  = json.dumps(plan_chat if plan_chat is not None else existing.get("plan_chat", []))
-    pb  = None if clear_pptx else (pptx_bytes if pptx_bytes is not None else existing.get("pptx_bytes"))
-    tb  = None if clear_template else (template_bytes if template_bytes is not None else existing.get("template_bytes"))
-
-    ts  = _now()
-    created = existing.get("created_at", ts)
-
-    with get_conn() as conn:
-        conn.execute(
-            """INSERT INTO projects
-               (owner, name, business_question, game_title, audience, doc_names, slide_json,
-                pptx_bytes, template_bytes, plan_chat, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT(owner, name) DO UPDATE SET
-                   business_question = excluded.business_question,
-                   game_title        = excluded.game_title,
-                   audience          = excluded.audience,
-                   doc_names         = excluded.doc_names,
-                   slide_json        = excluded.slide_json,
-                   pptx_bytes        = excluded.pptx_bytes,
-                   template_bytes    = excluded.template_bytes,
-                   plan_chat         = excluded.plan_chat,
-                   updated_at        = excluded.updated_at""",
-            (owner, name, bq, gt, aud, dns, sj, pb, tb, pc, created, ts),
-        )
-        conn.commit()
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO pptx_projects
+                    (owner, name, business_question, game_title, audience,
+                     doc_names, slide_json, plan_chat,
+                     pptx_b64, template_b64, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (owner, name) DO UPDATE SET
+                    business_question = EXCLUDED.business_question,
+                    game_title        = EXCLUDED.game_title,
+                    audience          = EXCLUDED.audience,
+                    doc_names         = EXCLUDED.doc_names,
+                    slide_json        = EXCLUDED.slide_json,
+                    plan_chat         = EXCLUDED.plan_chat,
+                    pptx_b64          = CASE
+                                          WHEN %s THEN NULL
+                                          ELSE COALESCE(EXCLUDED.pptx_b64,
+                                                        pptx_projects.pptx_b64)
+                                        END,
+                    template_b64      = COALESCE(EXCLUDED.template_b64,
+                                                 pptx_projects.template_b64),
+                    updated_at        = NOW()
+            """, (
+                owner, name,
+                business_question, game_title, audience,
+                json.dumps(doc_names or []),
+                json.dumps(slide_json or {}),
+                json.dumps(plan_chat or []),
+                pptx_b64,
+                template_b64,
+                # second pass of clear_pptx for the CASE expression
+                clear_pptx,
+            ))
