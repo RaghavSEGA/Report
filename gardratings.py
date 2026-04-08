@@ -4,12 +4,14 @@ Ratings Tracker — AI Assistant
 Run with:  streamlit run ratings_ai.py
 
 Secrets (.streamlit/secrets.toml):
-    ANTHROPIC_API_KEY      = "sk-ant-..."
-    AWS_ACCESS_KEY_ID      = "AKIA..."
-    AWS_SECRET_ACCESS_KEY  = "..."
-    AWS_SES_REGION         = "us-east-1"
-    EMAIL_FROM             = "noreply@segaamerica.com"
-    COOKIE_SIGNING_KEY     = "some-long-random-string"
+    AWS_ACCESS_KEY_ID          = "AKIA..."   # SES (OTP email)
+    AWS_SECRET_ACCESS_KEY      = "..."
+    AWS_SES_REGION             = "us-east-1"
+    EMAIL_FROM                 = "noreply@segaamerica.com"
+    AWS_ACCESS_KEY_ID_API      = "AKIA..."   # Bedrock (Claude AI)
+    AWS_SECRET_ACCESS_KEY_API  = "..."
+    AWS_BEDROCK_REGION         = "us-east-1"
+    COOKIE_SIGNING_KEY         = "some-long-random-string"
 """
 
 import base64
@@ -367,7 +369,7 @@ div[data-baseweb="menu"] li:hover { background: var(--surface3) !important; }
 # SECRETS
 # ─────────────────────────────────────────────────────────────
 
-claude_key = st.secrets.get("ANTHROPIC_API_KEY", "")
+claude_key = ""  # unused — auth is via AWS Bedrock IAM credentials
 
 # ─────────────────────────────────────────────────────────────
 # OTP / SES AUTH
@@ -695,13 +697,6 @@ with st.sidebar:
                     unsafe_allow_html=True)
         st.markdown("---")
 
-    st.markdown("### 🤖 Model")
-    model = st.selectbox("Claude model", [
-        "claude-sonnet-4-20250514",
-        "claude-opus-4-20250514",
-        "claude-haiku-4-5-20251001",
-    ], label_visibility="collapsed")
-
 # ─────────────────────────────────────────────────────────────
 # NO FILE UPLOADED — empty state
 # ─────────────────────────────────────────────────────────────
@@ -808,9 +803,8 @@ st.dataframe(
 
 st.markdown('<div class="sec">ASK CLAUDE</div>', unsafe_allow_html=True)
 
-if not claude_key:
-    st.warning("Add `ANTHROPIC_API_KEY` to `.streamlit/secrets.toml` to enable the AI assistant.")
-    st.code('ANTHROPIC_API_KEY = "sk-ant-..."', language="toml")
+if not st.secrets.get("AWS_ACCESS_KEY_ID_API", ""):
+    st.warning("Add `AWS_ACCESS_KEY_ID_API`, `AWS_SECRET_ACCESS_KEY_API`, and `AWS_BEDROCK_REGION` to `.streamlit/secrets.toml` to enable the AI assistant.")
     st.stop()
 
 # Suggested prompt chips (rendered as buttons in a row)
@@ -865,14 +859,18 @@ if st.session_state.chat_pending:
     st.session_state.chat_pending = False
     try:
         import anthropic
-        client   = anthropic.Anthropic(api_key=claude_key)
+        client = anthropic.AnthropicBedrock(
+            aws_access_key=st.secrets.get("AWS_ACCESS_KEY_ID_API", ""),
+            aws_secret_key=st.secrets.get("AWS_SECRET_ACCESS_KEY_API", ""),
+            aws_region=st.secrets.get("AWS_BEDROCK_REGION", "us-east-1"),
+        )
         api_msgs = [{"role": m["role"], "content": m["content"]}
                     for m in st.session_state.chat_history]
         with st.chat_message("assistant"):
             reply = ""
             ph    = st.empty()
             with client.messages.stream(
-                model=model,
+                model="us.anthropic.claude-sonnet-4-6",
                 max_tokens=1500,
                 system=SYSTEM,
                 messages=api_msgs,

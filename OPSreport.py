@@ -1,15 +1,17 @@
 """
-FY26 Submission Tracker — SEGA Platform Ops
-============================================
+Submission Tracker — SEGA Platform Ops
+=======================================
 Run with:  streamlit run submission_tracker.py
 
-Secrets required (.streamlit/secrets.toml):
-    ANTHROPIC_API_KEY      = "sk-ant-..."
-    AWS_ACCESS_KEY_ID      = "..."
-    AWS_SECRET_ACCESS_KEY  = "..."
-    AWS_SES_REGION         = "us-east-1"
-    EMAIL_FROM             = "noreply@segaamerica.com"
-    COOKIE_SIGNING_KEY     = "some-long-random-string"
+Secrets (.streamlit/secrets.toml):
+    AWS_ACCESS_KEY_ID          = "AKIA..."   # SES (OTP email)
+    AWS_SECRET_ACCESS_KEY      = "..."
+    AWS_SES_REGION             = "us-east-1"
+    EMAIL_FROM                 = "noreply@segaamerica.com"
+    AWS_ACCESS_KEY_ID_API      = "AKIA..."   # Bedrock (Claude AI)
+    AWS_SECRET_ACCESS_KEY_API  = "..."
+    AWS_BEDROCK_REGION         = "us-east-1"
+    COOKIE_SIGNING_KEY         = "some-long-random-string"
 """
 
 import base64
@@ -29,7 +31,7 @@ import streamlit as st
 # ─────────────────────────────────────────────────────────────
 
 st.set_page_config(
-    page_title="FY26 Submission Tracker",
+    page_title="Submission Tracker",
     page_icon="🎮",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -159,6 +161,21 @@ div[data-baseweb="tab-border"] { background:var(--border) !important; }
 /* CHAT */
 .stChatMessage { background:var(--surface2) !important; border:1px solid var(--border) !important; border-radius:8px !important; }
 
+/* SUGGESTED CHIPS */
+.chip-wrap { display:flex; flex-wrap:wrap; gap:.5rem; margin-bottom:1.25rem; }
+.chip {
+    background: var(--surface2);
+    border: 1px solid var(--border-hi);
+    border-radius: 20px;
+    padding: .3rem .85rem;
+    font-size: .72rem;
+    color: var(--text-dim) !important;
+    cursor: pointer;
+    transition: all .15s;
+    white-space: nowrap;
+}
+.chip:hover { border-color: var(--blue); color: var(--blue) !important; background: rgba(64,128,255,.08); }
+
 /* FOOTER */
 .footer { margin-top:4rem; padding:1.5rem 0; border-top:1px solid var(--border);
           display:flex; align-items:center; justify-content:space-between; }
@@ -172,7 +189,7 @@ div[data-baseweb="tab-border"] { background:var(--border) !important; }
 # SECRETS
 # ─────────────────────────────────────────────────────────────
 
-claude_key = st.secrets.get("ANTHROPIC_API_KEY", "")
+claude_key = ""  # unused — auth is via AWS Bedrock IAM credentials
 
 # ─────────────────────────────────────────────────────────────
 # OTP / SES AUTH
@@ -208,7 +225,7 @@ def _send_otp(email: str, code: str) -> bool:
                         "Data": f"""
                         <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:32px 24px;background:#f8f9ff;">
                           <div style="font-size:22px;font-weight:900;letter-spacing:.1em;color:#4080ff;margin-bottom:4px;">SEGA</div>
-                          <div style="font-size:14px;color:#444;margin-bottom:28px;">FY26 Submission Tracker</div>
+                          <div style="font-size:14px;color:#444;margin-bottom:28px;">Submission Tracker</div>
                           <div style="font-size:14px;color:#222;margin-bottom:16px;">Your verification code is:</div>
                           <div style="font-size:42px;font-weight:900;letter-spacing:.18em;color:#1a1a2e;
                                       background:#e8eeff;border-radius:8px;padding:18px 24px;
@@ -293,7 +310,7 @@ if not st.session_state.auth_verified:
         st.markdown("""
         <div class="auth-wrap">
           <div class="auth-logo">SEGA</div>
-          <div class="auth-title">FY26 Submission Tracker</div>
+          <div class="auth-title">Submission Tracker</div>
           <div class="auth-sub">Sign in with your SEGA America email to continue</div>
         </div>""", unsafe_allow_html=True)
 
@@ -450,13 +467,10 @@ DATA_FILES = {
 
 @st.cache_data(show_spinner=False)
 def load_local(path: str) -> pd.DataFrame:
-    """Load a bundled CSV from the repo, trying multiple encodings."""
-    for enc in ("utf-8", "utf-8-sig", "latin-1", "cp1252"):
-        try:
-            return load_data(open(path, "rb").read(), path)
-        except UnicodeDecodeError:
-            continue
-    return load_data(open(path, "rb").read(), path)
+    """Read a bundled repo CSV and process it through the standard pipeline."""
+    with open(path, "rb") as f:
+        raw = f.read()
+    return load_data(raw, path)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -470,7 +484,8 @@ tab_dash, tab_chat = st.tabs(["📊  Dashboard", "💬  Ask Claude"])
 # ══════════════════════════════════════════════════════════════
 
 with tab_dash:
-    fy = st.session_state.get("fy_choice", "FY26")
+    # fy_choice is set by the sidebar radio above; default FY26
+    fy        = fy_choice          # already a string: "FY26" or "FY27"
     data_path = DATA_FILES[fy]
 
     try:
@@ -490,7 +505,7 @@ with tab_dash:
         st.markdown("### Filters")
         def sb(label, col):
             o = opts(df_raw[col]) if col in df_raw.columns else ["All"]
-            return st.selectbox(label, o, key=f"f_{col.replace(' ','_')}")
+            return st.selectbox(label, o, key=f"{fy}_f_{col.replace(' ','_')}")
 
         f_codename  = sb("Codename",  "Codename")
         f_party     = sb("1st Party", "1st Party")
@@ -498,7 +513,7 @@ with tab_dash:
         f_product   = sb("Product",   "Product")
         f_submitter = sb("Submitter", "Submitter")
         f_month     = sb("Month",     "Month")
-        f_quarter   = st.selectbox("Quarter", list(QUARTER_MAP.keys()), key="f_quarter")
+        f_quarter   = st.selectbox("Quarter", list(QUARTER_MAP.keys()), key=f"{fy}_f_quarter")
 
     # ── Apply filters ─────────────────────────────────────────
     df = df_raw.copy()
@@ -512,7 +527,7 @@ with tab_dash:
         df = df[df["MonthNum"].isin(QUARTER_MAP[f_quarter])]
 
     # ── Metric cards ──────────────────────────────────────────
-    st.markdown('<div class="section-header"><span class="dot"></span>OVERVIEW</div>',
+    st.markdown(f'<div class="section-header"><span class="dot"></span>OVERVIEW · {fy}</div>',
                 unsafe_allow_html=True)
     total   = len(df)
     passed  = int((df["Result"] == "PASS").sum())  if "Result" in df.columns else 0
@@ -653,16 +668,8 @@ with tab_dash:
 # ══════════════════════════════════════════════════════════════
 
 with tab_chat:
-    if not claude_key:
-        st.warning("No `ANTHROPIC_API_KEY` found in `.streamlit/secrets.toml`.")
-        st.code("""# .streamlit/secrets.toml
-ANTHROPIC_API_KEY      = "sk-ant-..."
-AWS_ACCESS_KEY_ID      = "AKIA..."
-AWS_SECRET_ACCESS_KEY  = "..."
-AWS_SES_REGION         = "us-east-1"
-EMAIL_FROM             = "noreply@segaamerica.com"
-COOKIE_SIGNING_KEY     = "some-long-random-secret"
-""", language="toml")
+    if not st.secrets.get("AWS_ACCESS_KEY_ID_API", ""):
+        st.warning("Add `AWS_ACCESS_KEY_ID_API`, `AWS_SECRET_ACCESS_KEY_API`, and `AWS_BEDROCK_REGION` to `.streamlit/secrets.toml` to enable the AI assistant.")
         st.stop()
 
     st.markdown("""
@@ -675,6 +682,28 @@ COOKIE_SIGNING_KEY     = "some-long-random-secret"
         based on the filtered data in the Dashboard tab.
       </div>
     </div>""", unsafe_allow_html=True)
+
+    SUGGESTED_PROMPTS = [
+        f"What is the overall pass rate for {fy}?",
+        "Which titles have the most failures?",
+        "Show me all FAILs and their reasons",
+        "Which submitters have the highest pass rate?",
+        "Which platforms have the most submissions?",
+        "List titles that are still PENDING",
+        "What are the most common fail reasons?",
+        "How many submissions were there per month?",
+    ]
+
+    st.markdown("**Suggested questions**")
+    chip_cols = st.columns(4)
+    for i, prompt in enumerate(SUGGESTED_PROMPTS):
+        with chip_cols[i % 4]:
+            if st.button(prompt, key=f"chip_{i}"):
+                st.session_state.chat_history.append({"role": "user", "content": prompt})
+                st.session_state.chat_pending = True
+                st.rerun()
+
+    st.markdown("<div style='margin-top:.5rem'></div>", unsafe_allow_html=True)
 
     # Build data context for Claude
     def _data_context() -> str:
@@ -708,10 +737,10 @@ If you cannot answer from the available data, say so clearly."""
         try:
             import anthropic
             client = anthropic.AnthropicBedrock(
-    aws_access_key   = st.secrets.get("AWS_ACCESS_KEY_ID_API", ""),
-    aws_secret_key   = st.secrets.get("AWS_SECRET_ACCESS_KEY_API", ""),
-    aws_region       = st.secrets.get("AWS_BEDROCK_REGION", "us-east-1"),
-)
+                aws_access_key=st.secrets.get("AWS_ACCESS_KEY_ID_API", ""),
+                aws_secret_key=st.secrets.get("AWS_SECRET_ACCESS_KEY_API", ""),
+                aws_region=st.secrets.get("AWS_BEDROCK_REGION", "us-east-1"),
+            )
             api_msgs = [{"role": m["role"], "content": m["content"]}
                         for m in st.session_state.chat_history]
             with st.chat_message("assistant"):
