@@ -417,6 +417,10 @@ Rules:
 - Bullets: max 6 per slide, each under 15 words
 - Comparison rows: max 8 per slide
 - Use "chart" type when data supports it
+- TOPIC DISCIPLINE: Stay strictly on the topic as given. Do NOT introduce tangential subjects,
+  industry trends, or technology themes — including AI, machine learning, or automation — unless
+  they appear explicitly in the uploaded documents, the research brief, or the business question.
+  If the topic has nothing to do with AI or technology, do not mention them at all.
 - Return ONLY valid JSON — no markdown fences, no explanation
 """
 
