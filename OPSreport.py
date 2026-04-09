@@ -286,6 +286,7 @@ for k, v in {
     "otp_code": "", "otp_email": "", "otp_expiry": 0,
     "otp_sent": False, "otp_attempts": 0,
     "chat_history": [], "chat_pending": False,
+    "user_context": "",
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -414,7 +415,7 @@ st.markdown("""
 # ─────────────────────────────────────────────────────────────
 
 RESULT_COLORS  = {"PASS": "#20c65a", "FAIL": "#ff3d52", "PRE": "#aaaaaa", "PENDING": "#f0a500"}
-PRODUCT_COLORS = {"Demo": "#4c9be8", "Dlc": "#6a0dad", "Game": "#e07030", "Patch": "#3333cc"}
+PRODUCT_COLORS = {"Demo": "#4c9be8", "DLC": "#6a0dad", "Game": "#e07030", "Patch": "#3333cc"}
 QUARTER_MAP    = {
     "Q1 (Apr–Jun)": [4,5,6],   "Q2 (Jul–Sep)": [7,8,9],
     "Q3 (Oct–Dec)": [10,11,12], "Q4 (Jan–Mar)": [1,2,3],
@@ -705,6 +706,34 @@ with tab_chat:
 
     st.markdown("<div style='margin-top:.5rem'></div>", unsafe_allow_html=True)
 
+    # ── Editable context ──────────────────────────────────────
+    with st.expander("✏️ Add context for Claude", expanded=False):
+        st.markdown(
+            "<div style='font-size:.75rem;color:var(--muted);margin-bottom:.5rem;'>"
+            "Provide extra background — platform quirks, specific titles to focus on, "
+            "known issues, or anything else Claude should keep in mind for this session."
+            "</div>", unsafe_allow_html=True,
+        )
+        user_context = st.text_area(
+            "Additional context",
+            value=st.session_state.get("user_context", ""),
+            placeholder="e.g. 'Focus only on Switch submissions. ESRB delays are expected for title X.'",
+            height=100,
+            label_visibility="collapsed",
+            key="user_context_input",
+        )
+        col_save, col_clear, _ = st.columns([1, 1, 4])
+        with col_save:
+            if st.button("Save", key="ctx_save"):
+                st.session_state["user_context"] = user_context
+                st.success("Context saved.", icon="✅")
+        with col_clear:
+            if st.button("Clear", key="ctx_clear"):
+                st.session_state["user_context"] = ""
+                st.rerun()
+
+    saved_context = st.session_state.get("user_context", "").strip()
+
     # Build data context for Claude
     def _data_context() -> str:
         try:
@@ -716,10 +745,12 @@ with tab_chat:
         except Exception:
             return "Data available but could not be serialised."
 
+    _extra = f"\n\nADDITIONAL CONTEXT FROM USER:\n{saved_context}" if saved_context else ""
+
     SYSTEM = f"""You are an internal data analyst for SEGA America's Platform Operations team.
 You help the team understand their {fy} 1st-party submission tracker.
 
-{_data_context()}
+{_data_context()}{_extra}
 
 Answer questions about pass/fail rates, trends, specific titles, submitters, platforms,
 fail reasons, turnaround times, or anything else the user asks.
