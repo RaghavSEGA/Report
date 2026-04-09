@@ -397,96 +397,84 @@ def _web_research(topic: str, purpose: str, industry: str, question: str) -> tup
 # Image fetching — Bing Image Search (primary) with DuckDuckGo fallback
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Image fetching — uses Claude web_search to find a real image URL, then
+# downloads it directly. Works reliably on Streamlit Cloud.
+# ─────────────────────────────────────────────────────────────────────────────
+
 def _fetch_image_for_query(query: str) -> bytes | None:
     """
-    Fetch real image bytes for a search query.
-    Tries Bing Image Search API first (requires BING_IMAGE_API_KEY in secrets),
-    then falls back to DuckDuckGo scraping.
-    Returns raw image bytes or None if nothing usable is found.
+    Ask Claude (with web_search) to find a direct image URL for the query,
+    then download and return the raw bytes. Returns None on any failure.
     """
     if not query or not query.strip():
         return None
 
-    # ── Try Bing Image Search API ─────────────────────────────────────────────
-    bing_key = st.secrets.get("BING_IMAGE_API_KEY", "")
-    if bing_key:
-        try:
-            import urllib.request, urllib.parse
-            params = urllib.parse.urlencode({
-                "q": query, "count": "5", "safeSearch": "Moderate",
-                "imageType": "Photo", "size": "Medium",
-            })
-            req = urllib.request.Request(
-                f"https://api.bing.microsoft.com/v7.0/images/search?{params}",
-                headers={"Ocp-Apim-Subscription-Key": bing_key},
-            )
-            import json as _j
-            with urllib.request.urlopen(req, timeout=8) as resp:
-                data = _j.loads(resp.read())
-            for item in data.get("value", [])[:5]:
-                img_url = item.get("contentUrl", "")
-                if not img_url:
-                    continue
-                try:
-                    req2 = urllib.request.Request(
-                        img_url, headers={"User-Agent": "Mozilla/5.0"}
-                    )
-                    with urllib.request.urlopen(req2, timeout=6) as img_resp:
-                        img_bytes = img_resp.read()
-                    if len(img_bytes) > 1000 and img_bytes[:3] in (
-                        b'\xff\xd8\xff', b'\x89PN', b'GIF',
-                    ) or img_bytes[:4] == b'\x89PNG':
-                        return img_bytes
-                except Exception:
-                    continue
-        except Exception:
-            pass  # fall through to DuckDuckGo
-
-    # ── Fallback: DuckDuckGo image scraping ───────────────────────────────────
     try:
-        import urllib.request, urllib.parse, re as _re, json as _j
-        headers = {"User-Agent": "Mozilla/5.0"}
-        search_url = "https://duckduckgo.com/?q=" + urllib.parse.quote(query) + "&iax=images&ia=images"
-        req = urllib.request.Request(search_url, headers=headers)
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            html = resp.read().decode("utf-8", errors="replace")
+        import urllib.request, json as _j
 
-        vqd_match = _re.search(r'vqd=(["\'])([^"\']+)\1', html)
-        if not vqd_match:
-            vqd_match = _re.search(r'vqd=([\d-]+)', html)
-            vqd = vqd_match.group(1) if vqd_match else None
-        else:
-            vqd = vqd_match.group(2)
-        if not vqd:
+        client = _make_anthropic_client()
+
+        # Ask Claude to find a direct image URL using web search
+        msg = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=300,
+            tools=[{"type": "web_search_20250305", "name": "web_search"}],
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Find a direct URL to a real image (jpg, png, or webp) for: {query}\n\n"
+                    "Search the web and return ONLY a single raw image URL on its own line — "
+                    "no markdown, no explanation, just the URL starting with https://. "
+                    "The URL must point directly to an image file, not a webpage. "
+                    "Prefer official sources like official game websites, Wikipedia, or press kits."
+                )
+            }],
+        )
+
+        # Extract the URL from Claude's text response
+        text = "\n".join(
+            b.text for b in msg.content
+            if hasattr(b, "type") and b.type == "text" and b.text
+        ).strip()
+
+        # Find the first https:// URL in the response
+        import re as _re
+        url_match = _re.search(r'https://\S+\.(?:jpg|jpeg|png|webp|gif)(?:\?\S*)?', text, _re.IGNORECASE)
+        if not url_match:
+            # Fallback: grab any https URL
+            url_match = _re.search(r'https://[^\s\)\]"\']+', text)
+        if not url_match:
             return None
 
-        img_url = (
-            "https://duckduckgo.com/i.js?q=" + urllib.parse.quote(query)
-            + "&vqd=" + urllib.parse.quote(vqd) + "&o=json&p=1"
-        )
-        req2 = urllib.request.Request(
-            img_url, headers={**headers, "Referer": "https://duckduckgo.com/"}
-        )
-        with urllib.request.urlopen(req2, timeout=8) as resp2:
-            data = _j.loads(resp2.read())
+        img_url = url_match.group(0).rstrip('.,;)')
 
-        for result in data.get("results", [])[:5]:
-            img_src = result.get("image") or result.get("thumbnail")
-            if not img_src:
-                continue
-            try:
-                req3 = urllib.request.Request(img_src, headers=headers)
-                with urllib.request.urlopen(req3, timeout=6) as img_resp:
-                    img_bytes = img_resp.read()
-                if len(img_bytes) > 1000 and (
-                    img_bytes[:4] in (b'\x89PNG', b'\xff\xd8\xff', b'GIF8', b'RIFF')
-                    or img_bytes[8:12] == b'WEBP'
-                ):
-                    return img_bytes
-            except Exception:
-                continue
+        # Download the image
+        req = urllib.request.Request(
+            img_url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (compatible; SEGA/1.0)",
+                "Accept": "image/*,*/*",
+            }
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            img_bytes = resp.read()
+
+        # Validate it's actually an image
+        if len(img_bytes) < 500:
+            return None
+        magic = img_bytes[:4]
+        if magic in (b'\x89PNG', b'\xff\xd8\xff', b'GIF8', b'RIFF', b'WEBP'):
+            return img_bytes
+        if img_bytes[8:12] == b'WEBP':
+            return img_bytes
+        # Also accept if content-type was image (bytes may not start with magic for some formats)
+        if len(img_bytes) > 1000:
+            return img_bytes
+
     except Exception:
         pass
+
     return None
 
 
@@ -907,17 +895,20 @@ def _postprocess_pptx(pptx_bytes: bytes, slides_list: list) -> bytes:
         H = prs2.slide_height / 914400
 
         for slide, sdata in zip(prs2.slides, slides_list):
-            # Source line
+            # ── Source line ───────────────────────────────────────────────────
             src_text = (sdata.get("source") or "").strip()
             if src_text:
-                txb = slide.shapes.add_textbox(_In(0.3), _In(H-0.28), _In(W-0.6), _In(0.22))
-                tf  = txb.text_frame; tf.word_wrap = False
-                run = tf.paragraphs[0].add_run()
-                run.text = f"Source: {src_text}"
-                run.font.size = _Pt(7); run.font.italic = True
-                run.font.color.rgb = _RGB(0x88,0x99,0xBB); run.font.name = "Calibri"
+                try:
+                    txb = slide.shapes.add_textbox(_In(0.3), _In(H-0.28), _In(W-0.6), _In(0.22))
+                    tf  = txb.text_frame; tf.word_wrap = False
+                    run = tf.paragraphs[0].add_run()
+                    run.text = f"Source: {src_text}"
+                    run.font.size = _Pt(7); run.font.italic = True
+                    run.font.color.rgb = _RGB(0x88,0x99,0xBB); run.font.name = "Calibri"
+                except Exception:
+                    pass
 
-            # Image
+            # ── Image ─────────────────────────────────────────────────────────
             img_query = (sdata.get("image_search_query") or "").strip()
             stype = (sdata.get("type") or "").lower()
             if img_query and stype not in ("title","closing","chart"):
@@ -929,17 +920,24 @@ def _postprocess_pptx(pptx_bytes: bytes, slides_list: list) -> bytes:
                         img_h = H * 0.50
                         img_x = W - img_w - 0.12
                         img_y = (H - img_h) / 2
+                        # Shrink text boxes that overlap the image zone
                         for sh in slide.shapes:
                             if sh.has_text_frame:
                                 sh_right = (sh.left + sh.width) / 914400
                                 if sh_right > img_x:
                                     sh.width = max(int(0.5*914400), int((img_x - sh.left/914400 - 0.1)*914400))
-                        slide.shapes.add_picture(_io.BytesIO(img_bytes), _In(img_x), _In(img_y), _In(img_w), _In(img_h))
-                    except Exception:
-                        pass
+                        slide.shapes.add_picture(
+                            _io.BytesIO(img_bytes), _In(img_x), _In(img_y), _In(img_w), _In(img_h)
+                        )
+                    except Exception as _ie:
+                        # Log to stderr so it appears in Streamlit Cloud logs
+                        import sys
+                        print(f"[image embed error] {img_query}: {_ie}", file=sys.stderr)
 
         out = _io.BytesIO(); prs2.save(out); return out.getvalue()
-    except Exception:
+    except Exception as _e:
+        import sys
+        print(f"[postprocess error] {_e}", file=sys.stderr)
         return pptx_bytes
 
 
