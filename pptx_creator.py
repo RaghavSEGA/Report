@@ -294,10 +294,12 @@ if not st.session_state.auth_verified:
 # Web research — generic, topic-aware
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _web_research(topic: str, purpose: str, industry: str, question: str) -> str:
-    """Run a web search and return a structured research brief on the topic."""
+def _web_research(topic: str, purpose: str, industry: str, question: str) -> tuple[str, list[dict]]:
+    """Run a web search and return (research_text, sources).
+    sources is a list of {"title": ..., "url": ...} dicts extracted from tool results.
+    """
     if not topic.strip():
-        return "[No research topic specified]"
+        return "[No research topic specified]", []
 
     purpose_hint = PURPOSE_PRESETS.get(purpose, purpose)
     industry_hint = f" in the {industry} industry" if industry.strip() else ""
@@ -328,19 +330,44 @@ def _web_research(topic: str, purpose: str, industry: str, question: str) -> str
                 tools=[{"type": "web_search_20250305", "name": "web_search"}],
                 messages=[{"role": "user", "content": prompt}],
             )
-            return "\n".join(
+            # Extract text content
+            text = "\n".join(
                 b.text for b in msg.content
                 if hasattr(b, "type") and b.type == "text" and b.text
             ) or "[No results returned]"
+            # Extract source URLs from tool result blocks
+            sources = []
+            seen_urls = set()
+            for block in msg.content:
+                if not hasattr(block, "type"):
+                    continue
+                # web_search tool results contain a list of result objects
+                if block.type == "tool_result":
+                    for item in (block.content or []):
+                        if hasattr(item, "type") and item.type == "web_search_result":
+                            url   = getattr(item, "url", None)
+                            title = getattr(item, "title", url)
+                            if url and url not in seen_urls:
+                                seen_urls.add(url)
+                                sources.append({"title": title or url, "url": url})
+                # Anthropic SDK may surface results as tool_use with nested results
+                if getattr(block, "type", "") == "tool_use" and getattr(block, "name", "") == "web_search":
+                    for result in (getattr(block, "results", None) or []):
+                        url   = getattr(result, "url", None)
+                        title = getattr(result, "title", url)
+                        if url and url not in seen_urls:
+                            seen_urls.add(url)
+                            sources.append({"title": title or url, "url": url})
+            return text, sources
         except Exception as e:
-            return f"[Web research error: {e}]"
+            return f"[Web research error: {e}]", []
 
     with _cf.ThreadPoolExecutor(max_workers=1) as ex:
         fut = ex.submit(_fetch)
         try:
             return fut.result(timeout=TIMEOUT)
         except _cf.TimeoutError:
-            return f"[Web research timed out after {TIMEOUT}s — using model knowledge]"
+            return f"[Web research timed out after {TIMEOUT}s — using model knowledge]", []
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -358,11 +385,17 @@ def _build_analysis_prompt(
     research_text: str,
     data_summary: str,
     theme: dict,
+    sources: list | None = None,
 ) -> str:
     purpose_hint = PURPOSE_PRESETS.get(purpose, purpose)
     industry_ctx = f" in the {industry} industry" if industry.strip() else ""
     primary  = theme.get("primary", "1A3A6B")
     accent   = theme.get("accent",  "0099CC")
+
+    sources_block = ""
+    if sources:
+        lines = "\n".join(f'  - {s["title"]}: {s["url"]}' for s in sources[:20])
+        sources_block = f"\n## VERIFIED WEB SOURCES (include as final Sources slide):\n{lines}\n"
 
     return f"""You are an expert presentation strategist and analyst.
 Create a JSON outline for a {slide_count}-slide professional presentation.
@@ -381,7 +414,7 @@ Create a JSON outline for a {slide_count}-slide professional presentation.
 
 ## DATA FOR CHARTS:
 {data_summary if data_summary else "(none uploaded)"}
-
+{sources_block}
 Output a single JSON object. Schema:
 {{
   "title":"...", "subtitle":"...",
@@ -410,7 +443,6 @@ Output a single JSON object. Schema:
 
 Rules:
 - Use REAL data from documents and research — no placeholders
-- Supply sources as well for all of the documents/research.
 - Tailor depth, tone, and structure to: {purpose} for {audience}
 - Purpose hint: {purpose_hint}
 - theme.primary and theme.accent must be vivid hex (6 digits, no #)
@@ -422,6 +454,7 @@ Rules:
   industry trends, or technology themes — including AI, machine learning, or automation — unless
   they appear explicitly in the uploaded documents, the research brief, or the business question.
   If the topic has nothing to do with AI or technology, do not mention them at all.
+{f'- SOURCES: The last slide MUST be a "bullets" type slide titled "Sources" listing each source as a bullet in the format "Title — URL". Use ONLY the URLs from the VERIFIED WEB SOURCES list above.' if sources else ''}
 - Return ONLY valid JSON — no markdown fences, no explanation
 """
 
@@ -463,7 +496,8 @@ def run_pipeline(
         ))
 
     doc_text     = "[No documents uploaded]"
-    research_txt = "[No web research — using model knowledge]"
+    research_txt     = "[No web research — using model knowledge]"
+    research_sources = []
     _file_stats  = []
 
     def _extract_docs():
@@ -482,7 +516,7 @@ def run_pipeline(
 
     def _do_research():
         if not web_search_en or not topic.strip():
-            return "[Web search disabled]"
+            return "[Web search disabled]", []
         return _web_research(topic, purpose, industry, question)
 
     # ── Parallel: extract docs + web research ─────────────────────────────────
@@ -511,14 +545,22 @@ def run_pipeline(
                     ))
                     yield ("step_done", "extract")
                 else:
-                    research_txt = f.result()
+                    result = f.result()
+                    if isinstance(result, tuple):
+                        research_txt, research_sources = result
+                    else:
+                        research_txt, research_sources = result, []
                     ok = not research_txt.startswith("[")
                     yield ("log", (
                         f"{'✅' if ok else '⚠️'} <b>Web research</b> — "
                         f"{'~' + str(len(research_txt.split())) + ' words' if ok else 'used model knowledge'}<br>"
-                        f"<span class='log-detail'>Topic: {topic}</span>"
+                        f"<span class='log-detail'>Topic: {topic}"
+                        + (f" · {len(research_sources)} source(s) found" if research_sources else "")
+                        + "</span>"
                     ))
                     yield ("step_done", "research")
+                    if research_sources:
+                        yield ("sources", research_sources)
 
             if pending:
                 elapsed += TICK
@@ -569,6 +611,7 @@ def run_pipeline(
     prompt = _build_analysis_prompt(
         topic, purpose, industry, audience, question,
         slide_count, doc_text, research_txt, data_summary, theme,
+        sources=research_sources,
     )
     est_tokens = len(prompt) // 4
 
@@ -1013,11 +1056,280 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-_tab_main, _tab_pdf, _tab_transfer = st.tabs([
+_tab_main, _tab_guided, _tab_pdf, _tab_transfer = st.tabs([
     "📊 Create Presentation",
+    "💬 Guided Build",
     "📄 PDF → Editable PPTX",
     "🔄 Template Transfer",
 ])
+
+with _tab_guided:
+    st.markdown(
+        "<div style='font-size:.85rem;color:#8899BB;margin-bottom:1rem'>"
+        "Describe what you need and Claude will ask clarifying questions, "
+        "then build your presentation when you're ready."
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+    # ── Session state init ────────────────────────────────────────────────────
+    if "guided_messages" not in st.session_state:
+        st.session_state["guided_messages"] = []
+    if "guided_ready" not in st.session_state:
+        st.session_state["guided_ready"] = False
+    if "guided_params" not in st.session_state:
+        st.session_state["guided_params"] = {}
+
+    _gc_left, _gc_right = st.columns([1, 1], gap="large")
+
+    with _gc_left:
+        st.markdown('<div class="section-label">Conversation</div>', unsafe_allow_html=True)
+
+        # Chat history
+        _chat_box = st.container(height=420)
+        with _chat_box:
+            if not st.session_state["guided_messages"]:
+                st.markdown(
+                    "<div style='color:#4A6A9A;font-size:.85rem;padding:.5rem 0'>"
+                    "👋 Hi! Tell me about the presentation you need — topic, "
+                    "purpose, audience, anything you have in mind."
+                    "</div>",
+                    unsafe_allow_html=True,
+                )
+            for _msg in st.session_state["guided_messages"]:
+                with st.chat_message(_msg["role"]):
+                    st.markdown(_msg["content"])
+
+        _guided_input = st.chat_input(
+            "Tell me about your presentation…", key="guided_chat_input"
+        )
+
+        if _guided_input:
+            st.session_state["guided_messages"].append(
+                {"role": "user", "content": _guided_input}
+            )
+
+            _guide_system = """You are a friendly presentation consultant helping a SEGA America employee plan a presentation.
+Your job is to gather enough information to build a great deck through natural conversation, then confirm you're ready.
+
+Gather (one or two questions at a time, conversationally):
+- Topic / subject
+- Purpose (e.g. executive briefing, sales pitch, project proposal, market analysis)
+- Audience (e.g. executive team, external clients, internal team)
+- Rough slide count (suggest 8-12 if not mentioned)
+- Any specific points, data, sections, or emphasis they want
+- Industry or context (optional)
+
+Keep it warm and concise. Do NOT ask all questions at once.
+
+Once you have at minimum topic + purpose + audience, confirm the plan by ending your message with exactly:
+READY_TO_GENERATE: {"topic": "...", "purpose": "...", "industry": "...", "audience": "...", "question": "...", "slide_count": 10}
+
+Fill the JSON with real values from the conversation. Use empty string for anything not mentioned.
+The "question" field should capture the core goal or key question the deck should answer.
+Do NOT wrap the JSON line in markdown fences. Keep your confirmation message friendly."""
+
+            _guide_msgs = [
+                {"role": m["role"], "content": m["content"]}
+                for m in st.session_state["guided_messages"]
+            ]
+
+            try:
+                _gc_client = _make_anthropic_client()
+                _gc_resp = _gc_client.messages.create(
+                    model="claude-sonnet-4-6",
+                    max_tokens=600,
+                    system=_guide_system,
+                    messages=_guide_msgs,
+                )
+                _reply = (
+                    _gc_resp.content[0].text if _gc_resp.content else
+                    "Sorry, I had trouble responding. Please try again."
+                )
+            except Exception as _ge:
+                _reply = f"(Connection error: {_ge})"
+
+            # Parse READY_TO_GENERATE signal
+            _clean_reply = _reply
+            if "READY_TO_GENERATE:" in _reply:
+                try:
+                    _json_line = (
+                        _reply.split("READY_TO_GENERATE:")[1].strip().split("\n")[0]
+                    )
+                    _parsed_params = json.loads(_json_line)
+                    st.session_state["guided_params"] = _parsed_params
+                    st.session_state["guided_ready"] = True
+                    _clean_reply = _reply.split("READY_TO_GENERATE:")[0].strip()
+                    if not _clean_reply:
+                        _p = _parsed_params
+                        _clean_reply = (
+                            f"Perfect — I have everything I need! Here's the plan:\n\n"
+                            f"**Topic:** {_p.get('topic', '')}\n"
+                            f"**Purpose:** {_p.get('purpose', '')}\n"
+                            f"**Audience:** {_p.get('audience', '')}\n"
+                            f"**Slides:** {_p.get('slide_count', 10)}\n\n"
+                            "When you're happy with this, click **Generate presentation** "
+                            "on the right. You can also upload documents or pick a template there."
+                        )
+                except Exception:
+                    st.session_state["guided_ready"] = False
+
+            st.session_state["guided_messages"].append(
+                {"role": "assistant", "content": _clean_reply}
+            )
+            st.rerun()
+
+        if st.button("🔄 Start over", key="guided_reset", use_container_width=True):
+            for _k in [
+                "guided_messages", "guided_ready", "guided_params",
+                "guided_pptx_bytes", "guided_pptx_filename",
+            ]:
+                st.session_state.pop(_k, None)
+            st.rerun()
+
+    with _gc_right:
+        st.markdown('<div class="section-label">Generate</div>', unsafe_allow_html=True)
+
+        _gp      = st.session_state.get("guided_params", {})
+        _g_ready = st.session_state.get("guided_ready", False)
+
+        if _g_ready and _gp:
+            st.success(
+                f"**{_gp.get('topic', 'Your topic')}**  \n"
+                f"{_gp.get('purpose', '')} · {_gp.get('audience', '')} · "
+                f"{_gp.get('slide_count', 10)} slides"
+            )
+        else:
+            st.markdown(
+                "<div class='status-card'>"
+                "<div class='status-card-label'>Waiting for plan</div>"
+                "<div style='color:#6080A8;font-size:.82rem;line-height:1.9'>"
+                "Chat with Claude on the left.<br>"
+                "Once it has enough info it will confirm the plan<br>"
+                "and the Generate button will unlock."
+                "</div></div>",
+                unsafe_allow_html=True,
+            )
+
+        st.markdown('<div class="section-label">Options</div>', unsafe_allow_html=True)
+        _g_model = st.selectbox(
+            "Model",
+            ["claude-sonnet-4-6", "claude-opus-4-6", "claude-haiku-4-5-20251001"],
+            key="guided_model",
+        )
+        _g_theme_name = st.selectbox(
+            "Theme", list(THEME_PRESETS.keys()), key="guided_theme"
+        )
+        _g_theme = THEME_PRESETS[_g_theme_name]
+        _g_web = st.checkbox("Web research", value=True, key="guided_web")
+        _g_template = st.file_uploader(
+            "Custom template (.pptx)", type=["pptx"], key="guided_template"
+        )
+        _g_docs = st.file_uploader(
+            "Supporting documents",
+            type=["pdf", "docx", "txt", "csv", "xlsx"],
+            accept_multiple_files=True,
+            key="guided_docs",
+        )
+
+        _g_btn = st.button(
+            "⚡ Generate presentation",
+            use_container_width=True,
+            type="primary",
+            disabled=not _g_ready,
+            key="guided_generate_btn",
+        )
+
+        _g_log_area = st.empty()
+        _g_dl_area  = st.empty()
+
+        if st.session_state.get("guided_pptx_bytes") and not _g_btn:
+            _g_dl_area.download_button(
+                "⬇️ Download PPTX",
+                data=st.session_state["guided_pptx_bytes"],
+                file_name=st.session_state.get(
+                    "guided_pptx_filename", "presentation.pptx"
+                ),
+                mime=(
+                    "application/vnd.openxmlformats-officedocument"
+                    ".presentationml.presentation"
+                ),
+                use_container_width=True,
+            )
+
+        if _g_btn and _g_ready and _gp:
+            _g_template_bytes = None
+            if _g_template:
+                _g_template.seek(0)
+                _g_template_bytes = _g_template.read()
+
+            _g_logs = []
+
+            for _ev in run_pipeline(
+                model=_g_model,
+                uploaded_files=_g_docs or [],
+                topic=_gp.get("topic", ""),
+                purpose=_gp.get("purpose", "General / Other"),
+                industry=_gp.get("industry", ""),
+                audience=_gp.get("audience", "General audience"),
+                question=_gp.get("question", ""),
+                web_search_en=_g_web,
+                slide_count=int(_gp.get("slide_count", 10)),
+                theme=_g_theme,
+                template_bytes=_g_template_bytes,
+                plan_mode=False,
+            ):
+                _et = _ev[0]
+                if _et in ("log", "spinner"):
+                    if _et == "spinner":
+                        if _g_logs and _g_logs[-1][0] == "spinner":
+                            _g_logs[-1] = ("log", _g_logs[-1][1])
+                        _g_logs.append(("spinner", _ev[1]))
+                    else:
+                        if _g_logs and _g_logs[-1][0] == "spinner":
+                            _g_logs[-1] = ("log", _g_logs[-1][1])
+                        _g_logs.append(("log", _ev[1]))
+                    _g_log_area.markdown(
+                        _render_log(_g_logs), unsafe_allow_html=True
+                    )
+                elif _et == "sources":
+                    st.session_state["research_sources"] = _ev[1]
+                elif _et == "pptx_bytes_out":
+                    _slug = re.sub(
+                        r"[^a-zA-Z0-9]+", "_", _gp.get("topic", "presentation")
+                    )[:50]
+                    st.session_state["guided_pptx_bytes"]    = _ev[1]
+                    st.session_state["guided_pptx_filename"] = (
+                        f"Presentation_{_slug}.pptx"
+                    )
+                elif _et == "error":
+                    st.error(_ev[1], icon="🚨")
+                    break
+
+            if st.session_state.get("guided_pptx_bytes"):
+                _g_dl_area.download_button(
+                    "⬇️ Download PPTX",
+                    data=st.session_state["guided_pptx_bytes"],
+                    file_name=st.session_state.get(
+                        "guided_pptx_filename", "presentation.pptx"
+                    ),
+                    mime=(
+                        "application/vnd.openxmlformats-officedocument"
+                        ".presentationml.presentation"
+                    ),
+                    use_container_width=True,
+                )
+                st.success("Presentation ready!")
+
+            # Show verified sources
+            _g_sources = st.session_state.get("research_sources", [])
+            if _g_sources:
+                with st.expander(
+                    f"🔗 {len(_g_sources)} verified source(s)", expanded=True
+                ):
+                    for _s in _g_sources:
+                        st.markdown(f"- [{_s['title']}]({_s['url']})")
+
 
 with _tab_pdf:
     st.markdown(
@@ -1643,6 +1955,9 @@ The pipeline will:<br>
                             _pipeline_steps[event[1]] = True
                             st.session_state["pipeline_steps"] = _pipeline_steps
 
+                        elif etype == "sources":
+                            st.session_state["research_sources"] = event[1]
+
                         elif etype == "slide_data":
                             st.session_state["slide_data"] = event[1]
 
@@ -1682,3 +1997,8 @@ The pipeline will:<br>
                         mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
                         use_container_width=True,
                     )
+                    _main_sources = st.session_state.get("research_sources", [])
+                    if _main_sources:
+                        with st.expander(f"🔗 {len(_main_sources)} verified source(s)", expanded=False):
+                            for _s in _main_sources:
+                                st.markdown(f"- [{_s['title']}]({_s['url']})")
