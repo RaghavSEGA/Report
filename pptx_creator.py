@@ -410,6 +410,7 @@ Output a single JSON object. Schema:
 
 Rules:
 - Use REAL data from documents and research — no placeholders
+- Supply sources as well for all of the documents/research.
 - Tailor depth, tone, and structure to: {purpose} for {audience}
 - Purpose hint: {purpose_hint}
 - theme.primary and theme.accent must be vivid hex (6 digits, no #)

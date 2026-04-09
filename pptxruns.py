@@ -2239,6 +2239,7 @@ RESPONSE FORMAT — you MUST return one of these two JSON objects (no markdown f
     {"action":"message","text":"your reply"}
 
 Rules:
+
 - Always return the COMPLETE slides array, not just modified slides.
 - Never add duplicate title slides unless asked.
 - Keep slide count reasonable (6-16 slides).
@@ -2754,7 +2755,8 @@ Output a single JSON object. Schema:
 }}
 
 Rules:
-- Use REAL data from the documents and research — no generic placeholders
+- Use REAL data from documents and research — no placeholders
+- Supply sources as well for all of the documents/research.
 - Be specific and data-driven for {audience}
 - theme.primary and theme.accent must be dark-to-mid vivid hex colours (6 digits, no #).
   Never use white, near-white, or light pastels (no values above DDDDDD).
