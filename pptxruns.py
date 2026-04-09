@@ -3006,1027 +3006,1028 @@ Rules:
     ).format(len(pptx_bytes_out) / 1024, n_slides))
     yield ("pptx_bytes_out", pptx_bytes_out)
 
-# ─── STREAMLIT UI ───
+if __name__ == "__main__":
+    # ─── STREAMLIT UI ───
 
-st.set_page_config(
-    page_title="SEGA PowerPoint Creator",
-    page_icon="🎮",
-    layout="wide",
-)
-
-
-# ─────────────────────────────────────────────────────────────
-# OTP AUTHENTICATION  (mirrors BIreport.py exactly)
-# ─────────────────────────────────────────────────────────────
-
-ALLOWED_DOMAIN     = "@segaamerica.com"
-OTP_EXPIRY_SECS    = 600   # 10 minutes
-COOKIE_EXPIRY_DAYS = 7
-COOKIE_NAME        = "sega_analyzer_auth"
+    st.set_page_config(
+        page_title="SEGA PowerPoint Creator",
+        page_icon="🎮",
+        layout="wide",
+    )
 
 
+    # ─────────────────────────────────────────────────────────────
+    # OTP AUTHENTICATION  (mirrors BIreport.py exactly)
+    # ─────────────────────────────────────────────────────────────
 
+    ALLOWED_DOMAIN     = "@segaamerica.com"
+    OTP_EXPIRY_SECS    = 600   # 10 minutes
+    COOKIE_EXPIRY_DAYS = 7
+    COOKIE_NAME        = "sega_analyzer_auth"
 
 
 
 
 
-# ── Check for existing valid cookie ──────────────────────────
-try:
-    import extra_streamlit_components as stx
-    _cookie_manager = stx.CookieManager(key="auth_cookies")
-    _existing_cookie = _cookie_manager.get(COOKIE_NAME)
-except Exception:
-    _cookie_manager = None
-    _existing_cookie = None
 
-_cookie_email = _verify_cookie(_existing_cookie) if _existing_cookie else None
 
-# ── Auth state init ───────────────────────────────────────────
-for _k, _v in [
-    ("auth_verified",   False),
-    ("auth_email",      ""),
-    ("otp_code",        ""),
-    ("otp_email",       ""),
-    ("otp_expiry",      0),
-    ("otp_sent",        False),
-    ("otp_attempts",    0),
-]:
-    if _k not in st.session_state:
-        st.session_state[_k] = _v
 
-# If valid cookie found, mark as verified and roll the expiry forward
-if _cookie_email and not st.session_state.auth_verified:
-    st.session_state.auth_verified = True
-    st.session_state.auth_email    = _cookie_email
-    # Roll cookie: re-issue with a fresh 7-day window from now
-    if _cookie_manager:
-        _rolled_token = _sign_cookie(_cookie_email)
-        _cookie_manager.set(
-            COOKIE_NAME, _rolled_token,
-            expires_at=datetime.now(timezone.utc) + timedelta(days=COOKIE_EXPIRY_DAYS),
-            key="roll_auth_cookie",
+    # ── Check for existing valid cookie ──────────────────────────
+    try:
+        import extra_streamlit_components as stx
+        _cookie_manager = stx.CookieManager(key="auth_cookies")
+        _existing_cookie = _cookie_manager.get(COOKIE_NAME)
+    except Exception:
+        _cookie_manager = None
+        _existing_cookie = None
+
+    _cookie_email = _verify_cookie(_existing_cookie) if _existing_cookie else None
+
+    # ── Auth state init ───────────────────────────────────────────
+    for _k, _v in [
+        ("auth_verified",   False),
+        ("auth_email",      ""),
+        ("otp_code",        ""),
+        ("otp_email",       ""),
+        ("otp_expiry",      0),
+        ("otp_sent",        False),
+        ("otp_attempts",    0),
+    ]:
+        if _k not in st.session_state:
+            st.session_state[_k] = _v
+
+    # If valid cookie found, mark as verified and roll the expiry forward
+    if _cookie_email and not st.session_state.auth_verified:
+        st.session_state.auth_verified = True
+        st.session_state.auth_email    = _cookie_email
+        # Roll cookie: re-issue with a fresh 7-day window from now
+        if _cookie_manager:
+            _rolled_token = _sign_cookie(_cookie_email)
+            _cookie_manager.set(
+                COOKIE_NAME, _rolled_token,
+                expires_at=datetime.now(timezone.utc) + timedelta(days=COOKIE_EXPIRY_DAYS),
+                key="roll_auth_cookie",
+            )
+
+    # ── Render login gate if not verified ────────────────────────
+    if not st.session_state.auth_verified:
+        st.markdown("""
+        <style>
+        .auth-wrap {
+            max-width: 420px; margin: 5rem auto; padding: 2.5rem 2.5rem 2rem;
+            background: var(--surface); border: 1px solid var(--border);
+            border-top: 3px solid var(--blue); border-radius: 0 0 10px 10px;
+        }
+        .auth-logo  { font-family:'Arial Black',sans-serif; font-size:1.6rem; font-weight:900;
+                      letter-spacing:0.12em; color:var(--blue) !important; margin-bottom:0.2rem; }
+        .auth-title { font-size:1rem; font-weight:700; color:var(--text) !important; margin-bottom:0.25rem; }
+        .auth-sub   { font-size:0.8rem; color:var(--muted) !important; margin-bottom:1.5rem; }
+        .auth-note  { font-size:0.72rem; color:var(--muted) !important; margin-top:1rem;
+                      text-align:center; line-height:1.5; }
+        :root { --bg:#0a0c1a; --surface:#0f1120; --border:#232640; --blue:#4080ff; --text:#eef0fa; --muted:#5a5f82; }
+        html, body, .stApp { background: var(--bg) !important; }
+        </style>
+        """, unsafe_allow_html=True)
+
+        _lc, _mc, _rc = st.columns([1, 2, 1])
+        with _mc:
+            st.markdown("""
+            <div class="auth-wrap">
+              <div class="auth-logo">SEGA</div>
+              <div class="auth-title">PowerPoint Creator</div>
+              <div class="auth-sub">Sign in with your SEGA America email</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            if not st.session_state.otp_sent:
+                _email_input = st.text_input(
+                    "Email address",
+                    placeholder="you@segaamerica.com",
+                    label_visibility="hidden",
+                    key="auth_email_input",
+                )
+                _send_btn = st.button("Send verification code", use_container_width=True)
+
+                if _send_btn and _email_input:
+                    if not _email_input.strip().lower().endswith(ALLOWED_DOMAIN):
+                        st.error(f"Access restricted to {ALLOWED_DOMAIN} addresses.")
+                    else:
+                        _code = str(random.randint(100000, 999999))
+                        if _send_otp(_email_input.strip().lower(), _code):
+                            st.session_state.otp_code     = _code
+                            st.session_state.otp_email    = _email_input.strip().lower()
+                            st.session_state.otp_expiry   = time.time() + OTP_EXPIRY_SECS
+                            st.session_state.otp_sent     = True
+                            st.session_state.otp_attempts = 0
+                            st.rerun()
+
+            else:
+                st.info(f"Code sent to **{st.session_state.otp_email}** — check your inbox.")
+                _code_input = st.text_input(
+                    "6-digit code",
+                    placeholder="123456",
+                    label_visibility="hidden",
+                    max_chars=6,
+                    key="auth_code_input",
+                )
+                _verify_btn = st.button("Verify code", use_container_width=True)
+
+                if _verify_btn and _code_input:
+                    if st.session_state.otp_attempts >= 5:
+                        st.error("Too many attempts. Please request a new code.")
+                        st.session_state.otp_sent = False
+                    elif time.time() > st.session_state.otp_expiry:
+                        st.error("Code has expired. Please request a new one.")
+                        st.session_state.otp_sent = False
+                    elif _code_input.strip() != st.session_state.otp_code:
+                        st.session_state.otp_attempts += 1
+                        _remaining = 5 - st.session_state.otp_attempts
+                        st.error(f"Incorrect code. {_remaining} attempt{'s' if _remaining != 1 else ''} remaining.")
+                    else:
+                        st.session_state.auth_verified = True
+                        st.session_state.auth_email    = st.session_state.otp_email
+                        st.session_state.otp_code      = ""
+                        if _cookie_manager:
+                            _token = _sign_cookie(st.session_state.auth_email)
+                            _cookie_manager.set(
+                            COOKIE_NAME, _token,
+                            expires_at=datetime.now(timezone.utc) + timedelta(days=COOKIE_EXPIRY_DAYS),
+                            key="set_auth_cookie",
+                        )
+                        st.rerun()
+
+                if st.button("← Use a different email", key="auth_back"):
+                    st.session_state.otp_sent = False
+                    st.session_state.otp_code = ""
+                    st.rerun()
+
+            st.markdown(
+                '<div class="auth-note">Restricted to @segaamerica.com addresses only.<br>'
+                'Codes expire after 10 minutes.</div>',
+                unsafe_allow_html=True,
+            )
+
+        st.stop()
+
+    # ── Signed-in user + sign out (sidebar) ──────────────────────
+    with st.sidebar:
+        st.markdown(
+            f'<div style="font-size:.6rem;font-weight:700;letter-spacing:.12em;text-transform:uppercase;'
+            f'color:#5a5f82;margin-bottom:.3rem;">SEGA America</div>'
+            f'<div style="font-size:.7rem;font-weight:600;color:#b8bcd4;margin-bottom:.75rem;">'
+            f'{st.session_state.auth_email}</div>',
+            unsafe_allow_html=True,
+        )
+        if st.button("Sign out", key="sign_out_btn"):
+            if _cookie_manager:
+                _cookie_manager.delete(COOKIE_NAME, key="delete_auth_cookie")
+            for _k in ["auth_verified", "auth_email", "otp_sent", "otp_code",
+                       "otp_email", "otp_expiry", "otp_attempts"]:
+                st.session_state[_k] = False if _k == "auth_verified" else ""
+            st.rerun()
+        st.markdown("<hr style='border:none;border-top:1px solid #232640;margin:.5rem 0 1rem;'>", unsafe_allow_html=True)
+
+    # ── Shorthand for signed-in owner ────────────────────────────
+    OWNER = st.session_state.auth_email
+
+    # ─────────────────────────────────────────────────────────────
+    # PROJECT MANAGEMENT — sidebar (post-auth)
+    # ─────────────────────────────────────────────────────────────
+    def _load_project_into_session(project_name: str) -> None:
+        """Pull a saved project's state into st.session_state."""
+        data = load_project(OWNER, project_name)
+        if not data:
+            return
+        st.session_state["active_project"]    = project_name
+        st.session_state["project_question"]  = data.get("business_question", "")
+        st.session_state["project_doc_names"] = data.get("doc_names", [])
+        st.session_state["project_game_title"] = data.get("game_title", "")
+        st.session_state["project_audience"]   = data.get("audience", "Executive team")
+        st.session_state["plan_slide_data"]   = data.get("slide_json") or {}
+        st.session_state["plan_chat"]         = data.get("plan_chat", [])
+        # Restore PPTX bytes if previously generated
+        if data.get("pptx_bytes"):
+            st.session_state["pptx_bytes"] = data["pptx_bytes"]
+        else:
+            st.session_state.pop("pptx_bytes", None)
+        # Restore custom template bytes
+        if data.get("template_bytes"):
+            st.session_state["saved_template_bytes"] = data["template_bytes"]
+        else:
+            st.session_state.pop("saved_template_bytes", None)
+        # Clear stale pipeline state
+        st.session_state["pipeline_steps"] = {
+            "upload": False, "extract": False, "research": False,
+            "analyze": False, "generate": False,
+        }
+
+    def _clear_project_session() -> None:
+        """Clear project-scoped session state."""
+        for k in ["active_project", "project_question", "project_doc_names",
+                  "project_game_title", "project_audience",
+                  "plan_slide_data", "pptx_bytes", "saved_template_bytes",
+                  "plan_chat", "plan_slide_history", "pipeline_steps",
+                  "plan_mode_active"]:
+            st.session_state.pop(k, None)
+
+    with st.sidebar:
+        st.markdown(
+            "<div style='font-size:.6rem;font-weight:700;letter-spacing:.12em;"
+            "text-transform:uppercase;color:#475569;margin-bottom:.3rem;'>Projects</div>",
+            unsafe_allow_html=True,
         )
 
-# ── Render login gate if not verified ────────────────────────
-if not st.session_state.auth_verified:
+        _all_projects = get_projects(OWNER)
+        _project_names = [p["name"] for p in _all_projects]
+
+        # Read active project from URL params if present
+        _qp_project = st.query_params.get("project", "")
+        if _qp_project and _qp_project not in _project_names:
+            _qp_project = ""
+
+        # Initialise active_project from URL param on first load
+        if "active_project" not in st.session_state and _qp_project:
+            _load_project_into_session(_qp_project)
+
+        _active = st.session_state.get("active_project", "")
+
+        # ── Project selector ──
+        _select_options = ["— select a project —"] + _project_names + ["＋ New project"]
+        _default_idx = (
+            _select_options.index(_active) if _active in _select_options else 0
+        )
+        _selected = st.selectbox(
+            "project_selector",
+            _select_options,
+            index=_default_idx,
+            label_visibility="collapsed",
+        )
+
+        # Handle selection changes
+        if _selected == "— select a project —":
+            if _active:
+                _clear_project_session()
+                st.query_params.pop("project", None)
+                st.rerun()
+
+        elif _selected == "＋ New project":
+            _new_name = st.text_input(
+                "Project name", placeholder="e.g. STH Competitor Analysis",
+                key="new_project_name_input",
+            )
+            if st.button("Create project", use_container_width=True, type="primary"):
+                _nn = _new_name.strip()
+                if not _nn:
+                    st.error("Please enter a project name.")
+                elif project_exists(OWNER, _nn):
+                    st.error(f"'{_nn}' already exists.")
+                else:
+                    create_project(OWNER, _nn)
+                    _clear_project_session()
+                    _load_project_into_session(_nn)
+                    st.query_params["project"] = _nn
+                    st.rerun()
+
+        elif _selected != _active:
+            # User switched to an existing project
+            _clear_project_session()
+            _load_project_into_session(_selected)
+            st.query_params["project"] = _selected
+            st.rerun()
+
+        # ── Project actions (only shown when a project is active) ──
+        if _active and _active in _project_names:
+            _proj_data = next((p for p in _all_projects if p["name"] == _active), {})
+            _updated   = (_proj_data.get("updated_at", "")[:16].replace("T", " ") + " UTC"
+                          if _proj_data.get("updated_at") else "unsaved")
+            st.caption(f"Last saved: {_updated}")
+
+            _col_save, _col_rename, _col_del = st.columns([3, 2, 1])
+
+            with _col_save:
+                if st.button("💾 Save", use_container_width=True, help="Save current state to this project"):
+                    save_project(
+                        OWNER, _active,
+                        business_question=st.session_state.get("project_question", ""),
+                        game_title=st.session_state.get("project_game_title", ""),
+                        audience=st.session_state.get("project_audience", "Executive team"),
+                        doc_names=st.session_state.get("project_doc_names", []),
+                        slide_json=st.session_state.get("plan_slide_data") or {},
+                        plan_chat=st.session_state.get("plan_chat", []),
+                        pptx_bytes=st.session_state.get("pptx_bytes"),
+                        template_bytes=st.session_state.get("saved_template_bytes"),
+                    )
+                    st.toast(f'Saved "{_active}"', icon='✅')
+
+            with _col_rename:
+                if st.button("✏️", help="Rename project", use_container_width=True):
+                    st.session_state["_renaming_project"] = True
+
+            with _col_del:
+                if st.button("🗑", help="Delete project", use_container_width=True):
+                    st.session_state["_confirm_delete"] = True
+
+            # Reset output — clears generated PPTX and slide plan from DB
+            if st.session_state.get("pptx_bytes") or st.session_state.get("plan_slide_data"):
+                if st.button("🔄 Reset output", use_container_width=True,
+                             help="Clear the generated PPTX and slide outline so you can run fresh"):
+                    st.session_state.pop("pptx_bytes", None)
+                    st.session_state.pop("pptx_filename", None)
+                    st.session_state.pop("plan_slide_data", None)
+                    st.session_state.pop("plan_mode_active", None)
+                    st.session_state.pop("plan_chat", None)
+                    st.session_state.pop("plan_slide_history", None)
+                    st.session_state.pop("pipeline_steps", None)
+                    save_project(OWNER, _active, slide_json={}, plan_chat=[],
+                                 clear_pptx=True)
+                    st.rerun()
+
+            # Rename UI
+            if st.session_state.pop("_renaming_project", False):
+                _rn = st.text_input("New name", value=_active, key="_rename_input")
+                if st.button("Rename", key="_rename_confirm"):
+                    try:
+                        rename_project(OWNER, _active, _rn.strip())
+                        _clear_project_session()
+                        _load_project_into_session(_rn.strip())
+                        st.query_params["project"] = _rn.strip()
+                        st.rerun()
+                    except ValueError as e:
+                        st.error(str(e))
+
+            # Delete confirmation UI
+            if st.session_state.pop("_confirm_delete", False):
+                st.warning(f"Delete **{_active}**? This cannot be undone.")
+                _dc1, _dc2 = st.columns(2)
+                with _dc1:
+                    if st.button("Yes, delete", type="primary", key="_delete_yes"):
+                        delete_project(OWNER, _active)
+                        _clear_project_session()
+                        st.query_params.pop("project", None)
+                        st.rerun()
+                with _dc2:
+                    if st.button("Cancel", key="_delete_no"):
+                        st.rerun()
+
+        st.markdown(
+            "<hr style='border:none;border-top:1px solid #1e293b;margin:.75rem 0 .5rem;'>",
+            unsafe_allow_html=True,
+        )
+
+    # ── Gate: require an active project before showing the main UI ──
+    if not st.session_state.get("active_project"):
+        with st.sidebar:
+            pass  # project selector already shown above
+        st.markdown(
+            "<div style='text-align:center;padding:4rem 2rem;color:#475569;'>"
+            "<div style='font-size:2.5rem;margin-bottom:1rem;'>📁</div>"
+            "<div style='font-size:1.1rem;font-weight:600;color:#94a3b8;margin-bottom:.5rem;'>"
+            "No project selected</div>"
+            "<div style='font-size:.85rem;'>Select an existing project or create a new one in the sidebar to get started.</div>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+        st.stop()
+
+    # ─────────────────────────────────────────────────────────────
+    # GLOBAL STYLES
+    # ─────────────────────────────────────────────────────────────
     st.markdown("""
     <style>
-    .auth-wrap {
-        max-width: 420px; margin: 5rem auto; padding: 2.5rem 2.5rem 2rem;
-        background: var(--surface); border: 1px solid var(--border);
-        border-top: 3px solid var(--blue); border-radius: 0 0 10px 10px;
+    [data-testid="stToolbar"]      { display: none !important; }
+    [data-testid="stDecoration"]   { display: none !important; }
+    header[data-testid="stHeader"] { display: none !important; }
+
+    html, body, [class*="css"], .stApp {
+        background-color: #0a0c1a !important;
+        color: #e2e8f0 !important;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif !important;
     }
-    .auth-logo  { font-family:'Arial Black',sans-serif; font-size:1.6rem; font-weight:900;
-                  letter-spacing:0.12em; color:var(--blue) !important; margin-bottom:0.2rem; }
-    .auth-title { font-size:1rem; font-weight:700; color:var(--text) !important; margin-bottom:0.25rem; }
-    .auth-sub   { font-size:0.8rem; color:var(--muted) !important; margin-bottom:1.5rem; }
-    .auth-note  { font-size:0.72rem; color:var(--muted) !important; margin-top:1rem;
-                  text-align:center; line-height:1.5; }
-    :root { --bg:#0a0c1a; --surface:#0f1120; --border:#232640; --blue:#4080ff; --text:#eef0fa; --muted:#5a5f82; }
-    html, body, .stApp { background: var(--bg) !important; }
+    [data-testid="stSidebar"] { background: #0f172a !important; border-right: 1px solid #1e293b !important; }
+    [data-testid="stSidebar"] * { color: #cbd5e1 !important; }
+    [data-testid="stSidebar"] .block-container { padding: 1.25rem 1rem !important; max-width: 100% !important; }
+    .block-container { max-width: 1400px !important; padding: 1.5rem 2rem 3rem !important; margin: 0 auto !important; }
+
+    h1 { font-size: 2rem !important; font-weight: 700 !important; color: #f1f5f9 !important;
+         letter-spacing: -.02em !important; margin-bottom: .15rem !important; }
+
+    .sidebar-section { font-size:.7rem; font-weight:600; text-transform:uppercase;
+                       letter-spacing:.1em; color:#64748b; margin:1.2rem 0 .4rem; display:block; }
+
+    [data-testid="stFileUploader"] {
+        border: 1px dashed #334155 !important;
+        border-radius: 8px !important;
+        background: transparent !important;
+    }
+
+    .stTextInput input, .stTextArea textarea {
+        background: #1e293b !important;
+        border: 1px solid #334155 !important;
+        border-radius: 6px !important;
+        color: #e2e8f0 !important;
+        font-size: .85rem !important;
+    }
+
+    .section-label {
+        font-size: .68rem; font-weight: 600; text-transform: uppercase;
+        letter-spacing: .1em; color: #475569;
+        margin: 2rem 0 .75rem;
+        border-bottom: 1px solid #1e293b;
+        padding-bottom: .4rem;
+    }
+
+    .status-card {
+        background: #1e293b; border: 1px solid #334155; border-radius: 8px; padding: 1rem 1.25rem;
+    }
+    .status-card-label { font-size:.65rem; text-transform:uppercase; letter-spacing:.1em; color:#64748b; margin-bottom:.3rem; }
+    .status-card-value { font-size:.95rem; font-weight:600; color:#f1f5f9; line-height:1.4; }
+
+    .step-row { display:flex; align-items:center; gap:.6rem; padding:.45rem .75rem;
+                margin:.2rem 0; border-radius:5px; font-size:.8rem; }
+    .step-done    { background:rgba(52,211,153,.1); color:#34d399; }
+    .step-active  { background:rgba(96,165,250,.12); color:#60a5fa; }
+    .step-pending { color:#475569; }
+
+    .result-log {
+        background: #0f172a; border: 1px solid #1e293b; border-radius: 8px;
+        padding: 1rem 1.25rem; font-size: .82rem;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        color: #94a3b8; max-height: 480px; overflow-y: auto; line-height: 1.7;
+    }
+    .result-log b  { color: #e2e8f0; font-weight: 600; }
+    .result-log i  { color: #60a5fa; }
+    .log-detail    { color: #64748b; font-size: .76rem; line-height: 1.55; display: block;
+                     margin-top: .15rem; margin-bottom: .35rem; }
+    .log-entry     { border-left: 2px solid #1e3a5f; padding-left: .6rem;
+                     margin-bottom: .5rem; }
+
+    /* ── Active spinner entry ── */
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .log-active {
+        border-left: 2px solid #00AADD;
+        padding-left: .6rem;
+        margin-bottom: .5rem;
+        display: flex;
+        align-items: flex-start;
+        gap: .55rem;
+    }
+    .log-spinner {
+        flex-shrink: 0;
+        width: 14px; height: 14px;
+        margin-top: 3px;
+        border: 2px solid rgba(0,170,221,0.25);
+        border-top-color: #00AADD;
+        border-radius: 50%;
+        animation: spin 0.8s linear infinite;
+        display: inline-block;
+    }
+    .log-active-text { flex: 1; }
     </style>
     """, unsafe_allow_html=True)
 
-    _lc, _mc, _rc = st.columns([1, 2, 1])
-    with _mc:
-        st.markdown("""
-        <div class="auth-wrap">
-          <div class="auth-logo">SEGA</div>
-          <div class="auth-title">PowerPoint Creator</div>
-          <div class="auth-sub">Sign in with your SEGA America email</div>
-        </div>
-        """, unsafe_allow_html=True)
-
-        if not st.session_state.otp_sent:
-            _email_input = st.text_input(
-                "Email address",
-                placeholder="you@segaamerica.com",
-                label_visibility="hidden",
-                key="auth_email_input",
-            )
-            _send_btn = st.button("Send verification code", use_container_width=True)
-
-            if _send_btn and _email_input:
-                if not _email_input.strip().lower().endswith(ALLOWED_DOMAIN):
-                    st.error(f"Access restricted to {ALLOWED_DOMAIN} addresses.")
-                else:
-                    _code = str(random.randint(100000, 999999))
-                    if _send_otp(_email_input.strip().lower(), _code):
-                        st.session_state.otp_code     = _code
-                        st.session_state.otp_email    = _email_input.strip().lower()
-                        st.session_state.otp_expiry   = time.time() + OTP_EXPIRY_SECS
-                        st.session_state.otp_sent     = True
-                        st.session_state.otp_attempts = 0
-                        st.rerun()
-
-        else:
-            st.info(f"Code sent to **{st.session_state.otp_email}** — check your inbox.")
-            _code_input = st.text_input(
-                "6-digit code",
-                placeholder="123456",
-                label_visibility="hidden",
-                max_chars=6,
-                key="auth_code_input",
-            )
-            _verify_btn = st.button("Verify code", use_container_width=True)
-
-            if _verify_btn and _code_input:
-                if st.session_state.otp_attempts >= 5:
-                    st.error("Too many attempts. Please request a new code.")
-                    st.session_state.otp_sent = False
-                elif time.time() > st.session_state.otp_expiry:
-                    st.error("Code has expired. Please request a new one.")
-                    st.session_state.otp_sent = False
-                elif _code_input.strip() != st.session_state.otp_code:
-                    st.session_state.otp_attempts += 1
-                    _remaining = 5 - st.session_state.otp_attempts
-                    st.error(f"Incorrect code. {_remaining} attempt{'s' if _remaining != 1 else ''} remaining.")
-                else:
-                    st.session_state.auth_verified = True
-                    st.session_state.auth_email    = st.session_state.otp_email
-                    st.session_state.otp_code      = ""
-                    if _cookie_manager:
-                        _token = _sign_cookie(st.session_state.auth_email)
-                        _cookie_manager.set(
-                        COOKIE_NAME, _token,
-                        expires_at=datetime.now(timezone.utc) + timedelta(days=COOKIE_EXPIRY_DAYS),
-                        key="set_auth_cookie",
-                    )
-                    st.rerun()
-
-            if st.button("← Use a different email", key="auth_back"):
-                st.session_state.otp_sent = False
-                st.session_state.otp_code = ""
-                st.rerun()
-
-        st.markdown(
-            '<div class="auth-note">Restricted to @segaamerica.com addresses only.<br>'
-            'Codes expire after 10 minutes.</div>',
-            unsafe_allow_html=True,
-        )
-
-    st.stop()
-
-# ── Signed-in user + sign out (sidebar) ──────────────────────
-with st.sidebar:
-    st.markdown(
-        f'<div style="font-size:.6rem;font-weight:700;letter-spacing:.12em;text-transform:uppercase;'
-        f'color:#5a5f82;margin-bottom:.3rem;">SEGA America</div>'
-        f'<div style="font-size:.7rem;font-weight:600;color:#b8bcd4;margin-bottom:.75rem;">'
-        f'{st.session_state.auth_email}</div>',
-        unsafe_allow_html=True,
-    )
-    if st.button("Sign out", key="sign_out_btn"):
-        if _cookie_manager:
-            _cookie_manager.delete(COOKIE_NAME, key="delete_auth_cookie")
-        for _k in ["auth_verified", "auth_email", "otp_sent", "otp_code",
-                   "otp_email", "otp_expiry", "otp_attempts"]:
-            st.session_state[_k] = False if _k == "auth_verified" else ""
-        st.rerun()
-    st.markdown("<hr style='border:none;border-top:1px solid #232640;margin:.5rem 0 1rem;'>", unsafe_allow_html=True)
-
-# ── Shorthand for signed-in owner ────────────────────────────
-OWNER = st.session_state.auth_email
-
-# ─────────────────────────────────────────────────────────────
-# PROJECT MANAGEMENT — sidebar (post-auth)
-# ─────────────────────────────────────────────────────────────
-def _load_project_into_session(project_name: str) -> None:
-    """Pull a saved project's state into st.session_state."""
-    data = load_project(OWNER, project_name)
-    if not data:
-        return
-    st.session_state["active_project"]    = project_name
-    st.session_state["project_question"]  = data.get("business_question", "")
-    st.session_state["project_doc_names"] = data.get("doc_names", [])
-    st.session_state["project_game_title"] = data.get("game_title", "")
-    st.session_state["project_audience"]   = data.get("audience", "Executive team")
-    st.session_state["plan_slide_data"]   = data.get("slide_json") or {}
-    st.session_state["plan_chat"]         = data.get("plan_chat", [])
-    # Restore PPTX bytes if previously generated
-    if data.get("pptx_bytes"):
-        st.session_state["pptx_bytes"] = data["pptx_bytes"]
-    else:
-        st.session_state.pop("pptx_bytes", None)
-    # Restore custom template bytes
-    if data.get("template_bytes"):
-        st.session_state["saved_template_bytes"] = data["template_bytes"]
-    else:
-        st.session_state.pop("saved_template_bytes", None)
-    # Clear stale pipeline state
-    st.session_state["pipeline_steps"] = {
-        "upload": False, "extract": False, "research": False,
-        "analyze": False, "generate": False,
-    }
-
-def _clear_project_session() -> None:
-    """Clear project-scoped session state."""
-    for k in ["active_project", "project_question", "project_doc_names",
-              "project_game_title", "project_audience",
-              "plan_slide_data", "pptx_bytes", "saved_template_bytes",
-              "plan_chat", "plan_slide_history", "pipeline_steps",
-              "plan_mode_active"]:
-        st.session_state.pop(k, None)
-
-with st.sidebar:
-    st.markdown(
-        "<div style='font-size:.6rem;font-weight:700;letter-spacing:.12em;"
-        "text-transform:uppercase;color:#475569;margin-bottom:.3rem;'>Projects</div>",
-        unsafe_allow_html=True,
-    )
-
-    _all_projects = get_projects(OWNER)
-    _project_names = [p["name"] for p in _all_projects]
-
-    # Read active project from URL params if present
-    _qp_project = st.query_params.get("project", "")
-    if _qp_project and _qp_project not in _project_names:
-        _qp_project = ""
-
-    # Initialise active_project from URL param on first load
-    if "active_project" not in st.session_state and _qp_project:
-        _load_project_into_session(_qp_project)
-
-    _active = st.session_state.get("active_project", "")
-
-    # ── Project selector ──
-    _select_options = ["— select a project —"] + _project_names + ["＋ New project"]
-    _default_idx = (
-        _select_options.index(_active) if _active in _select_options else 0
-    )
-    _selected = st.selectbox(
-        "project_selector",
-        _select_options,
-        index=_default_idx,
-        label_visibility="collapsed",
-    )
-
-    # Handle selection changes
-    if _selected == "— select a project —":
-        if _active:
-            _clear_project_session()
-            st.query_params.pop("project", None)
-            st.rerun()
-
-    elif _selected == "＋ New project":
-        _new_name = st.text_input(
-            "Project name", placeholder="e.g. STH Competitor Analysis",
-            key="new_project_name_input",
-        )
-        if st.button("Create project", use_container_width=True, type="primary"):
-            _nn = _new_name.strip()
-            if not _nn:
-                st.error("Please enter a project name.")
-            elif project_exists(OWNER, _nn):
-                st.error(f"'{_nn}' already exists.")
-            else:
-                create_project(OWNER, _nn)
-                _clear_project_session()
-                _load_project_into_session(_nn)
-                st.query_params["project"] = _nn
-                st.rerun()
-
-    elif _selected != _active:
-        # User switched to an existing project
-        _clear_project_session()
-        _load_project_into_session(_selected)
-        st.query_params["project"] = _selected
-        st.rerun()
-
-    # ── Project actions (only shown when a project is active) ──
-    if _active and _active in _project_names:
-        _proj_data = next((p for p in _all_projects if p["name"] == _active), {})
-        _updated   = (_proj_data.get("updated_at", "")[:16].replace("T", " ") + " UTC"
-                      if _proj_data.get("updated_at") else "unsaved")
-        st.caption(f"Last saved: {_updated}")
-
-        _col_save, _col_rename, _col_del = st.columns([3, 2, 1])
-
-        with _col_save:
-            if st.button("💾 Save", use_container_width=True, help="Save current state to this project"):
-                save_project(
-                    OWNER, _active,
-                    business_question=st.session_state.get("project_question", ""),
-                    game_title=st.session_state.get("project_game_title", ""),
-                    audience=st.session_state.get("project_audience", "Executive team"),
-                    doc_names=st.session_state.get("project_doc_names", []),
-                    slide_json=st.session_state.get("plan_slide_data") or {},
-                    plan_chat=st.session_state.get("plan_chat", []),
-                    pptx_bytes=st.session_state.get("pptx_bytes"),
-                    template_bytes=st.session_state.get("saved_template_bytes"),
-                )
-                st.toast(f'Saved "{_active}"', icon='✅')
-
-        with _col_rename:
-            if st.button("✏️", help="Rename project", use_container_width=True):
-                st.session_state["_renaming_project"] = True
-
-        with _col_del:
-            if st.button("🗑", help="Delete project", use_container_width=True):
-                st.session_state["_confirm_delete"] = True
-
-        # Reset output — clears generated PPTX and slide plan from DB
-        if st.session_state.get("pptx_bytes") or st.session_state.get("plan_slide_data"):
-            if st.button("🔄 Reset output", use_container_width=True,
-                         help="Clear the generated PPTX and slide outline so you can run fresh"):
-                st.session_state.pop("pptx_bytes", None)
-                st.session_state.pop("pptx_filename", None)
-                st.session_state.pop("plan_slide_data", None)
-                st.session_state.pop("plan_mode_active", None)
-                st.session_state.pop("plan_chat", None)
-                st.session_state.pop("plan_slide_history", None)
-                st.session_state.pop("pipeline_steps", None)
-                save_project(OWNER, _active, slide_json={}, plan_chat=[],
-                             clear_pptx=True)
-                st.rerun()
-
-        # Rename UI
-        if st.session_state.pop("_renaming_project", False):
-            _rn = st.text_input("New name", value=_active, key="_rename_input")
-            if st.button("Rename", key="_rename_confirm"):
-                try:
-                    rename_project(OWNER, _active, _rn.strip())
-                    _clear_project_session()
-                    _load_project_into_session(_rn.strip())
-                    st.query_params["project"] = _rn.strip()
-                    st.rerun()
-                except ValueError as e:
-                    st.error(str(e))
-
-        # Delete confirmation UI
-        if st.session_state.pop("_confirm_delete", False):
-            st.warning(f"Delete **{_active}**? This cannot be undone.")
-            _dc1, _dc2 = st.columns(2)
-            with _dc1:
-                if st.button("Yes, delete", type="primary", key="_delete_yes"):
-                    delete_project(OWNER, _active)
-                    _clear_project_session()
-                    st.query_params.pop("project", None)
-                    st.rerun()
-            with _dc2:
-                if st.button("Cancel", key="_delete_no"):
-                    st.rerun()
-
-    st.markdown(
-        "<hr style='border:none;border-top:1px solid #1e293b;margin:.75rem 0 .5rem;'>",
-        unsafe_allow_html=True,
-    )
-
-# ── Gate: require an active project before showing the main UI ──
-if not st.session_state.get("active_project"):
+    # ─────────────────────────────────────────────────────────────
+    # SIDEBAR — settings (post-auth)
+    # ─────────────────────────────────────────────────────────────
     with st.sidebar:
-        pass  # project selector already shown above
-    st.markdown(
-        "<div style='text-align:center;padding:4rem 2rem;color:#475569;'>"
-        "<div style='font-size:2.5rem;margin-bottom:1rem;'>📁</div>"
-        "<div style='font-size:1.1rem;font-weight:600;color:#94a3b8;margin-bottom:.5rem;'>"
-        "No project selected</div>"
-        "<div style='font-size:.85rem;'>Select an existing project or create a new one in the sidebar to get started.</div>"
-        "</div>",
-        unsafe_allow_html=True,
-    )
-    st.stop()
+        st.markdown("<div style='font-size:1rem;font-weight:700;color:#f1f5f9;margin-bottom:.25rem;'>PowerPoint Creator</div>", unsafe_allow_html=True)
+        st.markdown("<div style='font-size:.65rem;color:#475569;text-transform:uppercase;letter-spacing:.1em;margin-bottom:1rem;'>Game PowerPoint Generator</div>", unsafe_allow_html=True)
 
-# ─────────────────────────────────────────────────────────────
-# GLOBAL STYLES
-# ─────────────────────────────────────────────────────────────
-st.markdown("""
-<style>
-[data-testid="stToolbar"]      { display: none !important; }
-[data-testid="stDecoration"]   { display: none !important; }
-header[data-testid="stHeader"] { display: none !important; }
-
-html, body, [class*="css"], .stApp {
-    background-color: #0a0c1a !important;
-    color: #e2e8f0 !important;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif !important;
-}
-[data-testid="stSidebar"] { background: #0f172a !important; border-right: 1px solid #1e293b !important; }
-[data-testid="stSidebar"] * { color: #cbd5e1 !important; }
-[data-testid="stSidebar"] .block-container { padding: 1.25rem 1rem !important; max-width: 100% !important; }
-.block-container { max-width: 1400px !important; padding: 1.5rem 2rem 3rem !important; margin: 0 auto !important; }
-
-h1 { font-size: 2rem !important; font-weight: 700 !important; color: #f1f5f9 !important;
-     letter-spacing: -.02em !important; margin-bottom: .15rem !important; }
-
-.sidebar-section { font-size:.7rem; font-weight:600; text-transform:uppercase;
-                   letter-spacing:.1em; color:#64748b; margin:1.2rem 0 .4rem; display:block; }
-
-[data-testid="stFileUploader"] {
-    border: 1px dashed #334155 !important;
-    border-radius: 8px !important;
-    background: transparent !important;
-}
-
-.stTextInput input, .stTextArea textarea {
-    background: #1e293b !important;
-    border: 1px solid #334155 !important;
-    border-radius: 6px !important;
-    color: #e2e8f0 !important;
-    font-size: .85rem !important;
-}
-
-.section-label {
-    font-size: .68rem; font-weight: 600; text-transform: uppercase;
-    letter-spacing: .1em; color: #475569;
-    margin: 2rem 0 .75rem;
-    border-bottom: 1px solid #1e293b;
-    padding-bottom: .4rem;
-}
-
-.status-card {
-    background: #1e293b; border: 1px solid #334155; border-radius: 8px; padding: 1rem 1.25rem;
-}
-.status-card-label { font-size:.65rem; text-transform:uppercase; letter-spacing:.1em; color:#64748b; margin-bottom:.3rem; }
-.status-card-value { font-size:.95rem; font-weight:600; color:#f1f5f9; line-height:1.4; }
-
-.step-row { display:flex; align-items:center; gap:.6rem; padding:.45rem .75rem;
-            margin:.2rem 0; border-radius:5px; font-size:.8rem; }
-.step-done    { background:rgba(52,211,153,.1); color:#34d399; }
-.step-active  { background:rgba(96,165,250,.12); color:#60a5fa; }
-.step-pending { color:#475569; }
-
-.result-log {
-    background: #0f172a; border: 1px solid #1e293b; border-radius: 8px;
-    padding: 1rem 1.25rem; font-size: .82rem;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    color: #94a3b8; max-height: 480px; overflow-y: auto; line-height: 1.7;
-}
-.result-log b  { color: #e2e8f0; font-weight: 600; }
-.result-log i  { color: #60a5fa; }
-.log-detail    { color: #64748b; font-size: .76rem; line-height: 1.55; display: block;
-                 margin-top: .15rem; margin-bottom: .35rem; }
-.log-entry     { border-left: 2px solid #1e3a5f; padding-left: .6rem;
-                 margin-bottom: .5rem; }
-
-/* ── Active spinner entry ── */
-@keyframes spin { to { transform: rotate(360deg); } }
-.log-active {
-    border-left: 2px solid #00AADD;
-    padding-left: .6rem;
-    margin-bottom: .5rem;
-    display: flex;
-    align-items: flex-start;
-    gap: .55rem;
-}
-.log-spinner {
-    flex-shrink: 0;
-    width: 14px; height: 14px;
-    margin-top: 3px;
-    border: 2px solid rgba(0,170,221,0.25);
-    border-top-color: #00AADD;
-    border-radius: 50%;
-    animation: spin 0.8s linear infinite;
-    display: inline-block;
-}
-.log-active-text { flex: 1; }
-</style>
-""", unsafe_allow_html=True)
-
-# ─────────────────────────────────────────────────────────────
-# SIDEBAR — settings (post-auth)
-# ─────────────────────────────────────────────────────────────
-with st.sidebar:
-    st.markdown("<div style='font-size:1rem;font-weight:700;color:#f1f5f9;margin-bottom:.25rem;'>PowerPoint Creator</div>", unsafe_allow_html=True)
-    st.markdown("<div style='font-size:.65rem;color:#475569;text-transform:uppercase;letter-spacing:.1em;margin-bottom:1rem;'>Game PowerPoint Generator</div>", unsafe_allow_html=True)
-
-    st.markdown('<span class="sidebar-section">Model</span>', unsafe_allow_html=True)
-    model = st.selectbox(
-        "Model", ["claude-sonnet-4-5", "claude-opus-4-5", "claude-haiku-4-5-20251001"],
-        label_visibility="hidden",
-    )
-    st.session_state["_selected_model"] = model
-
-    st.markdown('<span class="sidebar-section">Options</span>', unsafe_allow_html=True)
-    web_search_enabled = st.checkbox("Web search for reference game", value=True)
-    plan_mode          = True  # always on — pipeline stops at outline for review
-    slide_count        = st.slider("Target slides", 6, 20, 12)
-
-    st.markdown('<span class="sidebar-section">Template</span>', unsafe_allow_html=True)
-
-    # Show current template status
-    _uploaded_tpl = st.session_state.get("template_upload")
-    if _uploaded_tpl:
-        st.markdown(
-            f"<div style='font-size:.75rem;color:#22d3ee;margin-bottom:.3rem'>"
-            f"✓ Using uploaded: <b>{_uploaded_tpl.name}</b></div>",
-            unsafe_allow_html=True,
-        )
-    else:
-        st.markdown(
-            "<div style='font-size:.75rem;color:#60a5fa;margin-bottom:.3rem'>"
-            "✓ Using default: <b>SEGA Blue (SOA-HD)</b></div>",
-            unsafe_allow_html=True,
-        )
-
-    template_file = st.file_uploader(
-        "Override template (.pptx)",
-        type=["pptx"],
-        label_visibility="visible",
-        help="Upload a branded .pptx to override the default SEGA blue template. "
-             "The app will extract its colours, fonts, and layouts.",
-        key="template_upload",
-    )
-
-    # Theme is only used when no template is active (fallback scratch-build)
-    theme_preset = "SEGA Blue — Corporate Executive"  # kept for run_pipeline signature
-
-
-    st.markdown('<span class="sidebar-section">Pipeline</span>', unsafe_allow_html=True)
-    pipeline_steps = st.session_state.get("pipeline_steps", {
-        "upload": False, "extract": False, "research": False, "analyze": False, "generate": False,
-    })
-    for key, label in {"upload":"Document upload","extract":"Content extraction",
-                        "research":"Web research","analyze":"AI analysis","generate":"PPTX generation"}.items():
-        done = pipeline_steps.get(key, False)
-        st.markdown(
-            f'<div class="step-row {"step-done" if done else "step-pending"}">'
-            f'{"✓" if done else "○"}&nbsp; {label}</div>',
-            unsafe_allow_html=True,
-        )
-
-# ─────────────────────────────────────────────────────────────
-# PAGE HEADER
-# ─────────────────────────────────────────────────────────────
-st.markdown(
-    "<h1>Game PowerPoint Creator</h1>"
-    "<div style='font-size:.78rem;color:#475569;margin-bottom:1.5rem;'>"
-    "Upload internal documents &nbsp;·&nbsp; Benchmark against a released title &nbsp;·&nbsp; Generate a SEGA-branded PPTX"
-    "</div>",
-    unsafe_allow_html=True,
-)
-
-# ─────────────────────────────────────────────────────────────
-# TABS — Analysis tool vs PDF converter
-# ─────────────────────────────────────────────────────────────
-_tab_analysis, _tab_pdf = st.tabs(["📊 Analysis & PPTX", "📄 PDF → Editable PPTX"])
-
-with _tab_pdf:
-    st.markdown(
-        "<div style='font-size:.85rem;color:#94a3b8;margin-bottom:1rem;'>"
-        "Upload any PDF of slides — even rasterised/image-only exports from NotebookLM, Canva, etc. "
-        "Claude reads each page with vision and reconstructs it as fully editable PowerPoint shapes, "
-        "text boxes, and tables you can click and modify in PowerPoint or Google Slides."
-        "</div>",
-        unsafe_allow_html=True,
-    )
-
-    _pdf_col, _pdf_out_col = st.columns([1, 1], gap="large")
-
-    with _pdf_col:
-        st.markdown('<div class="section-label">Upload PDF</div>', unsafe_allow_html=True)
-        _pdf_file = st.file_uploader(
-            "Upload a PDF of slides",
-            type=["pdf"],
+        st.markdown('<span class="sidebar-section">Model</span>', unsafe_allow_html=True)
+        model = st.selectbox(
+            "Model", ["claude-sonnet-4-5", "claude-opus-4-5", "claude-haiku-4-5-20251001"],
             label_visibility="hidden",
-            key="pdf_converter_upload",
         )
-        if _pdf_file:
-            import pypdf as _pypdf
-            _pdf_reader = _pypdf.PdfReader(io.BytesIO(_pdf_file.read()))
-            _pdf_n_pages = len(_pdf_reader.pages)
-            _pdf_file.seek(0)
-            st.caption(f"📄 {_pdf_n_pages} page{'s' if _pdf_n_pages != 1 else ''} detected")
+        st.session_state["_selected_model"] = model
 
-        _pdf_model = st.selectbox(
-            "Vision model",
-            ["claude-opus-4-5", "claude-sonnet-4-5"],
-            help="Opus gives the most accurate layout extraction. Sonnet is faster and cheaper.",
-            key="pdf_vision_model",
-        )
-        _pdf_dpi = st.select_slider(
-            "Rasterisation quality",
-            options=[96, 120, 150, 200],
-            value=150,
-            key="pdf_dpi",
-            help="Higher DPI = sharper image for Claude to read, but slower. 150 is a good default.",
-        )
+        st.markdown('<span class="sidebar-section">Options</span>', unsafe_allow_html=True)
+        web_search_enabled = st.checkbox("Web search for reference game", value=True)
+        plan_mode          = True  # always on — pipeline stops at outline for review
+        slide_count        = st.slider("Target slides", 6, 20, 12)
 
-        _pdf_run_btn = st.button(
-            "⚡ Convert to editable PPTX",
-            use_container_width=True,
-            type="primary",
-            key="pdf_convert_btn",
-            disabled=not bool(_pdf_file),
-        )
+        st.markdown('<span class="sidebar-section">Template</span>', unsafe_allow_html=True)
 
-    with _pdf_out_col:
-        st.markdown('<div class="section-label">Output</div>', unsafe_allow_html=True)
-        _pdf_output_area = st.empty()
-
-        if "pdf_pptx_bytes" in st.session_state and not _pdf_run_btn:
-            _pdf_output_area.download_button(
-                "⬇️ Download editable PPTX",
-                data=st.session_state["pdf_pptx_bytes"],
-                file_name=st.session_state.get("pdf_pptx_filename", "converted.pptx"),
-                mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-                use_container_width=True,
+        # Show current template status
+        _uploaded_tpl = st.session_state.get("template_upload")
+        if _uploaded_tpl:
+            st.markdown(
+                f"<div style='font-size:.75rem;color:#22d3ee;margin-bottom:.3rem'>"
+                f"✓ Using uploaded: <b>{_uploaded_tpl.name}</b></div>",
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                "<div style='font-size:.75rem;color:#60a5fa;margin-bottom:.3rem'>"
+                "✓ Using default: <b>SEGA Blue (SOA-HD)</b></div>",
+                unsafe_allow_html=True,
             )
 
-    if _pdf_run_btn and _pdf_file:
-        _api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
-        if not _api_key:
-            st.error("ANTHROPIC_API_KEY not found in st.secrets.")
-        else:
-            _pdf_file.seek(0)
-            _pdf_bytes_raw = _pdf_file.read()
-            _pdf_n = len(_pypdf.PdfReader(io.BytesIO(_pdf_bytes_raw)).pages)
+        template_file = st.file_uploader(
+            "Override template (.pptx)",
+            type=["pptx"],
+            label_visibility="visible",
+            help="Upload a branded .pptx to override the default SEGA blue template. "
+                 "The app will extract its colours, fonts, and layouts.",
+            key="template_upload",
+        )
 
-            _prog_bar  = _pdf_output_area.progress(0, text="Starting…")
-            _log_area  = st.empty()
-            _log_lines = []
+        # Theme is only used when no template is active (fallback scratch-build)
+        theme_preset = "SEGA Blue — Corporate Executive"  # kept for run_pipeline signature
 
-            def _pdf_log(msg):
-                _log_lines.append(msg)
-                _log_area.markdown(
-                    "<div style='background:#0f172a;border-radius:6px;padding:.75rem 1rem;"
-                    "font-size:.8rem;color:#94a3b8;font-family:monospace;max-height:260px;"
-                    "overflow-y:auto;'>"
-                    + "".join(f"<div>{l}</div>" for l in _log_lines[-20:])
-                    + "</div>",
-                    unsafe_allow_html=True,
-                )
 
-            def _pdf_progress(frac):
-                page_num = max(1, round(frac * _pdf_n))
-                _prog_bar.progress(
-                    min(frac, 0.99),
-                    text=f"Processing page {page_num} of {_pdf_n}…",
-                )
+        st.markdown('<span class="sidebar-section">Pipeline</span>', unsafe_allow_html=True)
+        pipeline_steps = st.session_state.get("pipeline_steps", {
+            "upload": False, "extract": False, "research": False, "analyze": False, "generate": False,
+        })
+        for key, label in {"upload":"Document upload","extract":"Content extraction",
+                            "research":"Web research","analyze":"AI analysis","generate":"PPTX generation"}.items():
+            done = pipeline_steps.get(key, False)
+            st.markdown(
+                f'<div class="step-row {"step-done" if done else "step-pending"}">'
+                f'{"✓" if done else "○"}&nbsp; {label}</div>',
+                unsafe_allow_html=True,
+            )
 
-            _pdf_log(f"📄 <b>PDF loaded</b> — {_pdf_n} page(s)")
-            _pdf_log(f"🔍 <b>Sending to {_pdf_model}</b> for vision extraction…")
+    # ─────────────────────────────────────────────────────────────
+    # PAGE HEADER
+    # ─────────────────────────────────────────────────────────────
+    st.markdown(
+        "<h1>Game PowerPoint Creator</h1>"
+        "<div style='font-size:.78rem;color:#475569;margin-bottom:1.5rem;'>"
+        "Upload internal documents &nbsp;·&nbsp; Benchmark against a released title &nbsp;·&nbsp; Generate a SEGA-branded PPTX"
+        "</div>",
+        unsafe_allow_html=True,
+    )
 
-            try:
-                _pptx_out, _errs = _pdf_to_pptx(
-                    _pdf_bytes_raw,
-                    api_key=_api_key,
-                    model=_pdf_model,
-                    dpi=_pdf_dpi,
-                    progress_cb=_pdf_progress,
-                )
-                _fname = (_pdf_file.name.rsplit(".", 1)[0] if "." in _pdf_file.name
-                          else _pdf_file.name) + "_editable.pptx"
-                st.session_state["pdf_pptx_bytes"]    = _pptx_out
-                st.session_state["pdf_pptx_filename"] = _fname
+    # ─────────────────────────────────────────────────────────────
+    # TABS — Analysis tool vs PDF converter
+    # ─────────────────────────────────────────────────────────────
+    _tab_analysis, _tab_pdf = st.tabs(["📊 Analysis & PPTX", "📄 PDF → Editable PPTX"])
 
-                if _errs:
-                    for _e in _errs:
-                        _pdf_log(f"⚠️ {_e}")
+    with _tab_pdf:
+        st.markdown(
+            "<div style='font-size:.85rem;color:#94a3b8;margin-bottom:1rem;'>"
+            "Upload any PDF of slides — even rasterised/image-only exports from NotebookLM, Canva, etc. "
+            "Claude reads each page with vision and reconstructs it as fully editable PowerPoint shapes, "
+            "text boxes, and tables you can click and modify in PowerPoint or Google Slides."
+            "</div>",
+            unsafe_allow_html=True,
+        )
 
-                _prog_bar.progress(1.0, text="Done!")
-                _pdf_log(f"🎉 <b>Conversion complete</b> — {len(_pptx_out)//1024} KB PPTX")
+        _pdf_col, _pdf_out_col = st.columns([1, 1], gap="large")
 
+        with _pdf_col:
+            st.markdown('<div class="section-label">Upload PDF</div>', unsafe_allow_html=True)
+            _pdf_file = st.file_uploader(
+                "Upload a PDF of slides",
+                type=["pdf"],
+                label_visibility="hidden",
+                key="pdf_converter_upload",
+            )
+            if _pdf_file:
+                import pypdf as _pypdf
+                _pdf_reader = _pypdf.PdfReader(io.BytesIO(_pdf_file.read()))
+                _pdf_n_pages = len(_pdf_reader.pages)
+                _pdf_file.seek(0)
+                st.caption(f"📄 {_pdf_n_pages} page{'s' if _pdf_n_pages != 1 else ''} detected")
+
+            _pdf_model = st.selectbox(
+                "Vision model",
+                ["claude-opus-4-5", "claude-sonnet-4-5"],
+                help="Opus gives the most accurate layout extraction. Sonnet is faster and cheaper.",
+                key="pdf_vision_model",
+            )
+            _pdf_dpi = st.select_slider(
+                "Rasterisation quality",
+                options=[96, 120, 150, 200],
+                value=150,
+                key="pdf_dpi",
+                help="Higher DPI = sharper image for Claude to read, but slower. 150 is a good default.",
+            )
+
+            _pdf_run_btn = st.button(
+                "⚡ Convert to editable PPTX",
+                use_container_width=True,
+                type="primary",
+                key="pdf_convert_btn",
+                disabled=not bool(_pdf_file),
+            )
+
+        with _pdf_out_col:
+            st.markdown('<div class="section-label">Output</div>', unsafe_allow_html=True)
+            _pdf_output_area = st.empty()
+
+            if "pdf_pptx_bytes" in st.session_state and not _pdf_run_btn:
                 _pdf_output_area.download_button(
                     "⬇️ Download editable PPTX",
-                    data=_pptx_out,
-                    file_name=_fname,
+                    data=st.session_state["pdf_pptx_bytes"],
+                    file_name=st.session_state.get("pdf_pptx_filename", "converted.pptx"),
                     mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
                     use_container_width=True,
                 )
-                st.rerun()
 
-            except Exception as _pdf_ex:
-                st.error(f"Conversion failed: {_pdf_ex}")
-                import traceback
-                st.code(traceback.format_exc())
-
-with _tab_analysis:
-    pass  # rest of the app flows into this tab below
-
-# ─────────────────────────────────────────────────────────────
-# MAIN LAYOUT  (inside the Analysis tab)
-# ─────────────────────────────────────────────────────────────
-with _tab_analysis:
-    col_left, col_right = st.columns([1.1, 0.9], gap="large")
-
-    with col_left:
-        st.markdown('<div class="section-label">Documents</div>', unsafe_allow_html=True)
-        uploaded_files = st.file_uploader(
-            "Upload internal game documents",
-            type=["pdf", "xlsx", "xls", "csv", "txt", "docx"],
-            accept_multiple_files=True,
-            label_visibility="hidden",
-        )
-        if uploaded_files:
-            st.caption(f"{len(uploaded_files)} file(s): " + ", ".join(f.name for f in uploaded_files))
-            st.session_state["project_doc_names"] = [f.name for f in uploaded_files]
-
-        st.markdown('<div class="section-label" style="margin-top:.75rem;">Data for charts (optional)</div>', unsafe_allow_html=True)
-        data_files = st.file_uploader(
-            "Upload data files for chart generation",
-            type=["xlsx", "xls", "csv"],
-            accept_multiple_files=True,
-            label_visibility="hidden",
-            key="data_upload",
-            help="Upload Excel or CSV files. Mention specific charts in the Business Question field.",
-        )
-        if data_files:
-            st.caption(f"📊 {len(data_files)} data file(s): " + ", ".join(f.name for f in data_files))
-
-        st.markdown('<div class="section-label">Analysis inputs</div>', unsafe_allow_html=True)
-
-        game_title = st.text_input(
-            "Reference / competitor game titles (comma-separated for multiple)",
-            value=st.session_state.get("project_game_title", ""),
-            placeholder="e.g. Mario Odyssey, Astro Bot, Hollow Knight — separate multiple with commas",
-            key="game_title_input",
-        )
-        st.session_state["project_game_title"] = game_title
-        business_question = st.text_area(
-            "Business question",
-            value=st.session_state.get("project_question", ""),
-            placeholder=(
-                "e.g. Compare our internal game's combat mechanics and scope against Sonic Frontiers, "
-                "highlighting gaps and opportunities for the executive team…"
-            ),
-            height=130,
-            key="biz_question_input",
-        )
-        st.session_state["project_question"] = business_question
-        audience = st.text_input(
-            "Presentation audience",
-            value=st.session_state.get("project_audience", "Executive team"),
-            placeholder="e.g. Executive team, Product leads, Marketing…",
-            key="audience_input",
-        )
-        st.session_state["project_audience"] = audience
-
-        run_btn = st.button("⚡ Run analysis", use_container_width=True, type="primary")
-
-    with col_right:
-        st.markdown('<div class="section-label">Output</div>', unsafe_allow_html=True)
-        output_area   = st.empty()
-        download_area = st.empty()
-
-        if st.session_state.get("plan_mode_active") and not run_btn:
-            with output_area.container():
-                _render_plan_modal(st.session_state.get("template_upload"))
-        elif not run_btn and "pptx_bytes" not in st.session_state:
-            output_area.markdown("""
-    <div class="status-card">
-    <div class="status-card-label">Ready</div>
-    <div class="status-card-value" style="color:#475569;font-size:.82rem;line-height:1.8;">
-    Fill in the inputs on the left and click <strong style="color:#e2e8f0;">Run analysis</strong>.<br><br>
-    The pipeline will:<br>
-    &nbsp;1. Extract your uploaded documents<br>
-    &nbsp;2. Search the web for the reference game<br>
-    &nbsp;3. Run a Claude-powered comparative analysis<br>
-    &nbsp;4. Show you the outline to review and edit<br>
-    &nbsp;5. Export to a SEGA-branded PPTX on demand
-    </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-        if "pptx_bytes" in st.session_state and not run_btn:
-            download_area.download_button(
-                label="⬇️ Download previous PPTX",
-                data=st.session_state["pptx_bytes"],
-                file_name=st.session_state.get("pptx_filename", "SEGA_Analysis.pptx"),
-                mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-                use_container_width=True,
-            )
-
-    # ─────────────────────────────────────────────────────────────
-    # HELPERS
-    # ─────────────────────────────────────────────────────────────
-
-
-
-
-    # ─────────────────────────────────────────────────────────────
-    # PPTX GENERATION — pure python-pptx (no Node.js required)
-    # ─────────────────────────────────────────────────────────────
-
-
-    # Slide canvas: 13.3 × 7.5 inches (LAYOUT_WIDE)
-
-
-
-
-
-
-
-    # ── Slide type renderers ──────────────────────────────────────
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    # ─────────────────────────────────────────────────────────────
-    # API HELPERS  (with rate-limit retry + back-off)
-    # ─────────────────────────────────────────────────────────────
-
-    _RL_WAIT_BASE = 20   # seconds to wait on first 429
-    _RL_MAX_TRIES = 5    # max retries before giving up
-
-
-
-
-
-
-    # ─────────────────────────────────────────────────────────────
-    # PIPELINE  (parallel extraction + research, streaming analysis)
-    # ─────────────────────────────────────────────────────────────
-
-    # Characters of document context to send.
-    # 60 000 chars ≈ 15 000 tokens — plenty for most PDFs while staying well under
-    # Sonnet's 200k context window.  Rate-limit headroom is managed by model choice.
-    _MAX_DOC_CHARS = 60_000
-
-
-
-
-    # ─────────────────────────────────────────────────────────────
-    # RUN BUTTON HANDLER
-    # ─────────────────────────────────────────────────────────────
-
-
-
-    if run_btn:
-        if not business_question.strip():
-            st.error("Please enter a business question.")
-        else:
-            # Collect data files
-            data_files = st.session_state.get("data_upload") or []
-            if hasattr(data_files, "read"):  # single file — wrap
-                data_files = [data_files]
-
-            # Use uploaded template override, or fall back to the embedded SEGA blue default
-            _template_bytes = None
-            _template_file = st.session_state.get("template_upload")
-            if _template_file is not None:
-                try:
-                    _template_file.seek(0)
-                    _template_bytes = _template_file.read()
-                    # Persist for project Save
-                    st.session_state["saved_template_bytes"] = _template_bytes
-                except Exception as _e:
-                    st.warning(f"Could not read template file: {_e}. Using default SEGA blue template.")
-                    _template_bytes = _SEGA_BLUE_TEMPLATE_BYTES
+        if _pdf_run_btn and _pdf_file:
+            _api_key = st.secrets.get("ANTHROPIC_API_KEY", "")
+            if not _api_key:
+                st.error("ANTHROPIC_API_KEY not found in st.secrets.")
             else:
-                # Always use the embedded SEGA blue template as the default
-                _template_bytes = _SEGA_BLUE_TEMPLATE_BYTES
+                _pdf_file.seek(0)
+                _pdf_bytes_raw = _pdf_file.read()
+                _pdf_n = len(_pypdf.PdfReader(io.BytesIO(_pdf_bytes_raw)).pages)
 
-            pipeline_steps = {
-                "upload": bool(uploaded_files), "extract": False,
-                "research": False, "analyze": False, "generate": False,
-            }
-            st.session_state["pipeline_steps"] = pipeline_steps
-            log_lines = []
+                _prog_bar  = _pdf_output_area.progress(0, text="Starting…")
+                _log_area  = st.empty()
+                _log_lines = []
 
-            with output_area.container():
-                st.markdown('<div class="section-label">Pipeline log</div>', unsafe_allow_html=True)
-                log_area = st.empty()
+                def _pdf_log(msg):
+                    _log_lines.append(msg)
+                    _log_area.markdown(
+                        "<div style='background:#0f172a;border-radius:6px;padding:.75rem 1rem;"
+                        "font-size:.8rem;color:#94a3b8;font-family:monospace;max-height:260px;"
+                        "overflow-y:auto;'>"
+                        + "".join(f"<div>{l}</div>" for l in _log_lines[-20:])
+                        + "</div>",
+                        unsafe_allow_html=True,
+                    )
+
+                def _pdf_progress(frac):
+                    page_num = max(1, round(frac * _pdf_n))
+                    _prog_bar.progress(
+                        min(frac, 0.99),
+                        text=f"Processing page {page_num} of {_pdf_n}…",
+                    )
+
+                _pdf_log(f"📄 <b>PDF loaded</b> — {_pdf_n} page(s)")
+                _pdf_log(f"🔍 <b>Sending to {_pdf_model}</b> for vision extraction…")
 
                 try:
-                    for event in run_pipeline(
-                        model, uploaded_files, game_title, business_question,
-                        audience, theme_preset, web_search_enabled, slide_count,
-                        template_bytes=_template_bytes,
-                        data_files=data_files,
-                        plan_mode=plan_mode,
-                    ):
-                        etype = event[0]
+                    _pptx_out, _errs = _pdf_to_pptx(
+                        _pdf_bytes_raw,
+                        api_key=_api_key,
+                        model=_pdf_model,
+                        dpi=_pdf_dpi,
+                        progress_cb=_pdf_progress,
+                    )
+                    _fname = (_pdf_file.name.rsplit(".", 1)[0] if "." in _pdf_file.name
+                              else _pdf_file.name) + "_editable.pptx"
+                    st.session_state["pdf_pptx_bytes"]    = _pptx_out
+                    st.session_state["pdf_pptx_filename"] = _fname
 
-                        if etype in ("log", "spinner"):
-                            # "spinner" = active working entry (animated ring at bottom)
-                            # "log"     = completed entry (static, left-border style)
-                            # When a new event arrives, any previous spinner is promoted
-                            # to a plain log entry so only the latest one animates.
-                            if etype == "spinner":
-                                # Promote the last spinner (if any) to a plain log entry
-                                if log_lines and log_lines[-1][0] == "spinner":
-                                    log_lines[-1] = ("log", log_lines[-1][1])
-                                log_lines.append(("spinner", event[1]))
-                            else:
-                                # Promote any trailing spinner before adding the completed msg
-                                if log_lines and log_lines[-1][0] == "spinner":
-                                    log_lines[-1] = ("log", log_lines[-1][1])
-                                log_lines.append(("log", event[1]))
+                    if _errs:
+                        for _e in _errs:
+                            _pdf_log(f"⚠️ {_e}")
 
-                            # Build self-contained HTML with inline CSS.
-                            # Streamlit does NOT share CSS between separate markdown() calls,
-                            # so all styles must be embedded in every render.
-                            _CSS = (
-                                "<style>"
-                                "@keyframes _sp{to{transform:rotate(360deg)}}"
-                                "._lw{background:#0f172a;border:1px solid #1e293b;border-radius:8px;"
-                                "padding:1rem 1.25rem;font-size:.82rem;"
-                                "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;"
-                                "color:#94a3b8;max-height:480px;overflow-y:auto;line-height:1.7}"
-                                "._lw b{color:#e2e8f0;font-weight:600}"
-                                "._lw i{color:#60a5fa}"
-                                "._ld{color:#64748b;font-size:.76rem;line-height:1.55;display:block;"
-                                "margin-top:.15rem;margin-bottom:.35rem}"
-                                "._le{border-left:2px solid #1e3a5f;padding-left:.6rem;margin-bottom:.5rem}"
-                                "._la{border-left:2px solid #00AADD;padding-left:.6rem;"
-                                "margin-bottom:.5rem;display:flex;align-items:flex-start;gap:.55rem}"
-                                "._lr{flex-shrink:0;width:14px;height:14px;margin-top:3px;"
-                                "border:2px solid rgba(0,170,221,.25);border-top-color:#00AADD;"
-                                "border-radius:50%;animation:_sp .8s linear infinite}"
-                                "._lt{flex:1}"
-                                "</style>"
-                            )
-                            html_parts = [_CSS, '<div class="_lw">']
-                            for _kind, _text in log_lines[-14:]:
-                                _t = _text.replace("class='log-detail'", "class='_ld'")
-                                if _kind == "spinner":
-                                    html_parts.append(
-                                        f'<div class="_la"><div class="_lr"></div>'
-                                        f'<div class="_lt">{_t}</div></div>'
-                                    )
-                                else:
-                                    html_parts.append(f'<div class="_le">{_t}</div>')
-                            html_parts.append("</div>")
-                            log_area.markdown("".join(html_parts), unsafe_allow_html=True)
-                        elif etype == "step_done":
-                            pipeline_steps[event[1]] = True
-                            st.session_state["pipeline_steps"] = pipeline_steps
+                    _prog_bar.progress(1.0, text="Done!")
+                    _pdf_log(f"🎉 <b>Conversion complete</b> — {len(_pptx_out)//1024} KB PPTX")
 
-                        elif etype == "slide_data":
-                            st.session_state["slide_data"] = event[1]
-
-                        elif etype == "plan_ready":
-                            st.session_state["plan_slide_data"] = event[1]
-                            st.session_state["plan_mode_active"] = True
-                            # Auto-save slide plan to project
-                            _ap = st.session_state.get("active_project")
-                            if _ap:
-                                save_project(
-                                    OWNER, _ap,
-                                    business_question=st.session_state.get("project_question", ""),
-                                    game_title=st.session_state.get("project_game_title", ""),
-                                    audience=st.session_state.get("project_audience", "Executive team"),
-                                    doc_names=st.session_state.get("project_doc_names", []),
-                                    slide_json=event[1],
-                                    plan_chat=st.session_state.get("plan_chat", []),
-                                )
-
-                        elif etype == "pptx_bytes_out":
-                            _gt_disp = ", ".join(
-                                g.strip() for g in (game_title or "").split(",") if g.strip()
-                            ) or "Report"
-                            fname = f"SEGA_Analysis_{_gt_disp.replace(' ','_').replace(',','_')[:50]}.pptx"
-                            st.session_state["pptx_bytes"]    = event[1]
-                            st.session_state["pptx_filename"] = fname
-
-                        elif etype == "error":
-                            st.error(event[1])
-                            break
-
-                except Exception as ex:
-                    st.error(f"Unexpected error: {ex}")
-                    import traceback
-                    st.code(traceback.format_exc())
-
-            if st.session_state.get("plan_mode_active"):
-                with output_area.container():
-                    _render_plan_modal(st.session_state.get("template_upload"))
-
-            if "pptx_bytes" in st.session_state:
-                with download_area.container():
-                    st.success("Analysis complete.")
-                    st.download_button(
-                        label="⬇️ Download PPTX",
-                        data=st.session_state["pptx_bytes"],
-                        file_name=st.session_state["pptx_filename"],
+                    _pdf_output_area.download_button(
+                        "⬇️ Download editable PPTX",
+                        data=_pptx_out,
+                        file_name=_fname,
                         mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
                         use_container_width=True,
                     )
-                    if "slide_data" in st.session_state:
-                        with st.expander("Slide outline", expanded=False):
-                            for i, sl in enumerate(st.session_state["slide_data"].get("slides", []), 1):
-                                st.markdown(f"**{i}.** `{sl.get('type','?').upper()}` — {sl.get('title','')}")
+                    st.rerun()
 
+                except Exception as _pdf_ex:
+                    st.error(f"Conversion failed: {_pdf_ex}")
+                    import traceback
+                    st.code(traceback.format_exc())
 
-
+    with _tab_analysis:
+        pass  # rest of the app flows into this tab below
 
     # ─────────────────────────────────────────────────────────────
-    # PLAN MODE — OUTLINE EDITOR (modal dialog)
+    # MAIN LAYOUT  (inside the Analysis tab)
     # ─────────────────────────────────────────────────────────────
+    with _tab_analysis:
+        col_left, col_right = st.columns([1.1, 0.9], gap="large")
+
+        with col_left:
+            st.markdown('<div class="section-label">Documents</div>', unsafe_allow_html=True)
+            uploaded_files = st.file_uploader(
+                "Upload internal game documents",
+                type=["pdf", "xlsx", "xls", "csv", "txt", "docx"],
+                accept_multiple_files=True,
+                label_visibility="hidden",
+            )
+            if uploaded_files:
+                st.caption(f"{len(uploaded_files)} file(s): " + ", ".join(f.name for f in uploaded_files))
+                st.session_state["project_doc_names"] = [f.name for f in uploaded_files]
+
+            st.markdown('<div class="section-label" style="margin-top:.75rem;">Data for charts (optional)</div>', unsafe_allow_html=True)
+            data_files = st.file_uploader(
+                "Upload data files for chart generation",
+                type=["xlsx", "xls", "csv"],
+                accept_multiple_files=True,
+                label_visibility="hidden",
+                key="data_upload",
+                help="Upload Excel or CSV files. Mention specific charts in the Business Question field.",
+            )
+            if data_files:
+                st.caption(f"📊 {len(data_files)} data file(s): " + ", ".join(f.name for f in data_files))
+
+            st.markdown('<div class="section-label">Analysis inputs</div>', unsafe_allow_html=True)
+
+            game_title = st.text_input(
+                "Reference / competitor game titles (comma-separated for multiple)",
+                value=st.session_state.get("project_game_title", ""),
+                placeholder="e.g. Mario Odyssey, Astro Bot, Hollow Knight — separate multiple with commas",
+                key="game_title_input",
+            )
+            st.session_state["project_game_title"] = game_title
+            business_question = st.text_area(
+                "Business question",
+                value=st.session_state.get("project_question", ""),
+                placeholder=(
+                    "e.g. Compare our internal game's combat mechanics and scope against Sonic Frontiers, "
+                    "highlighting gaps and opportunities for the executive team…"
+                ),
+                height=130,
+                key="biz_question_input",
+            )
+            st.session_state["project_question"] = business_question
+            audience = st.text_input(
+                "Presentation audience",
+                value=st.session_state.get("project_audience", "Executive team"),
+                placeholder="e.g. Executive team, Product leads, Marketing…",
+                key="audience_input",
+            )
+            st.session_state["project_audience"] = audience
+
+            run_btn = st.button("⚡ Run analysis", use_container_width=True, type="primary")
+
+        with col_right:
+            st.markdown('<div class="section-label">Output</div>', unsafe_allow_html=True)
+            output_area   = st.empty()
+            download_area = st.empty()
+
+            if st.session_state.get("plan_mode_active") and not run_btn:
+                with output_area.container():
+                    _render_plan_modal(st.session_state.get("template_upload"))
+            elif not run_btn and "pptx_bytes" not in st.session_state:
+                output_area.markdown("""
+        <div class="status-card">
+        <div class="status-card-label">Ready</div>
+        <div class="status-card-value" style="color:#475569;font-size:.82rem;line-height:1.8;">
+        Fill in the inputs on the left and click <strong style="color:#e2e8f0;">Run analysis</strong>.<br><br>
+        The pipeline will:<br>
+        &nbsp;1. Extract your uploaded documents<br>
+        &nbsp;2. Search the web for the reference game<br>
+        &nbsp;3. Run a Claude-powered comparative analysis<br>
+        &nbsp;4. Show you the outline to review and edit<br>
+        &nbsp;5. Export to a SEGA-branded PPTX on demand
+        </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+            if "pptx_bytes" in st.session_state and not run_btn:
+                download_area.download_button(
+                    label="⬇️ Download previous PPTX",
+                    data=st.session_state["pptx_bytes"],
+                    file_name=st.session_state.get("pptx_filename", "SEGA_Analysis.pptx"),
+                    mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                    use_container_width=True,
+                )
+
+        # ─────────────────────────────────────────────────────────────
+        # HELPERS
+        # ─────────────────────────────────────────────────────────────
+
+
+
+
+        # ─────────────────────────────────────────────────────────────
+        # PPTX GENERATION — pure python-pptx (no Node.js required)
+        # ─────────────────────────────────────────────────────────────
+
+
+        # Slide canvas: 13.3 × 7.5 inches (LAYOUT_WIDE)
+
+
+
+
+
+
+
+        # ── Slide type renderers ──────────────────────────────────────
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        # ─────────────────────────────────────────────────────────────
+        # API HELPERS  (with rate-limit retry + back-off)
+        # ─────────────────────────────────────────────────────────────
+
+        _RL_WAIT_BASE = 20   # seconds to wait on first 429
+        _RL_MAX_TRIES = 5    # max retries before giving up
+
+
+
+
+
+
+        # ─────────────────────────────────────────────────────────────
+        # PIPELINE  (parallel extraction + research, streaming analysis)
+        # ─────────────────────────────────────────────────────────────
+
+        # Characters of document context to send.
+        # 60 000 chars ≈ 15 000 tokens — plenty for most PDFs while staying well under
+        # Sonnet's 200k context window.  Rate-limit headroom is managed by model choice.
+        _MAX_DOC_CHARS = 60_000
+
+
+
+
+        # ─────────────────────────────────────────────────────────────
+        # RUN BUTTON HANDLER
+        # ─────────────────────────────────────────────────────────────
+
+
+
+        if run_btn:
+            if not business_question.strip():
+                st.error("Please enter a business question.")
+            else:
+                # Collect data files
+                data_files = st.session_state.get("data_upload") or []
+                if hasattr(data_files, "read"):  # single file — wrap
+                    data_files = [data_files]
+
+                # Use uploaded template override, or fall back to the embedded SEGA blue default
+                _template_bytes = None
+                _template_file = st.session_state.get("template_upload")
+                if _template_file is not None:
+                    try:
+                        _template_file.seek(0)
+                        _template_bytes = _template_file.read()
+                        # Persist for project Save
+                        st.session_state["saved_template_bytes"] = _template_bytes
+                    except Exception as _e:
+                        st.warning(f"Could not read template file: {_e}. Using default SEGA blue template.")
+                        _template_bytes = _SEGA_BLUE_TEMPLATE_BYTES
+                else:
+                    # Always use the embedded SEGA blue template as the default
+                    _template_bytes = _SEGA_BLUE_TEMPLATE_BYTES
+
+                pipeline_steps = {
+                    "upload": bool(uploaded_files), "extract": False,
+                    "research": False, "analyze": False, "generate": False,
+                }
+                st.session_state["pipeline_steps"] = pipeline_steps
+                log_lines = []
+
+                with output_area.container():
+                    st.markdown('<div class="section-label">Pipeline log</div>', unsafe_allow_html=True)
+                    log_area = st.empty()
+
+                    try:
+                        for event in run_pipeline(
+                            model, uploaded_files, game_title, business_question,
+                            audience, theme_preset, web_search_enabled, slide_count,
+                            template_bytes=_template_bytes,
+                            data_files=data_files,
+                            plan_mode=plan_mode,
+                        ):
+                            etype = event[0]
+
+                            if etype in ("log", "spinner"):
+                                # "spinner" = active working entry (animated ring at bottom)
+                                # "log"     = completed entry (static, left-border style)
+                                # When a new event arrives, any previous spinner is promoted
+                                # to a plain log entry so only the latest one animates.
+                                if etype == "spinner":
+                                    # Promote the last spinner (if any) to a plain log entry
+                                    if log_lines and log_lines[-1][0] == "spinner":
+                                        log_lines[-1] = ("log", log_lines[-1][1])
+                                    log_lines.append(("spinner", event[1]))
+                                else:
+                                    # Promote any trailing spinner before adding the completed msg
+                                    if log_lines and log_lines[-1][0] == "spinner":
+                                        log_lines[-1] = ("log", log_lines[-1][1])
+                                    log_lines.append(("log", event[1]))
+
+                                # Build self-contained HTML with inline CSS.
+                                # Streamlit does NOT share CSS between separate markdown() calls,
+                                # so all styles must be embedded in every render.
+                                _CSS = (
+                                    "<style>"
+                                    "@keyframes _sp{to{transform:rotate(360deg)}}"
+                                    "._lw{background:#0f172a;border:1px solid #1e293b;border-radius:8px;"
+                                    "padding:1rem 1.25rem;font-size:.82rem;"
+                                    "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;"
+                                    "color:#94a3b8;max-height:480px;overflow-y:auto;line-height:1.7}"
+                                    "._lw b{color:#e2e8f0;font-weight:600}"
+                                    "._lw i{color:#60a5fa}"
+                                    "._ld{color:#64748b;font-size:.76rem;line-height:1.55;display:block;"
+                                    "margin-top:.15rem;margin-bottom:.35rem}"
+                                    "._le{border-left:2px solid #1e3a5f;padding-left:.6rem;margin-bottom:.5rem}"
+                                    "._la{border-left:2px solid #00AADD;padding-left:.6rem;"
+                                    "margin-bottom:.5rem;display:flex;align-items:flex-start;gap:.55rem}"
+                                    "._lr{flex-shrink:0;width:14px;height:14px;margin-top:3px;"
+                                    "border:2px solid rgba(0,170,221,.25);border-top-color:#00AADD;"
+                                    "border-radius:50%;animation:_sp .8s linear infinite}"
+                                    "._lt{flex:1}"
+                                    "</style>"
+                                )
+                                html_parts = [_CSS, '<div class="_lw">']
+                                for _kind, _text in log_lines[-14:]:
+                                    _t = _text.replace("class='log-detail'", "class='_ld'")
+                                    if _kind == "spinner":
+                                        html_parts.append(
+                                            f'<div class="_la"><div class="_lr"></div>'
+                                            f'<div class="_lt">{_t}</div></div>'
+                                        )
+                                    else:
+                                        html_parts.append(f'<div class="_le">{_t}</div>')
+                                html_parts.append("</div>")
+                                log_area.markdown("".join(html_parts), unsafe_allow_html=True)
+                            elif etype == "step_done":
+                                pipeline_steps[event[1]] = True
+                                st.session_state["pipeline_steps"] = pipeline_steps
+
+                            elif etype == "slide_data":
+                                st.session_state["slide_data"] = event[1]
+
+                            elif etype == "plan_ready":
+                                st.session_state["plan_slide_data"] = event[1]
+                                st.session_state["plan_mode_active"] = True
+                                # Auto-save slide plan to project
+                                _ap = st.session_state.get("active_project")
+                                if _ap:
+                                    save_project(
+                                        OWNER, _ap,
+                                        business_question=st.session_state.get("project_question", ""),
+                                        game_title=st.session_state.get("project_game_title", ""),
+                                        audience=st.session_state.get("project_audience", "Executive team"),
+                                        doc_names=st.session_state.get("project_doc_names", []),
+                                        slide_json=event[1],
+                                        plan_chat=st.session_state.get("plan_chat", []),
+                                    )
+
+                            elif etype == "pptx_bytes_out":
+                                _gt_disp = ", ".join(
+                                    g.strip() for g in (game_title or "").split(",") if g.strip()
+                                ) or "Report"
+                                fname = f"SEGA_Analysis_{_gt_disp.replace(' ','_').replace(',','_')[:50]}.pptx"
+                                st.session_state["pptx_bytes"]    = event[1]
+                                st.session_state["pptx_filename"] = fname
+
+                            elif etype == "error":
+                                st.error(event[1])
+                                break
+
+                    except Exception as ex:
+                        st.error(f"Unexpected error: {ex}")
+                        import traceback
+                        st.code(traceback.format_exc())
+
+                if st.session_state.get("plan_mode_active"):
+                    with output_area.container():
+                        _render_plan_modal(st.session_state.get("template_upload"))
+
+                if "pptx_bytes" in st.session_state:
+                    with download_area.container():
+                        st.success("Analysis complete.")
+                        st.download_button(
+                            label="⬇️ Download PPTX",
+                            data=st.session_state["pptx_bytes"],
+                            file_name=st.session_state["pptx_filename"],
+                            mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                            use_container_width=True,
+                        )
+                        if "slide_data" in st.session_state:
+                            with st.expander("Slide outline", expanded=False):
+                                for i, sl in enumerate(st.session_state["slide_data"].get("slides", []), 1):
+                                    st.markdown(f"**{i}.** `{sl.get('type','?').upper()}` — {sl.get('title','')}")
+
+
+
+
+        # ─────────────────────────────────────────────────────────────
+        # PLAN MODE — OUTLINE EDITOR (modal dialog)
+        # ─────────────────────────────────────────────────────────────
