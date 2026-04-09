@@ -24,7 +24,6 @@ from pptxruns import (
     generate_pptx,
     extract_text_from_file,
     _make_anthropic_client,
-    _render_plan_modal,
 )
 
 # ── Storage ───────────────────────────────────────────────────────────────────
@@ -395,51 +394,83 @@ def _web_research(topic: str, purpose: str, industry: str, question: str) -> tup
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Image fetching — searches the web and returns raw image bytes
+# Image fetching — Bing Image Search (primary) with DuckDuckGo fallback
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _fetch_image_for_query(query: str) -> bytes | None:
     """
-    Search the web for a real image matching `query` and return its bytes,
-    or None if nothing usable is found.
-    Uses DuckDuckGo image search (no API key needed).
+    Fetch real image bytes for a search query.
+    Tries Bing Image Search API first (requires BING_IMAGE_API_KEY in secrets),
+    then falls back to DuckDuckGo scraping.
+    Returns raw image bytes or None if nothing usable is found.
     """
     if not query or not query.strip():
         return None
-    try:
-        import urllib.request, urllib.parse
-        headers = {"User-Agent": "Mozilla/5.0"}
 
-        # DuckDuckGo image search — parse the vqd token then fetch results
+    # ── Try Bing Image Search API ─────────────────────────────────────────────
+    bing_key = st.secrets.get("BING_IMAGE_API_KEY", "")
+    if bing_key:
+        try:
+            import urllib.request, urllib.parse
+            params = urllib.parse.urlencode({
+                "q": query, "count": "5", "safeSearch": "Moderate",
+                "imageType": "Photo", "size": "Medium",
+            })
+            req = urllib.request.Request(
+                f"https://api.bing.microsoft.com/v7.0/images/search?{params}",
+                headers={"Ocp-Apim-Subscription-Key": bing_key},
+            )
+            import json as _j
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                data = _j.loads(resp.read())
+            for item in data.get("value", [])[:5]:
+                img_url = item.get("contentUrl", "")
+                if not img_url:
+                    continue
+                try:
+                    req2 = urllib.request.Request(
+                        img_url, headers={"User-Agent": "Mozilla/5.0"}
+                    )
+                    with urllib.request.urlopen(req2, timeout=6) as img_resp:
+                        img_bytes = img_resp.read()
+                    if len(img_bytes) > 1000 and img_bytes[:3] in (
+                        b'\xff\xd8\xff', b'\x89PN', b'GIF',
+                    ) or img_bytes[:4] == b'\x89PNG':
+                        return img_bytes
+                except Exception:
+                    continue
+        except Exception:
+            pass  # fall through to DuckDuckGo
+
+    # ── Fallback: DuckDuckGo image scraping ───────────────────────────────────
+    try:
+        import urllib.request, urllib.parse, re as _re, json as _j
+        headers = {"User-Agent": "Mozilla/5.0"}
         search_url = "https://duckduckgo.com/?q=" + urllib.parse.quote(query) + "&iax=images&ia=images"
         req = urllib.request.Request(search_url, headers=headers)
         with urllib.request.urlopen(req, timeout=8) as resp:
             html = resp.read().decode("utf-8", errors="replace")
 
-        # Extract vqd token
-        import re
-        vqd_match = re.search(r'vqd=(["\'])([^"\']+)\1', html)
+        vqd_match = _re.search(r'vqd=(["\'])([^"\']+)\1', html)
         if not vqd_match:
-            vqd_match = re.search(r'vqd=([\d-]+)', html)
+            vqd_match = _re.search(r'vqd=([\d-]+)', html)
             vqd = vqd_match.group(1) if vqd_match else None
         else:
             vqd = vqd_match.group(2)
         if not vqd:
             return None
 
-        # Fetch image results JSON
         img_url = (
             "https://duckduckgo.com/i.js?q=" + urllib.parse.quote(query)
-            + "&vqd=" + urllib.parse.quote(vqd)
-            + "&o=json&p=1"
+            + "&vqd=" + urllib.parse.quote(vqd) + "&o=json&p=1"
         )
-        req2 = urllib.request.Request(img_url, headers={**headers, "Referer": "https://duckduckgo.com/"})
+        req2 = urllib.request.Request(
+            img_url, headers={**headers, "Referer": "https://duckduckgo.com/"}
+        )
         with urllib.request.urlopen(req2, timeout=8) as resp2:
-            data = json.loads(resp2.read())
+            data = _j.loads(resp2.read())
 
-        results = data.get("results", [])
-        # Try up to 5 results to find one we can download
-        for result in results[:5]:
+        for result in data.get("results", [])[:5]:
             img_src = result.get("image") or result.get("thumbnail")
             if not img_src:
                 continue
@@ -447,19 +478,16 @@ def _fetch_image_for_query(query: str) -> bytes | None:
                 req3 = urllib.request.Request(img_src, headers=headers)
                 with urllib.request.urlopen(req3, timeout=6) as img_resp:
                     img_bytes = img_resp.read()
-                # Basic validation — must be a real image
-                if len(img_bytes) > 1000 and img_bytes[:4] in (
-                    b'\x89PNG', b'\xff\xd8\xff', b'GIF8', b'RIFF',
+                if len(img_bytes) > 1000 and (
+                    img_bytes[:4] in (b'\x89PNG', b'\xff\xd8\xff', b'GIF8', b'RIFF')
+                    or img_bytes[8:12] == b'WEBP'
                 ):
-                    return img_bytes
-                # Also accept WebP
-                if img_bytes[:4] == b'RIFF' or img_bytes[8:12] == b'WEBP':
                     return img_bytes
             except Exception:
                 continue
-        return None
     except Exception:
-        return None
+        pass
+    return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -550,6 +578,369 @@ Rules:
 {f'- SOURCES SLIDE: The final slide MUST be type "bullets" titled "Sources", listing each source from the VERIFIED WEB SOURCES as a bullet: "Title — URL".' if sources else ''}
 - Return ONLY valid JSON — no markdown fences, no explanation
 """
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Conversational plan modal — chat-first outline editor
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SLIDE_TYPES = ["title","section","bullets","stats","comparison","recommendation","chart","closing"]
+
+def _render_plan_modal(template_bytes_ref=None):
+    """
+    Chat-first plan editor. Claude is the primary interface for modifying the
+    outline; the raw expander editor is available as a secondary option.
+    """
+    sd     = st.session_state.get("plan_slide_data", {})
+    slides = sd.get("slides", [])
+    _active = st.session_state.get("active_project", "")
+
+    # ── Header ────────────────────────────────────────────────────────────────
+    hcol, xcol = st.columns([5, 1])
+    with hcol:
+        st.markdown(
+            f"<h3 style='color:#D0E4FF;margin:0'>✏️ Review outline &nbsp;·&nbsp; "
+            f"<span style='color:#00CCFF'>{sd.get('title','Presentation')}</span>"
+            f"<span style='color:#4A6A9A;font-size:.8rem;font-weight:400'>"
+            f" &nbsp;{len(slides)} slides</span></h3>",
+            unsafe_allow_html=True,
+        )
+    with xcol:
+        if st.button("✕ Close", key="pm_close", use_container_width=True):
+            st.session_state.pop("plan_slide_data", None)
+            st.session_state.pop("plan_mode_active", None)
+            st.rerun()
+
+    st.divider()
+
+    # ── Two-column layout: chat left, outline right ───────────────────────────
+    chat_col, outline_col = st.columns([1, 1], gap="large")
+
+    # ── LEFT: Conversational editor ───────────────────────────────────────────
+    with chat_col:
+        st.markdown(
+            "<div style='font-size:.72rem;font-weight:700;letter-spacing:.1em;"
+            "text-transform:uppercase;color:#00CCFF;margin-bottom:.5rem'>"
+            "Chat to refine</div>",
+            unsafe_allow_html=True,
+        )
+
+        if "plan_chat" not in st.session_state:
+            st.session_state["plan_chat"] = []
+        if "plan_slide_history" not in st.session_state:
+            st.session_state["plan_slide_history"] = []
+
+        # Welcome hint if no chat yet
+        if not st.session_state["plan_chat"]:
+            st.markdown(
+                "<div style='color:#4A6A9A;font-size:.82rem;line-height:1.7;"
+                "background:#0A1832;border-radius:6px;padding:.75rem 1rem;"
+                "border-left:3px solid #0055AA;margin-bottom:.75rem'>"
+                "Describe changes in plain language.<br>"
+                "<b style='color:#8899BB'>Examples:</b><br>"
+                "· \"Add a market size slide after slide 2\"<br>"
+                "· \"Make slide 4 a comparison table vs competitors\"<br>"
+                "· \"Swap slides 3 and 5, then tighten the bullets\"<br>"
+                "· \"Remove the AI mentions from every slide\""
+                "</div>",
+                unsafe_allow_html=True,
+            )
+
+        # Chat history
+        _chat_container = st.container(height=320)
+        with _chat_container:
+            for _msg in st.session_state["plan_chat"]:
+                with st.chat_message(_msg["role"]):
+                    st.markdown(_msg["content"])
+
+        # Undo button
+        _history = st.session_state["plan_slide_history"]
+        undo_col, _ = st.columns([1, 3])
+        with undo_col:
+            if _history:
+                if st.button(f"↩ Undo ({len(_history)})", key="pm_undo", use_container_width=True):
+                    st.session_state["plan_slide_data"]["slides"] = _history.pop()
+                    st.session_state["plan_slide_history"] = _history
+                    st.rerun()
+
+        chat_input = st.chat_input("Describe what to change…", key="plan_chat_input")
+
+        if chat_input and chat_input.strip():
+            current_slides = list(st.session_state["plan_slide_data"].get("slides", []))
+
+            _system = f"""You are editing a PowerPoint presentation outline for SEGA America.
+Respond conversationally — acknowledge what you're doing, explain any judgment calls, ask if anything is unclear.
+Be direct and professional. No filler phrases.
+
+SLIDE SCHEMA — every slide needs "type" and "title". Additional by type:
+  title/closing/section: subtitle, body
+  bullets/recommendation: bullets (list of strings, max 6)
+  stats: stats (list of 4 x {{value, label, note}})
+  comparison: comparison {{left_title, right_title, rows: [{{label,left,right,delta}}]}}
+  chart: chart {{chart_type, x_label, y_label, categories, series:[{{label,values:[]}}], colors:[]}}
+All slides may also have: image_search_query, source, speaker_notes
+
+RESPONSE FORMAT — return exactly one JSON object (no markdown fences):
+  Changes made: {{"action":"update","slides":[...complete array...],"message":"conversational explanation of what you did"}}
+  Need clarification: {{"action":"message","text":"your question"}}
+
+Rules:
+- Always return the COMPLETE slides array when making changes.
+- Do not introduce AI/ML/automation topics unless they are already in the outline.
+- Keep slide count between 6 and 18.
+- Return ONLY valid JSON."""
+
+            _messages = []
+            for _m in st.session_state["plan_chat"]:
+                if _m["role"] == "user":
+                    _messages.append({"role": "user", "content": _m["content"]})
+                else:
+                    _messages.append({"role": "assistant", "content": _m.get("_raw", _m["content"])})
+
+            _messages.append({
+                "role": "user",
+                "content": (
+                    f"Current outline ({len(current_slides)} slides):\n"
+                    f"```json\n{json.dumps(current_slides, indent=2)}\n```\n\n"
+                    f"Request: {chat_input.strip()}"
+                )
+            })
+
+            with st.spinner("Updating outline…"):
+                try:
+                    client = _make_anthropic_client()
+                    resp = client.messages.create(
+                        model="claude-sonnet-4-6",
+                        max_tokens=6000,
+                        system=_system,
+                        messages=_messages,
+                    )
+                    raw = "".join(
+                        b.text for b in resp.content
+                        if hasattr(b, "type") and b.type == "text"
+                    ).strip()
+                    if raw.startswith("```"):
+                        raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+
+                    parsed = json.loads(raw)
+
+                    if parsed.get("action") == "update":
+                        new_slides = parsed.get("slides", [])
+                        message    = parsed.get("message", f"Updated to {len(new_slides)} slides.")
+                        _history = st.session_state["plan_slide_history"]
+                        _history.append(current_slides)
+                        st.session_state["plan_slide_history"] = _history[-10:]
+                        _sd = dict(st.session_state["plan_slide_data"])
+                        _sd["slides"] = new_slides
+                        st.session_state["plan_slide_data"] = _sd
+                        display_reply = message
+                    else:
+                        display_reply = parsed.get("text", "No changes made.")
+                        raw = json.dumps({"action": "message", "text": display_reply})
+
+                    st.session_state["plan_chat"].append({"role": "user", "content": chat_input.strip()})
+                    st.session_state["plan_chat"].append({"role": "assistant", "content": display_reply, "_raw": raw})
+
+                    # Auto-save after each chat change
+                    if _active:
+                        _save_project(OWNER, _active)
+
+                    st.rerun()
+                except json.JSONDecodeError:
+                    st.session_state["plan_chat"].append({"role": "user", "content": chat_input.strip()})
+                    st.session_state["plan_chat"].append({"role": "assistant", "content": raw or "Could not parse response.", "_raw": raw or ""})
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Chat error: {e}")
+
+        if st.session_state["plan_chat"]:
+            if st.button("🗑 Clear chat", key="pm_clear_chat"):
+                st.session_state["plan_chat"] = []
+                st.rerun()
+
+    # ── RIGHT: Live outline + expander editor ─────────────────────────────────
+    with outline_col:
+        st.markdown(
+            "<div style='font-size:.72rem;font-weight:700;letter-spacing:.1em;"
+            "text-transform:uppercase;color:#00CCFF;margin-bottom:.5rem'>"
+            "Outline</div>",
+            unsafe_allow_html=True,
+        )
+
+        # Quick slide list — always visible
+        slides = st.session_state.get("plan_slide_data", {}).get("slides", [])
+        _TYPE_ICON = {
+            "title":"🎯","section":"📌","bullets":"📝","recommendation":"💡",
+            "stats":"📊","comparison":"⚖️","chart":"📈","closing":"🏁",
+        }
+        for i, s in enumerate(slides):
+            stype = s.get("type","bullets")
+            st.markdown(
+                f"<div style='font-size:.8rem;color:#8899BB;padding:.1rem 0'>"
+                f"<span style='color:#4A6A9A;font-size:.72rem'>{i+1}.</span> "
+                f"{_TYPE_ICON.get(stype,'📝')} "
+                f"<span style='color:#D0E4FF'>{s.get('title','(untitled)')}</span>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+
+        st.divider()
+
+        # Expander: manual slide editor (secondary)
+        with st.expander("✏️ Edit slides manually", expanded=False):
+            updated_slides = list(slides)
+            move_up = move_down = delete_idx = insert_after = None
+
+            for i, slide in enumerate(slides):
+                stype = slide.get("type", "bullets")
+                with st.expander(f"**{i+1}.** {slide.get('title','(untitled)')}", expanded=False):
+                    c1, c2 = st.columns([3, 2])
+                    with c1:
+                        new_type = st.selectbox("Type", _SLIDE_TYPES,
+                            index=_SLIDE_TYPES.index(stype) if stype in _SLIDE_TYPES else 1,
+                            key=f"pm_type_{i}")
+                    with c2:
+                        b1,b2,b3,b4 = st.columns(4)
+                        if b1.button("⬆", key=f"pu_{i}", use_container_width=True): move_up = i
+                        if b2.button("⬇", key=f"pd_{i}", use_container_width=True): move_down = i
+                        if b3.button("➕", key=f"pa_{i}", use_container_width=True): insert_after = i
+                        if b4.button("🗑", key=f"px_{i}", use_container_width=True): delete_idx = i
+
+                    new_title = st.text_input("Title", value=slide.get("title",""), key=f"pm_ti_{i}")
+                    new_sub   = st.text_input("Subtitle/body", value=slide.get("subtitle") or slide.get("body",""), key=f"pm_su_{i}")
+                    new_notes = st.text_input("Speaker notes", value=slide.get("speaker_notes",""), key=f"pm_no_{i}")
+                    new_src   = st.text_input("Source", value=slide.get("source",""), key=f"pm_sr_{i}", placeholder="Publication — https://url")
+                    new_img   = st.text_input("Image search query", value=slide.get("image_search_query",""), key=f"pm_img_{i}")
+
+                    new_slide = {**slide, "type": new_type, "title": new_title,
+                                 "subtitle": new_sub, "speaker_notes": new_notes,
+                                 "source": new_src, "image_search_query": new_img}
+
+                    if new_type in ("bullets","recommendation"):
+                        raw_b = st.text_area("Bullets (one per line)", value="\n".join(slide.get("bullets",[])), height=130, key=f"pm_bu_{i}")
+                        new_slide["bullets"] = [b.strip() for b in raw_b.split("\n") if b.strip()][:6]
+                    elif new_type == "stats":
+                        raw_s = st.text_area("Stats: value | label | note (4 rows)", height=100, key=f"pm_st_{i}",
+                            value="\n".join(f"{s.get('value','')} | {s.get('label','')} | {s.get('note','')}" for s in (slide.get("stats") or [{"value":"","label":"","note":""}]*4)[:4]))
+                        new_slide["stats"] = [{"value":p[0],"label":p[1] if len(p)>1 else "","note":p[2] if len(p)>2 else ""} for line in raw_s.split("\n") if (p:=[x.strip() for x in line.split("|")]) and any(p)][:4]
+                    elif new_type == "comparison":
+                        cmp = slide.get("comparison") or {}
+                        cl2,cr2 = st.columns(2)
+                        lt = cl2.text_input("Left title", cmp.get("left_title",""), key=f"pm_lt_{i}")
+                        rt = cr2.text_input("Right title", cmp.get("right_title",""), key=f"pm_rt_{i}")
+                        raw_r = st.text_area("Rows: label | left | right | delta", height=130, key=f"pm_ro_{i}",
+                            value="\n".join(f"{r.get('label','')} | {r.get('left','')} | {r.get('right','')} | {r.get('delta','neutral')}" for r in (cmp.get("rows") or [])))
+                        new_slide["comparison"] = {"left_title":lt,"right_title":rt,"rows":[{"label":p[0],"left":p[1] if len(p)>1 else "","right":p[2] if len(p)>2 else "","delta":p[3] if len(p)>3 else "neutral"} for line in raw_r.split("\n") if (p:=[x.strip() for x in line.split("|")]) and any(p)][:8]}
+
+                    updated_slides[i] = new_slide
+
+            # Apply manual reorder/insert/delete
+            sd2 = dict(st.session_state["plan_slide_data"])
+            if move_up is not None and move_up > 0:
+                updated_slides[move_up-1], updated_slides[move_up] = updated_slides[move_up], updated_slides[move_up-1]
+                sd2["slides"] = updated_slides; st.session_state["plan_slide_data"] = sd2; st.rerun()
+            if move_down is not None and move_down < len(updated_slides)-1:
+                updated_slides[move_down], updated_slides[move_down+1] = updated_slides[move_down+1], updated_slides[move_down]
+                sd2["slides"] = updated_slides; st.session_state["plan_slide_data"] = sd2; st.rerun()
+            if delete_idx is not None and len(updated_slides) > 1:
+                updated_slides.pop(delete_idx)
+                sd2["slides"] = updated_slides; st.session_state["plan_slide_data"] = sd2; st.rerun()
+            if insert_after is not None:
+                updated_slides.insert(insert_after+1, {"type":"bullets","title":"New Slide","bullets":[]})
+                sd2["slides"] = updated_slides; st.session_state["plan_slide_data"] = sd2; st.rerun()
+            # Persist live text edits
+            sd2["slides"] = updated_slides
+            st.session_state["plan_slide_data"] = sd2
+
+    # ── Export bar ────────────────────────────────────────────────────────────
+    st.divider()
+    ex1, ex2, _ = st.columns([1, 1, 2])
+    with ex1:
+        if st.button("🚀 Export to PPTX", key="pm_export", type="primary", use_container_width=True):
+            _tb = st.session_state.get("saved_template_bytes") or _DEFAULT_TEMPLATE_BYTES
+            _tf = template_bytes_ref
+            if _tf is not None:
+                try:
+                    _tf.seek(0); _tb = _tf.read()
+                except Exception:
+                    pass
+            with st.spinner("Building PPTX…"):
+                try:
+                    pptx_out = generate_pptx(st.session_state["plan_slide_data"], template_bytes=_tb)
+                    # Post-process: images + source lines
+                    pptx_out = _postprocess_pptx(pptx_out, st.session_state["plan_slide_data"].get("slides", []))
+                    title = st.session_state["plan_slide_data"].get("title", "Plan")
+                    fname = f"SEGA_{title.replace(' ','_')[:40]}.pptx"
+                    st.session_state["pptx_bytes"]    = pptx_out
+                    st.session_state["pptx_filename"] = fname
+                    if _active:
+                        _save_project(OWNER, _active)
+                        st.toast(f'Saved to "{_active}"', icon="💾")
+                    st.rerun()
+                except Exception as ex:
+                    st.error(f"Export failed: {ex}")
+    with ex2:
+        if st.session_state.get("pptx_bytes"):
+            st.download_button(
+                "⬇️ Download PPTX",
+                data=st.session_state["pptx_bytes"],
+                file_name=st.session_state.get("pptx_filename","presentation.pptx"),
+                mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                key="pm_dl", use_container_width=True,
+            )
+
+
+def _postprocess_pptx(pptx_bytes: bytes, slides_list: list) -> bytes:
+    """Apply source lines and image embedding to an already-rendered PPTX."""
+    has_images  = any(s.get("image_search_query","").strip() for s in slides_list)
+    has_sources = any(s.get("source","").strip() for s in slides_list)
+    if not has_images and not has_sources:
+        return pptx_bytes
+    try:
+        from pptx import Presentation as _Prs
+        from pptx.util import Inches as _In, Pt as _Pt
+        from pptx.dml.color import RGBColor as _RGB
+        import io as _io
+
+        prs2 = _Prs(_io.BytesIO(pptx_bytes))
+        W = prs2.slide_width  / 914400
+        H = prs2.slide_height / 914400
+
+        for slide, sdata in zip(prs2.slides, slides_list):
+            # Source line
+            src_text = (sdata.get("source") or "").strip()
+            if src_text:
+                txb = slide.shapes.add_textbox(_In(0.3), _In(H-0.28), _In(W-0.6), _In(0.22))
+                tf  = txb.text_frame; tf.word_wrap = False
+                run = tf.paragraphs[0].add_run()
+                run.text = f"Source: {src_text}"
+                run.font.size = _Pt(7); run.font.italic = True
+                run.font.color.rgb = _RGB(0x88,0x99,0xBB); run.font.name = "Calibri"
+
+            # Image
+            img_query = (sdata.get("image_search_query") or "").strip()
+            stype = (sdata.get("type") or "").lower()
+            if img_query and stype not in ("title","closing","chart"):
+                img_bytes = _fetch_image_for_query(img_query)
+                if img_bytes:
+                    try:
+                        n_text = sum(1 for sh in slide.shapes if sh.has_text_frame and sh.text_frame.text.strip())
+                        img_w = W * (0.22 if n_text >= 6 else 0.28)
+                        img_h = H * 0.50
+                        img_x = W - img_w - 0.12
+                        img_y = (H - img_h) / 2
+                        for sh in slide.shapes:
+                            if sh.has_text_frame:
+                                sh_right = (sh.left + sh.width) / 914400
+                                if sh_right > img_x:
+                                    sh.width = max(int(0.5*914400), int((img_x - sh.left/914400 - 0.1)*914400))
+                        slide.shapes.add_picture(_io.BytesIO(img_bytes), _In(img_x), _In(img_y), _In(img_w), _In(img_h))
+                    except Exception:
+                        pass
+
+        out = _io.BytesIO(); prs2.save(out); return out.getvalue()
+    except Exception:
+        return pptx_bytes
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -851,67 +1242,10 @@ def run_pipeline(
 
     # ── Post-process: embed images + source lines ──────────────────────────────
     slides_list = slide_data.get("slides", [])
-    has_images  = any(s.get("image_search_query","").strip() for s in slides_list)
-    has_sources = any(s.get("source","").strip() for s in slides_list)
-
-    if has_images or has_sources:
+    if any(s.get("image_search_query","").strip() for s in slides_list) or \
+       any(s.get("source","").strip() for s in slides_list):
         yield ("spinner", "🖼️ <b>Fetching images and adding source lines…</b>")
-        try:
-            from pptx import Presentation as _Prs
-            from pptx.util import Inches as _In, Pt as _Pt, Emu as _Emu
-            from pptx.dml.color import RGBColor as _RGB
-            import io as _io
-
-            prs2 = _Prs(_io.BytesIO(pptx_bytes))
-            slide_w = prs2.slide_width
-            slide_h = prs2.slide_height
-
-            # Slide dimensions in inches
-            W = slide_w / 914400
-            H = slide_h / 914400
-
-            for i, (slide, sdata) in enumerate(zip(prs2.slides, slides_list)):
-                # ── Source line ───────────────────────────────────────────
-                src_text = (sdata.get("source") or "").strip()
-                if src_text:
-                    txb = slide.shapes.add_textbox(
-                        _In(0.3), _In(H - 0.28), _In(W - 0.6), _In(0.22)
-                    )
-                    tf = txb.text_frame
-                    tf.word_wrap = False
-                    p  = tf.paragraphs[0]
-                    run = p.add_run()
-                    run.text = f"Source: {src_text}"
-                    run.font.size = _Pt(7)
-                    run.font.italic = True
-                    run.font.color.rgb = _RGB(0x88, 0x99, 0xBB)
-                    run.font.name = "Calibri"
-
-                # ── Image ─────────────────────────────────────────────────
-                img_query = (sdata.get("image_search_query") or "").strip()
-                stype = (sdata.get("type") or "").lower()
-                if img_query and stype not in ("title", "closing", "chart"):
-                    img_bytes = _fetch_image_for_query(img_query)
-                    if img_bytes:
-                        try:
-                            # Place image in right 30% of slide, vertically centred
-                            img_w = W * 0.28
-                            img_h = H * 0.55
-                            img_x = W - img_w - 0.15
-                            img_y = (H - img_h) / 2
-                            slide.shapes.add_picture(
-                                _io.BytesIO(img_bytes),
-                                _In(img_x), _In(img_y),
-                                _In(img_w), _In(img_h),
-                            )
-                        except Exception:
-                            pass  # silently skip if image can't be embedded
-
-            out2 = _io.BytesIO()
-            prs2.save(out2)
-            pptx_bytes = out2.getvalue()
-        except Exception as e:
-            yield ("log", f"⚠️ Post-processing warning: {e}")
+    pptx_bytes = _postprocess_pptx(pptx_bytes, slides_list)
 
     yield ("step_done", "generate")
     yield ("log", (
@@ -964,17 +1298,19 @@ def _load_project(owner: str, name: str):
     data = load_project(owner, name)
     if not data:
         return
-    st.session_state["active_project"]      = name
-    st.session_state["proj_topic"]          = data.get("business_question", "")
-    st.session_state["proj_purpose"]        = data.get("audience", "General / Other")
-    st.session_state["proj_industry"]       = data.get("industry", data.get("game_title", ""))
-    st.session_state["proj_audience"]       = data.get("audience", "")
-    st.session_state["project_doc_names"]   = data.get("doc_names", [])
-    st.session_state["plan_slide_data"]     = data.get("slide_json") or {}
-    st.session_state["plan_chat"]           = data.get("plan_chat", [])
-    st.session_state["pptx_bytes"]          = data.get("pptx_bytes") or None
+    st.session_state["active_project"]       = name
+    st.session_state["proj_topic"]           = data.get("business_question", "")
+    st.session_state["proj_purpose"]         = data.get("audience", "General / Other")
+    st.session_state["proj_industry"]        = data.get("industry", data.get("game_title", ""))
+    st.session_state["proj_audience"]        = data.get("audience", "")
+    st.session_state["project_doc_names"]    = data.get("doc_names", [])
+    st.session_state["plan_slide_data"]      = data.get("slide_json") or {}
+    st.session_state["plan_chat"]            = data.get("plan_chat", [])
+    st.session_state["guided_messages"]      = data.get("guided_chat", [])
+    st.session_state["research_sources"]     = data.get("sources", [])
+    st.session_state["proj_web_research"]    = data.get("web_research", True)
+    st.session_state["pptx_bytes"]           = data.get("pptx_bytes") or None
     st.session_state["saved_template_bytes"] = data.get("template_bytes") or None
-    # Remove the key entirely if None so download buttons stay hidden
     if st.session_state["pptx_bytes"] is None:
         st.session_state.pop("pptx_bytes", None)
     if st.session_state["saved_template_bytes"] is None:
@@ -987,11 +1323,15 @@ def _save_project(owner: str, name: str):
     save_project(
         owner, name,
         business_question = st.session_state.get("proj_topic", ""),
-        game_title        = st.session_state.get("proj_industry", ""),  # storage_pptx compat
+        game_title        = st.session_state.get("proj_industry", ""),
+        industry          = st.session_state.get("proj_industry", ""),
         audience          = st.session_state.get("proj_audience", ""),
         doc_names         = st.session_state.get("project_doc_names", []),
         slide_json        = st.session_state.get("plan_slide_data") or {},
         plan_chat         = st.session_state.get("plan_chat", []),
+        guided_chat       = st.session_state.get("guided_messages", []),
+        sources           = st.session_state.get("research_sources", []),
+        web_research      = st.session_state.get("proj_web_research", True),
         pptx_bytes        = st.session_state.get("pptx_bytes"),
         template_bytes    = st.session_state.get("saved_template_bytes"),
     )
@@ -1001,6 +1341,9 @@ def _clear_project():
     for k in [
         "active_project", "proj_topic", "proj_purpose", "proj_industry",
         "proj_audience", "project_doc_names", "plan_slide_data", "plan_chat",
+        "guided_messages", "guided_ready", "guided_params",
+        "guided_pptx_bytes", "guided_pptx_filename",
+        "research_sources", "proj_web_research",
         "pptx_bytes", "pptx_filename", "saved_template_bytes",
         "plan_mode_active", "plan_slide_history", "pipeline_steps",
     ]:
@@ -1145,8 +1488,12 @@ with st.sidebar:
 
     # ── Options ───────────────────────────────────────────────────────────────
     st.markdown('<span class="sidebar-section">Options</span>', unsafe_allow_html=True)
-    web_search_enabled = st.checkbox("Web research", value=True,
-        help="Search the web for current data on your topic")
+    _web_default = st.session_state.get("proj_web_research", True)
+    web_search_enabled = st.checkbox("Web research", value=_web_default,
+        help="Search the web for current data. Disable if your documents cover everything needed.",
+        key="web_search_checkbox")
+    # Persist preference immediately so it's saved with the project
+    st.session_state["proj_web_research"] = web_search_enabled
     slide_count = st.slider("Target slides", 6, 25, 12)
 
     # ── Theme ────────────────────────────────────────────────────────────────
@@ -1392,7 +1739,10 @@ Populate all JSON fields with real values from the conversation. Use empty strin
             "Theme", list(THEME_PRESETS.keys()), key="guided_theme"
         )
         _g_theme = THEME_PRESETS[_g_theme_name]
-        _g_web = st.checkbox("Web research", value=True, key="guided_web")
+        _g_web_default = st.session_state.get("proj_web_research", True)
+        _g_web = st.checkbox("Web research", value=_g_web_default, key="guided_web",
+            help="Disable if your uploaded documents cover everything needed.")
+        st.session_state["proj_web_research"] = _g_web
         _g_template = st.file_uploader(
             "Custom template (.pptx)", type=["pptx"], key="guided_template"
         )
@@ -2182,8 +2532,10 @@ The pipeline will:<br>
                         elif etype == "plan_ready":
                             st.session_state["plan_slide_data"]  = event[1]
                             st.session_state["plan_mode_active"] = True
+                            # Auto-save outline immediately — even before PPTX is built
                             if _active:
                                 _save_project(OWNER, _active)
+                                st.toast(f'Outline saved to "{_active}"', icon="📋")
 
                         elif etype == "pptx_bytes_out":
                             _slug = re.sub(r"[^a-zA-Z0-9]+", "_", topic)[:50]
