@@ -39,6 +39,14 @@ _init_db()
 _MAX_DOC_CHARS     = 60_000
 COOKIE_EXPIRY_DAYS = 1  # kept for storage_pptx compatibility
 
+# ── Default template: SOA-HD_Template_Blue.pptx ──────────────────────────────
+# Load from disk at startup so no upload is needed for the standard SEGA Blue look.
+_DEFAULT_TEMPLATE_BYTES: bytes | None = None
+_DEFAULT_TEMPLATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "SOA-HD_Template_Blue.pptx")
+if os.path.exists(_DEFAULT_TEMPLATE_PATH):
+    with open(_DEFAULT_TEMPLATE_PATH, "rb") as _f:
+        _DEFAULT_TEMPLATE_BYTES = _f.read()
+
 # Auth: set ALLOWED_DOMAIN in secrets to restrict (e.g. "@mycompany.com")
 # Leave blank or omit to allow any email address.
 ALLOWED_DOMAIN = st.secrets.get("ALLOWED_DOMAIN", "")
@@ -296,7 +304,12 @@ if not st.session_state.auth_verified:
 
 def _web_research(topic: str, purpose: str, industry: str, question: str) -> tuple[str, list[dict]]:
     """Run a web search and return (research_text, sources).
-    sources is a list of {"title": ..., "url": ...} dicts extracted from tool results.
+    sources is a list of {"title": ..., "url": ...} dicts.
+
+    The Anthropic web_search tool does not expose result URLs as structured data —
+    they live only in the text Claude writes. So we instruct Claude to append a
+    machine-parseable SOURCES block at the end of its response, then strip and
+    parse it out here.
     """
     if not topic.strip():
         return "[No research topic specified]", []
@@ -315,7 +328,13 @@ def _web_research(topic: str, purpose: str, industry: str, question: str) -> tup
         "TRENDS: 3-4 notable recent developments or directions.\n"
         "CHALLENGES & OPPORTUNITIES: Main risks and areas for growth or improvement.\n"
         "CONTEXT: How does this compare to alternatives, competitors, or prior state?\n\n"
-        "Use real, specific numbers wherever possible. Aim for 600-800 words."
+        "Use real, specific numbers wherever possible. Aim for 600-800 words.\n\n"
+        "IMPORTANT: After the research brief, append a sources section in this exact format "
+        "(do not skip this — it is required):\n\n"
+        "SOURCES:\n"
+        "- Title of page 1 | https://example.com/page1\n"
+        "- Title of page 2 | https://example.com/page2\n"
+        "(list every URL you actually retrieved content from, one per line)"
     )
 
     import concurrent.futures as _cf
@@ -326,39 +345,44 @@ def _web_research(topic: str, purpose: str, industry: str, question: str) -> tup
             client = _make_anthropic_client()
             msg = client.messages.create(
                 model="claude-haiku-4-5-20251001",
-                max_tokens=2000,
+                max_tokens=2500,
                 tools=[{"type": "web_search_20250305", "name": "web_search"}],
                 messages=[{"role": "user", "content": prompt}],
             )
-            # Extract text content
-            text = "\n".join(
+
+            full_text = "\n".join(
                 b.text for b in msg.content
                 if hasattr(b, "type") and b.type == "text" and b.text
             ) or "[No results returned]"
-            # Extract source URLs from tool result blocks
+
+            # ── Parse out the SOURCES block ───────────────────────────────────
             sources = []
             seen_urls = set()
-            for block in msg.content:
-                if not hasattr(block, "type"):
-                    continue
-                # web_search tool results contain a list of result objects
-                if block.type == "tool_result":
-                    for item in (block.content or []):
-                        if hasattr(item, "type") and item.type == "web_search_result":
-                            url   = getattr(item, "url", None)
-                            title = getattr(item, "title", url)
-                            if url and url not in seen_urls:
-                                seen_urls.add(url)
-                                sources.append({"title": title or url, "url": url})
-                # Anthropic SDK may surface results as tool_use with nested results
-                if getattr(block, "type", "") == "tool_use" and getattr(block, "name", "") == "web_search":
-                    for result in (getattr(block, "results", None) or []):
-                        url   = getattr(result, "url", None)
-                        title = getattr(result, "title", url)
-                        if url and url not in seen_urls:
-                            seen_urls.add(url)
-                            sources.append({"title": title or url, "url": url})
-            return text, sources
+            research_text = full_text
+
+            if "SOURCES:" in full_text:
+                parts = full_text.split("SOURCES:", 1)
+                research_text = parts[0].rstrip()
+                sources_block = parts[1].strip()
+
+                for line in sources_block.splitlines():
+                    line = line.strip().lstrip("- ").strip()
+                    if "|" in line:
+                        title_part, url_part = line.rsplit("|", 1)
+                        url   = url_part.strip()
+                        title = title_part.strip() or url
+                    elif line.startswith("http"):
+                        url   = line
+                        title = url
+                    else:
+                        continue
+
+                    if url.startswith("http") and url not in seen_urls:
+                        seen_urls.add(url)
+                        sources.append({"title": title, "url": url})
+
+            return research_text, sources
+
         except Exception as e:
             return f"[Web research error: {e}]", []
 
@@ -1258,7 +1282,7 @@ Do NOT wrap the JSON line in markdown fences. Keep your confirmation message fri
             )
 
         if _g_btn and _g_ready and _gp:
-            _g_template_bytes = None
+            _g_template_bytes = _DEFAULT_TEMPLATE_BYTES  # SOA-HD Blue by default
             if _g_template:
                 _g_template.seek(0)
                 _g_template_bytes = _g_template.read()
@@ -1902,7 +1926,7 @@ The pipeline will:<br>
             if hasattr(data_files_list, "read"):
                 data_files_list = [data_files_list]
 
-            _template_bytes = None
+            _template_bytes = _DEFAULT_TEMPLATE_BYTES  # SOA-HD Blue by default
             _tf = st.session_state.get("template_upload")
             if _tf:
                 try:
