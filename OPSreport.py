@@ -403,7 +403,7 @@ with st.sidebar:
 
 st.markdown("""
 <div class="topbar">
-  <div class="topbar-logo"><span class="seg">SEGA</span> SUBMISSION TRACKER</div>
+  <div class="topbar-logo"><span class="seg">SOA</span> SUBMISSIONS TRACKER</div>
   <div class="topbar-divider"></div>
   <div class="topbar-label">Platform Operations</div>
   <div class="topbar-pill">Internal</div>
@@ -452,7 +452,8 @@ def load_data(file_bytes: bytes, fname: str) -> pd.DataFrame:
         df["Month"]    = df["Sub Date"].dt.strftime("%B")
         df["MonthNum"] = df["Sub Date"].dt.month
     if "Product" in df.columns:
-        df["Product"] = df["Product"].astype(str).str.strip().str.title()
+        df["Product"] = (df["Product"].astype(str).str.strip().str.title()
+                         .str.replace("Dlc", "DLC", regex=False))
     return df
 
 
@@ -809,7 +810,7 @@ If you cannot answer from the available data, say so clearly."""
 
 st.markdown("""
 <div class="footer">
-  <div class="footer-brand">SEGA SUBMISSION TRACKER</div>
+  <div class="footer-brand">SOA SUBMISSIONS TRACKER</div>
   <div class="footer-note">Powered by Claude · Data processed locally · Internal use only</div>
 </div>
 """, unsafe_allow_html=True)
