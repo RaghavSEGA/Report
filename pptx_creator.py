@@ -395,6 +395,74 @@ def _web_research(topic: str, purpose: str, industry: str, question: str) -> tup
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Image fetching — searches the web and returns raw image bytes
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _fetch_image_for_query(query: str) -> bytes | None:
+    """
+    Search the web for a real image matching `query` and return its bytes,
+    or None if nothing usable is found.
+    Uses DuckDuckGo image search (no API key needed).
+    """
+    if not query or not query.strip():
+        return None
+    try:
+        import urllib.request, urllib.parse
+        headers = {"User-Agent": "Mozilla/5.0"}
+
+        # DuckDuckGo image search — parse the vqd token then fetch results
+        search_url = "https://duckduckgo.com/?q=" + urllib.parse.quote(query) + "&iax=images&ia=images"
+        req = urllib.request.Request(search_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            html = resp.read().decode("utf-8", errors="replace")
+
+        # Extract vqd token
+        import re
+        vqd_match = re.search(r'vqd=(["\'])([^"\']+)\1', html)
+        if not vqd_match:
+            vqd_match = re.search(r'vqd=([\d-]+)', html)
+            vqd = vqd_match.group(1) if vqd_match else None
+        else:
+            vqd = vqd_match.group(2)
+        if not vqd:
+            return None
+
+        # Fetch image results JSON
+        img_url = (
+            "https://duckduckgo.com/i.js?q=" + urllib.parse.quote(query)
+            + "&vqd=" + urllib.parse.quote(vqd)
+            + "&o=json&p=1"
+        )
+        req2 = urllib.request.Request(img_url, headers={**headers, "Referer": "https://duckduckgo.com/"})
+        with urllib.request.urlopen(req2, timeout=8) as resp2:
+            data = json.loads(resp2.read())
+
+        results = data.get("results", [])
+        # Try up to 5 results to find one we can download
+        for result in results[:5]:
+            img_src = result.get("image") or result.get("thumbnail")
+            if not img_src:
+                continue
+            try:
+                req3 = urllib.request.Request(img_src, headers=headers)
+                with urllib.request.urlopen(req3, timeout=6) as img_resp:
+                    img_bytes = img_resp.read()
+                # Basic validation — must be a real image
+                if len(img_bytes) > 1000 and img_bytes[:4] in (
+                    b'\x89PNG', b'\xff\xd8\xff', b'GIF8', b'RIFF',
+                ):
+                    return img_bytes
+                # Also accept WebP
+                if img_bytes[:4] == b'RIFF' or img_bytes[8:12] == b'WEBP':
+                    return img_bytes
+            except Exception:
+                continue
+        return None
+    except Exception:
+        return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Analysis prompt — fully generic
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -460,6 +528,8 @@ Output a single JSON object. Schema:
         "series":[{{"label":"...","values":[0.0]}}],
         "colors":["hex"]
       }},
+      "image_search_query":"concise image search query to find a real photo/logo for this slide, or empty string if no image needed",
+      "source":"Source name — URL (the single most relevant source for the data on this slide, or empty string)",
       "speaker_notes":"..."
     }}
   ]
@@ -474,11 +544,10 @@ Rules:
 - Bullets: max 6 per slide, each under 15 words
 - Comparison rows: max 8 per slide
 - Use "chart" type when data supports it
-- TOPIC DISCIPLINE: Stay strictly on the topic as given. Do NOT introduce tangential subjects,
-  industry trends, or technology themes — including AI, machine learning, or automation — unless
-  they appear explicitly in the uploaded documents, the research brief, or the business question.
-  If the topic has nothing to do with AI or technology, do not mention them at all.
-{f'- SOURCES: The last slide MUST be a "bullets" type slide titled "Sources" listing each source as a bullet in the format "Title — URL". Use ONLY the URLs from the VERIFIED WEB SOURCES list above.' if sources else ''}
+- image_search_query: provide a short, specific query (e.g. "PEAK game logo", "Sonic Frontiers screenshot") for slides where a real image would add value. Leave empty for data-heavy or abstract slides.
+- source: cite the single most relevant source for each slide as "Publication Name — https://url". Use ONLY URLs from the VERIFIED WEB SOURCES list. Leave empty if no web source applies.
+- STRICT TOPIC DISCIPLINE: Write ONLY about the stated topic. Do NOT introduce AI, machine learning, automation, or any technology trend unless it appears word-for-word in the uploaded documents or business question. If the topic is a game, genre, market, or business subject unrelated to AI, you MUST NOT mention AI anywhere in the slides. Violating this rule makes the deck unusable.
+{f'- SOURCES SLIDE: The final slide MUST be type "bullets" titled "Sources", listing each source from the VERIFIED WEB SOURCES as a bullet: "Title — URL".' if sources else ''}
 - Return ONLY valid JSON — no markdown fences, no explanation
 """
 
@@ -779,6 +848,70 @@ def run_pipeline(
     except Exception as e:
         yield ("error", f"PPTX render error: {e}")
         return
+
+    # ── Post-process: embed images + source lines ──────────────────────────────
+    slides_list = slide_data.get("slides", [])
+    has_images  = any(s.get("image_search_query","").strip() for s in slides_list)
+    has_sources = any(s.get("source","").strip() for s in slides_list)
+
+    if has_images or has_sources:
+        yield ("spinner", "🖼️ <b>Fetching images and adding source lines…</b>")
+        try:
+            from pptx import Presentation as _Prs
+            from pptx.util import Inches as _In, Pt as _Pt, Emu as _Emu
+            from pptx.dml.color import RGBColor as _RGB
+            import io as _io
+
+            prs2 = _Prs(_io.BytesIO(pptx_bytes))
+            slide_w = prs2.slide_width
+            slide_h = prs2.slide_height
+
+            # Slide dimensions in inches
+            W = slide_w / 914400
+            H = slide_h / 914400
+
+            for i, (slide, sdata) in enumerate(zip(prs2.slides, slides_list)):
+                # ── Source line ───────────────────────────────────────────
+                src_text = (sdata.get("source") or "").strip()
+                if src_text:
+                    txb = slide.shapes.add_textbox(
+                        _In(0.3), _In(H - 0.28), _In(W - 0.6), _In(0.22)
+                    )
+                    tf = txb.text_frame
+                    tf.word_wrap = False
+                    p  = tf.paragraphs[0]
+                    run = p.add_run()
+                    run.text = f"Source: {src_text}"
+                    run.font.size = _Pt(7)
+                    run.font.italic = True
+                    run.font.color.rgb = _RGB(0x88, 0x99, 0xBB)
+                    run.font.name = "Calibri"
+
+                # ── Image ─────────────────────────────────────────────────
+                img_query = (sdata.get("image_search_query") or "").strip()
+                stype = (sdata.get("type") or "").lower()
+                if img_query and stype not in ("title", "closing", "chart"):
+                    img_bytes = _fetch_image_for_query(img_query)
+                    if img_bytes:
+                        try:
+                            # Place image in right 30% of slide, vertically centred
+                            img_w = W * 0.28
+                            img_h = H * 0.55
+                            img_x = W - img_w - 0.15
+                            img_y = (H - img_h) / 2
+                            slide.shapes.add_picture(
+                                _io.BytesIO(img_bytes),
+                                _In(img_x), _In(img_y),
+                                _In(img_w), _In(img_h),
+                            )
+                        except Exception:
+                            pass  # silently skip if image can't be embedded
+
+            out2 = _io.BytesIO()
+            prs2.save(out2)
+            pptx_bytes = out2.getvalue()
+        except Exception as e:
+            yield ("log", f"⚠️ Post-processing warning: {e}")
 
     yield ("step_done", "generate")
     yield ("log", (
@@ -1133,25 +1266,35 @@ with _tab_guided:
                 {"role": "user", "content": _guided_input}
             )
 
-            _guide_system = """You are a friendly presentation consultant helping a SEGA America employee plan a presentation.
-Your job is to gather enough information to build a great deck through natural conversation, then confirm you're ready.
+            _guide_system = """You are a presentation planning assistant for SEGA America.
+Your role is to collect the minimum information needed to build a presentation brief, then confirm it.
 
-Gather (one or two questions at a time, conversationally):
-- Topic / subject
-- Purpose (e.g. executive briefing, sales pitch, project proposal, market analysis)
-- Audience (e.g. executive team, external clients, internal team)
-- Rough slide count (suggest 8-12 if not mentioned)
-- Any specific points, data, sections, or emphasis they want
-- Industry or context (optional)
+Rules:
+- Tone: professional, direct, concise. No filler. No enthusiasm markers. Do not say "Perfect", "Great", "Absolutely", "Sounds good", "Happy to help", or any similar phrase. Never compliment a choice.
+- Ask one or two questions at a time. Never ask all questions at once.
+- Do not volunteer opinions on the topic.
 
-Keep it warm and concise. Do NOT ask all questions at once.
+Information to collect (in order of priority):
+1. Topic
+2. Purpose (executive briefing, market analysis, project proposal, sales deck, etc.)
+3. Audience (executive team, product team, external clients, etc.)
+4. Slide count (assume 10 if not stated)
+5. Specific sections, data points, or emphasis areas (optional)
 
-Once you have at minimum topic + purpose + audience, confirm the plan by ending your message with exactly:
+Once you have topic + purpose + audience confirmed, output the plan summary THEN the signal line.
+Never skip the plan summary. Never output the signal without the summary above it.
+
+Format exactly:
+
+**Topic:** [value]
+**Purpose:** [value]
+**Audience:** [value]
+**Slides:** [value]
+**Focus:** [the core question or goal this deck will answer]
+
 READY_TO_GENERATE: {"topic": "...", "purpose": "...", "industry": "...", "audience": "...", "question": "...", "slide_count": 10}
 
-Fill the JSON with real values from the conversation. Use empty string for anything not mentioned.
-The "question" field should capture the core goal or key question the deck should answer.
-Do NOT wrap the JSON line in markdown fences. Keep your confirmation message friendly."""
+Populate all JSON fields with real values from the conversation. Use empty string for anything not discussed. Do not wrap the JSON in markdown fences."""
 
             _guide_msgs = [
                 {"role": m["role"], "content": m["content"]}
@@ -1183,20 +1326,24 @@ Do NOT wrap the JSON line in markdown fences. Keep your confirmation message fri
                     _parsed_params = json.loads(_json_line)
                     st.session_state["guided_params"] = _parsed_params
                     st.session_state["guided_ready"] = True
+                    # Strip the machine signal — keep everything before it
                     _clean_reply = _reply.split("READY_TO_GENERATE:")[0].strip()
+                    # Always guarantee the plan summary is visible
+                    _p = _parsed_params
+                    _plan_block = (
+                        f"**Topic:** {_p.get('topic', '')}\n"
+                        f"**Purpose:** {_p.get('purpose', '')}\n"
+                        f"**Audience:** {_p.get('audience', '')}\n"
+                        f"**Slides:** {_p.get('slide_count', 10)}\n\n"
+                        "Click **Generate presentation** on the right when ready."
+                    )
                     if not _clean_reply:
-                        _p = _parsed_params
-                        _clean_reply = (
-                            f"Perfect — I have everything I need! Here's the plan:\n\n"
-                            f"**Topic:** {_p.get('topic', '')}\n"
-                            f"**Purpose:** {_p.get('purpose', '')}\n"
-                            f"**Audience:** {_p.get('audience', '')}\n"
-                            f"**Slides:** {_p.get('slide_count', 10)}\n\n"
-                            "When you're happy with this, click **Generate presentation** "
-                            "on the right. You can also upload documents or pick a template there."
-                        )
+                        _clean_reply = "Plan confirmed:\n\n" + _plan_block
+                    elif not any(k in _clean_reply for k in ["**Topic:**", "**Purpose:**"]):
+                        _clean_reply = _clean_reply + "\n\n" + _plan_block
                 except Exception:
                     st.session_state["guided_ready"] = False
+
 
             st.session_state["guided_messages"].append(
                 {"role": "assistant", "content": _clean_reply}
@@ -1287,12 +1434,35 @@ Do NOT wrap the JSON line in markdown fences. Keep your confirmation message fri
                 _g_template.seek(0)
                 _g_template_bytes = _g_template.read()
 
+            # ── Sync guided params into session state for _save_project ────
+            _g_topic = _gp.get("topic", "")
+            st.session_state["proj_topic"]    = _g_topic
+            st.session_state["proj_purpose"]  = _gp.get("purpose", "")
+            st.session_state["proj_industry"] = _gp.get("industry", "")
+            st.session_state["proj_audience"] = _gp.get("audience", "")
+            st.session_state["project_doc_names"] = [f.name for f in (_g_docs or [])]
+            if _g_template_bytes:
+                st.session_state["saved_template_bytes"] = _g_template_bytes
+
+            # ── Auto-create project from topic if none active ──────────────
+            _g_active = st.session_state.get("active_project", "")
+            if not _g_active:
+                _g_auto = re.sub(r"[^a-zA-Z0-9 ]+", "", _g_topic).strip()[:40] or "Untitled"
+                _g_cand = _g_auto
+                _g_ctr  = 2
+                while project_exists(OWNER, _g_cand):
+                    _g_cand = f"{_g_auto} {_g_ctr}"
+                    _g_ctr += 1
+                create_project(OWNER, _g_cand)
+                st.session_state["active_project"] = _g_cand
+                _g_active = _g_cand
+
             _g_logs = []
 
             for _ev in run_pipeline(
                 model=_g_model,
                 uploaded_files=_g_docs or [],
-                topic=_gp.get("topic", ""),
+                topic=_g_topic,
                 purpose=_gp.get("purpose", "General / Other"),
                 industry=_gp.get("industry", ""),
                 audience=_gp.get("audience", "General audience"),
@@ -1320,12 +1490,16 @@ Do NOT wrap the JSON line in markdown fences. Keep your confirmation message fri
                     st.session_state["research_sources"] = _ev[1]
                 elif _et == "pptx_bytes_out":
                     _slug = re.sub(
-                        r"[^a-zA-Z0-9]+", "_", _gp.get("topic", "presentation")
+                        r"[^a-zA-Z0-9]+", "_", _g_topic
                     )[:50]
                     st.session_state["guided_pptx_bytes"]    = _ev[1]
                     st.session_state["guided_pptx_filename"] = (
                         f"Presentation_{_slug}.pptx"
                     )
+                    # ── Auto-save everything to the project ────────────────
+                    st.session_state["pptx_bytes"] = _ev[1]
+                    _save_project(OWNER, _g_active)
+                    st.toast(f'Auto-saved to "{_g_active}"', icon="💾")
                 elif _et == "error":
                     st.error(_ev[1], icon="🚨")
                     break
@@ -1922,6 +2096,26 @@ The pipeline will:<br>
         if not topic.strip():
             st.error("Please enter a topic.")
         else:
+            # ── Sync all form fields into session state so _save_project captures them ──
+            st.session_state["proj_topic"]    = topic
+            st.session_state["proj_purpose"]  = purpose
+            st.session_state["proj_industry"] = industry
+            st.session_state["proj_audience"] = audience
+            st.session_state["project_doc_names"] = [f.name for f in (uploaded_files or [])]
+
+            # ── Auto-create a project if none is selected ──────────────────
+            if not _active:
+                _auto_name = re.sub(r"[^a-zA-Z0-9 ]+", "", topic).strip()[:40] or "Untitled"
+                # Deduplicate if name exists
+                _candidate = _auto_name
+                _counter = 2
+                while project_exists(OWNER, _candidate):
+                    _candidate = f"{_auto_name} {_counter}"
+                    _counter += 1
+                create_project(OWNER, _candidate)
+                st.session_state["active_project"] = _candidate
+                _active = _candidate
+
             data_files_list = st.session_state.get("data_upload") or []
             if hasattr(data_files_list, "read"):
                 data_files_list = [data_files_list]
@@ -1998,6 +2192,7 @@ The pipeline will:<br>
                             st.session_state["pptx_filename"] = fname
                             if _active:
                                 _save_project(OWNER, _active)
+                                st.toast(f'Auto-saved to "{_active}"', icon="💾")
 
                         elif etype == "error":
                             st.error(event[1], icon="🚨")
