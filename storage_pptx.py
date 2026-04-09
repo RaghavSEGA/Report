@@ -40,6 +40,8 @@ def _dec(s):
 
 
 def init_db():
+    """Create table if missing; migrate new columns.
+    Each DDL statement runs in its own transaction to avoid deadlocks on Supabase."""
     with _get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -59,13 +61,16 @@ def init_db():
                 )
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_pptx_projects_owner ON pptx_projects (owner)")
-            # Migrate: add new columns to existing tables
-            for stmt in [
-                "ALTER TABLE pptx_projects ADD COLUMN IF NOT EXISTS industry     TEXT    DEFAULT ''",
-                "ALTER TABLE pptx_projects ADD COLUMN IF NOT EXISTS guided_chat  JSONB   DEFAULT '[]'",
-                "ALTER TABLE pptx_projects ADD COLUMN IF NOT EXISTS sources_json JSONB   DEFAULT '[]'",
-                "ALTER TABLE pptx_projects ADD COLUMN IF NOT EXISTS web_research BOOLEAN DEFAULT TRUE",
-            ]:
+
+    # Each ALTER in its own transaction — running them together causes a deadlock on Supabase
+    for stmt in [
+        "ALTER TABLE pptx_projects ADD COLUMN IF NOT EXISTS industry     TEXT    DEFAULT ''",
+        "ALTER TABLE pptx_projects ADD COLUMN IF NOT EXISTS guided_chat  JSONB   DEFAULT '[]'",
+        "ALTER TABLE pptx_projects ADD COLUMN IF NOT EXISTS sources_json JSONB   DEFAULT '[]'",
+        "ALTER TABLE pptx_projects ADD COLUMN IF NOT EXISTS web_research BOOLEAN DEFAULT TRUE",
+    ]:
+        with _get_conn() as conn:
+            with conn.cursor() as cur:
                 cur.execute(stmt)
 
 

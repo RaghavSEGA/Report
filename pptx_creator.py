@@ -1560,9 +1560,9 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-_tab_main, _tab_guided, _tab_pdf, _tab_transfer = st.tabs([
-    "📊 Create Presentation",
+_tab_guided, _tab_main, _tab_pdf, _tab_transfer = st.tabs([
     "💬 Guided Build",
+    "📊 Create Presentation",
     "📄 PDF → Editable PPTX",
     "🔄 Template Transfer",
 ])
