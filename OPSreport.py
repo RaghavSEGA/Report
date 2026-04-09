@@ -195,7 +195,7 @@ claude_key = ""  # unused — auth is via AWS Bedrock IAM credentials
 # OTP / SES AUTH
 # ─────────────────────────────────────────────────────────────
 
-ALLOWED_DOMAIN    = "@segaamerica.com"
+ALLOWED_DOMAINS   = {"@segaamerica.com", "@sega.com", "@sega.co.uk"}
 OTP_EXPIRY_SECS   = 600
 TOKEN_EXPIRY_DAYS = 7
 
@@ -310,18 +310,18 @@ if not st.session_state.auth_verified:
     with mid:
         st.markdown("""
         <div class="auth-wrap">
-          <div class="auth-logo">SEGA</div>
-          <div class="auth-title">Submission Tracker</div>
-          <div class="auth-sub">Sign in with your SEGA America email to continue</div>
+          <div class="auth-logo">SoA</div>
+          <div class="auth-title">Submissions Tracker</div>
+          <div class="auth-sub">Sign in with your SoA email to continue</div>
         </div>""", unsafe_allow_html=True)
 
         if not st.session_state.otp_sent:
-            email_in = st.text_input("Email address", placeholder="you@segaamerica.com",
+            email_in = st.text_input("Email address", placeholder="you@sega.com",
                                      label_visibility="collapsed", key="auth_email_input")
             if st.button("Send verification code", key="btn_send"):
                 addr = email_in.strip().lower()
-                if not addr.endswith(ALLOWED_DOMAIN):
-                    st.error(f"Access restricted to {ALLOWED_DOMAIN} addresses.")
+                if not any(addr.endswith(d) for d in ALLOWED_DOMAINS):
+                    st.error("Access restricted to @segaamerica.com, @sega.com, and @sega.co.uk addresses.")
                 else:
                     code = str(random.randint(100000, 999999))
                     if _send_otp(addr, code):
@@ -362,8 +362,8 @@ if not st.session_state.auth_verified:
                 st.rerun()
 
         st.markdown(
-            f'<div class="auth-note">Restricted to {ALLOWED_DOMAIN} addresses only.<br>'
-            f'Codes expire after 10 minutes.</div>',
+            '<div class="auth-note">Restricted to @segaamerica.com, @sega.com, and @sega.co.uk.<br>'
+            'Codes expire after 10 minutes.</div>',
             unsafe_allow_html=True,
         )
     st.stop()
@@ -403,7 +403,7 @@ with st.sidebar:
 
 st.markdown("""
 <div class="topbar">
-  <div class="topbar-logo"><span class="seg">SOA</span> SUBMISSIONS TRACKER</div>
+  <div class="topbar-logo"><span class="seg">SoA</span> SUBMISSIONS TRACKER</div>
   <div class="topbar-divider"></div>
   <div class="topbar-label">Platform Operations</div>
   <div class="topbar-pill">Internal</div>
