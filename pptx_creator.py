@@ -394,86 +394,101 @@ def _web_research(topic: str, purpose: str, industry: str, question: str) -> tup
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Image fetching — Bing Image Search (primary) with DuckDuckGo fallback
-# ─────────────────────────────────────────────────────────────────────────────
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Image fetching — uses Claude web_search to find a real image URL, then
-# downloads it directly. Works reliably on Streamlit Cloud.
+# Image fetching — uses Claude web_search to find an official image URL
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _fetch_image_for_query(query: str) -> bytes | None:
     """
-    Ask Claude (with web_search) to find a direct image URL for the query,
-    then download and return the raw bytes. Returns None on any failure.
+    Ask Claude (with web_search) to find a direct image URL from an official
+    source for the query, then download and return the raw bytes.
+    Explicitly avoids fan art, user-generated content, and social media.
+    Returns None on any failure.
     """
     if not query or not query.strip():
         return None
 
     try:
-        import urllib.request, json as _j
+        import urllib.request, re as _re
 
         client = _make_anthropic_client()
 
-        # Ask Claude to find a direct image URL using web search
         msg = client.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=300,
+            max_tokens=400,
             tools=[{"type": "web_search_20250305", "name": "web_search"}],
             messages=[{
                 "role": "user",
                 "content": (
-                    f"Find a direct URL to a real image (jpg, png, or webp) for: {query}\n\n"
-                    "Search the web and return ONLY a single raw image URL on its own line — "
-                    "no markdown, no explanation, just the URL starting with https://. "
-                    "The URL must point directly to an image file, not a webpage. "
-                    "Prefer official sources like official game websites, Wikipedia, or press kits."
+                    f"Find an official image for: {query}\n\n"
+                    "Requirements:\n"
+                    "- Must be from an OFFICIAL source only: the game/product's official website, "
+                    "publisher press kit, Wikipedia, official wiki, or official social media account.\n"
+                    "- Absolutely NO fan art, fan sites, DeviantArt, ArtStation, Pinterest, Reddit, "
+                    "Tumblr, Twitter/X fan accounts, Instagram fan accounts, or any user-generated content.\n"
+                    "- Must be a direct URL ending in .jpg, .jpeg, .png, .webp, or .gif\n\n"
+                    "Return ONLY the raw image URL on a single line. No markdown, no explanation."
                 )
             }],
         )
 
-        # Extract the URL from Claude's text response
         text = "\n".join(
             b.text for b in msg.content
             if hasattr(b, "type") and b.type == "text" and b.text
         ).strip()
 
-        # Find the first https:// URL in the response
-        import re as _re
-        url_match = _re.search(r'https://\S+\.(?:jpg|jpeg|png|webp|gif)(?:\?\S*)?', text, _re.IGNORECASE)
+        # Extract direct image URL — prefer explicit image extensions
+        url_match = _re.search(
+            r'https://[^\s\)\]"\'<>]+\.(?:jpg|jpeg|png|webp|gif)(?:\?[^\s\)\]"\'<>]*)?',
+            text, _re.IGNORECASE
+        )
         if not url_match:
-            # Fallback: grab any https URL
-            url_match = _re.search(r'https://[^\s\)\]"\']+', text)
+            url_match = _re.search(r'https://[^\s\)\]"\'<>]+', text)
         if not url_match:
             return None
 
         img_url = url_match.group(0).rstrip('.,;)')
 
-        # Download the image
+        # Block known fan art / UGC domains
+        _BLOCKED = (
+            "deviantart.com", "artstation.com", "pinterest.com", "reddit.com",
+            "tumblr.com", "twitter.com", "x.com", "instagram.com",
+            "pixiv.net", "furaffinity.net", "fandom.com/wiki",
+        )
+        if any(b in img_url.lower() for b in _BLOCKED):
+            return None
+
         req = urllib.request.Request(
             img_url,
             headers={
-                "User-Agent": "Mozilla/5.0 (compatible; SEGA/1.0)",
-                "Accept": "image/*,*/*",
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                              "AppleWebKit/537.36 (KHTML, like Gecko) "
+                              "Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "image/webp,image/apng,image/*,*/*;q=0.8",
+                "Referer": "https://www.google.com/",
             }
         )
         with urllib.request.urlopen(req, timeout=10) as resp:
             img_bytes = resp.read()
 
-        # Validate it's actually an image
-        if len(img_bytes) < 500:
+        # Validate: must be a real image
+        if len(img_bytes) < 1000:
             return None
         magic = img_bytes[:4]
-        if magic in (b'\x89PNG', b'\xff\xd8\xff', b'GIF8', b'RIFF', b'WEBP'):
+        if magic == b'\x89PNG':
+            return img_bytes
+        if magic[:3] == b'\xff\xd8\xff':
+            return img_bytes
+        if magic[:6] in (b'GIF87a', b'GIF89a'):
             return img_bytes
         if img_bytes[8:12] == b'WEBP':
             return img_bytes
-        # Also accept if content-type was image (bytes may not start with magic for some formats)
-        if len(img_bytes) > 1000:
+        # JPEG2000 or other formats that still render fine
+        if len(img_bytes) > 5000:
             return img_bytes
 
-    except Exception:
-        pass
+    except Exception as _e:
+        import sys
+        print(f"[image fetch] {query}: {_e}", file=sys.stderr)
 
     return None
 
@@ -879,62 +894,121 @@ Rules:
 
 
 def _postprocess_pptx(pptx_bytes: bytes, slides_list: list) -> bytes:
-    """Apply source lines and image embedding to an already-rendered PPTX."""
+    """
+    Post-process a rendered PPTX:
+    - Add a 'Source: ...' line at the bottom of slides that have one
+    - Embed a real image in the right portion of eligible slides,
+      preserving aspect ratio and not overwriting text content
+    """
     has_images  = any(s.get("image_search_query","").strip() for s in slides_list)
     has_sources = any(s.get("source","").strip() for s in slides_list)
     if not has_images and not has_sources:
         return pptx_bytes
+
     try:
         from pptx import Presentation as _Prs
-        from pptx.util import Inches as _In, Pt as _Pt
+        from pptx.util import Inches as _In, Pt as _Pt, Emu as _Emu
         from pptx.dml.color import RGBColor as _RGB
         import io as _io
 
         prs2 = _Prs(_io.BytesIO(pptx_bytes))
-        W = prs2.slide_width  / 914400
-        H = prs2.slide_height / 914400
+        W = prs2.slide_width  / 914400   # slide width in inches  (e.g. 13.3)
+        H = prs2.slide_height / 914400   # slide height in inches (e.g. 7.5)
+
+        # SOA-HD template layout constants (match _generate_from_template)
+        # Content area starts after the left sidebar and ends before source line
+        CONTENT_X   = 0.95   # left edge of content area (after sidebar)
+        CONTENT_TOP = 0.50   # top of content area (below title bar)
+        CONTENT_BOT = H - 0.40  # bottom of content area (above chrome footer)
+
+        # Image occupies the RIGHT portion of the content area
+        IMG_FRAC   = 0.30    # fraction of content width used for image
+        IMG_MARGIN = 0.15    # gap between text and image
+
+        content_w = W - CONTENT_X - 0.15         # total content width
+        img_w_max = content_w * IMG_FRAC          # max image width in inches
+        img_h_max = CONTENT_BOT - CONTENT_TOP - 0.1  # max image height
 
         for slide, sdata in zip(prs2.slides, slides_list):
+
             # ── Source line ───────────────────────────────────────────────────
             src_text = (sdata.get("source") or "").strip()
             if src_text:
                 try:
-                    txb = slide.shapes.add_textbox(_In(0.3), _In(H-0.28), _In(W-0.6), _In(0.22))
-                    tf  = txb.text_frame; tf.word_wrap = False
+                    txb = slide.shapes.add_textbox(
+                        _In(CONTENT_X), _In(H - 0.32), _In(W - CONTENT_X - 0.15), _In(0.25)
+                    )
+                    tf  = txb.text_frame
+                    tf.word_wrap = False
                     run = tf.paragraphs[0].add_run()
                     run.text = f"Source: {src_text}"
-                    run.font.size = _Pt(7); run.font.italic = True
-                    run.font.color.rgb = _RGB(0x88,0x99,0xBB); run.font.name = "Calibri"
+                    run.font.size  = _Pt(7)
+                    run.font.italic = True
+                    run.font.color.rgb = _RGB(0x88, 0x99, 0xBB)
+                    run.font.name  = "Calibri"
                 except Exception:
                     pass
 
             # ── Image ─────────────────────────────────────────────────────────
             img_query = (sdata.get("image_search_query") or "").strip()
             stype = (sdata.get("type") or "").lower()
-            if img_query and stype not in ("title","closing","chart"):
-                img_bytes = _fetch_image_for_query(img_query)
-                if img_bytes:
-                    try:
-                        n_text = sum(1 for sh in slide.shapes if sh.has_text_frame and sh.text_frame.text.strip())
-                        img_w = W * (0.22 if n_text >= 6 else 0.28)
-                        img_h = H * 0.50
-                        img_x = W - img_w - 0.12
-                        img_y = (H - img_h) / 2
-                        # Shrink text boxes that overlap the image zone
-                        for sh in slide.shapes:
-                            if sh.has_text_frame:
-                                sh_right = (sh.left + sh.width) / 914400
-                                if sh_right > img_x:
-                                    sh.width = max(int(0.5*914400), int((img_x - sh.left/914400 - 0.1)*914400))
-                        slide.shapes.add_picture(
-                            _io.BytesIO(img_bytes), _In(img_x), _In(img_y), _In(img_w), _In(img_h)
-                        )
-                    except Exception as _ie:
-                        # Log to stderr so it appears in Streamlit Cloud logs
-                        import sys
-                        print(f"[image embed error] {img_query}: {_ie}", file=sys.stderr)
+            if not img_query or stype in ("title", "closing", "chart"):
+                continue
 
-        out = _io.BytesIO(); prs2.save(out); return out.getvalue()
+            img_bytes = _fetch_image_for_query(img_query)
+            if not img_bytes:
+                continue
+
+            try:
+                # Detect image dimensions to preserve aspect ratio
+                from PIL import Image as _PIL_Image
+                import io as _pil_io
+                with _PIL_Image.open(_pil_io.BytesIO(img_bytes)) as _im:
+                    px_w, px_h = _im.size
+                src_ratio = px_w / px_h if px_h else 1.0
+            except Exception:
+                # PIL not available or can't decode — use 16:9 as safe default
+                src_ratio = 16 / 9
+
+            # Fit image into the allowed box preserving aspect ratio
+            if src_ratio >= img_w_max / img_h_max:
+                # Image is wider relative to box — constrain by width
+                img_w = img_w_max
+                img_h = img_w / src_ratio
+            else:
+                # Image is taller relative to box — constrain by height
+                img_h = img_h_max
+                img_w = img_h * src_ratio
+
+            # Position: right side of content area, vertically centred in content band
+            img_x = W - img_w - 0.15
+            img_y = CONTENT_TOP + (img_h_max - img_h) / 2
+
+            # Clip any text shapes whose right edge overlaps the image zone
+            # Only clip shapes that are clearly in the content area (left > sidebar)
+            for sh in slide.shapes:
+                if not sh.has_text_frame:
+                    continue
+                sh_left_in  = sh.left  / 914400
+                sh_right_in = (sh.left + sh.width) / 914400
+                # Only touch shapes that are in the content area and overlap
+                if sh_left_in >= CONTENT_X - 0.1 and sh_right_in > img_x - IMG_MARGIN:
+                    new_right = img_x - IMG_MARGIN
+                    new_w_emu = max(int(0.5 * 914400),
+                                   int((new_right - sh_left_in) * 914400))
+                    sh.width = new_w_emu
+
+            # Embed the image
+            slide.shapes.add_picture(
+                _io.BytesIO(img_bytes),
+                _In(img_x), _In(img_y),
+                _In(img_w), _In(img_h),
+            )
+
+        out = _io.BytesIO()
+        prs2.save(out)
+        return out.getvalue()
+
     except Exception as _e:
         import sys
         print(f"[postprocess error] {_e}", file=sys.stderr)
@@ -1759,8 +1833,14 @@ Populate all JSON fields with real values from the conversation. Use empty strin
             key="guided_generate_btn",
         )
 
-        _g_log_area = st.empty()
-        _g_dl_area  = st.empty()
+        _g_log_area    = st.empty()
+        _g_output_area = st.empty()
+        _g_dl_area     = st.empty()
+
+        # Show plan modal if already active (persists across reruns)
+        if st.session_state.get("plan_mode_active") and not _g_btn:
+            with _g_output_area.container():
+                _render_plan_modal(st.session_state.get("guided_template"))
 
         if st.session_state.get("guided_pptx_bytes") and not _g_btn:
             _g_dl_area.download_button(
@@ -1819,7 +1899,7 @@ Populate all JSON fields with real values from the conversation. Use empty strin
                 slide_count=int(_gp.get("slide_count", 10)),
                 theme=_g_theme,
                 template_bytes=_g_template_bytes,
-                plan_mode=False,
+                plan_mode=True,
             ):
                 _et = _ev[0]
                 if _et in ("log", "spinner"):
@@ -1836,15 +1916,15 @@ Populate all JSON fields with real values from the conversation. Use empty strin
                     )
                 elif _et == "sources":
                     st.session_state["research_sources"] = _ev[1]
+                elif _et == "plan_ready":
+                    st.session_state["plan_slide_data"]  = _ev[1]
+                    st.session_state["plan_mode_active"] = True
+                    _save_project(OWNER, _g_active)
+                    st.toast(f'Outline saved to "{_g_active}"', icon="📋")
                 elif _et == "pptx_bytes_out":
-                    _slug = re.sub(
-                        r"[^a-zA-Z0-9]+", "_", _g_topic
-                    )[:50]
+                    _slug = re.sub(r"[^a-zA-Z0-9]+", "_", _g_topic)[:50]
                     st.session_state["guided_pptx_bytes"]    = _ev[1]
-                    st.session_state["guided_pptx_filename"] = (
-                        f"Presentation_{_slug}.pptx"
-                    )
-                    # ── Auto-save everything to the project ────────────────
+                    st.session_state["guided_pptx_filename"] = f"Presentation_{_slug}.pptx"
                     st.session_state["pptx_bytes"] = _ev[1]
                     _save_project(OWNER, _g_active)
                     st.toast(f'Auto-saved to "{_g_active}"', icon="💾")
@@ -1852,22 +1932,12 @@ Populate all JSON fields with real values from the conversation. Use empty strin
                     st.error(_ev[1], icon="🚨")
                     break
 
-            if st.session_state.get("guided_pptx_bytes"):
-                _g_dl_area.download_button(
-                    "⬇️ Download PPTX",
-                    data=st.session_state["guided_pptx_bytes"],
-                    file_name=st.session_state.get(
-                        "guided_pptx_filename", "presentation.pptx"
-                    ),
-                    mime=(
-                        "application/vnd.openxmlformats-officedocument"
-                        ".presentationml.presentation"
-                    ),
-                    use_container_width=True,
-                )
-                st.success("Presentation ready!")
+            # Show plan modal after pipeline finishes
+            if st.session_state.get("plan_mode_active"):
+                with _g_output_area.container():
+                    _render_plan_modal(st.session_state.get("guided_template"))
 
-            # Show verified sources
+            # Show sources
             _g_sources = st.session_state.get("research_sources", [])
             if _g_sources:
                 with st.expander(
