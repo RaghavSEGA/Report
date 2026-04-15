@@ -1954,8 +1954,9 @@ with _tab_editor:
         ("editor_pptx_name",    ""),
         ("editor_chat",         []),
         ("editor_thumbs",       []),
-        ("editor_pending_code", ""),   # code waiting for Apply confirmation
-        ("editor_pending_msg",  ""),   # message to show with pending code
+        ("editor_pending_code", ""),
+        ("editor_pending_msg",  ""),
+        ("editor_version",      0),    # incremented on each Apply so download key refreshes
     ]:
         if _ek not in st.session_state:
             st.session_state[_ek] = _ev
@@ -2182,6 +2183,7 @@ with _tab_editor:
         st.session_state["editor_chat"]         = []
         st.session_state["editor_pending_code"] = ""
         st.session_state["editor_pending_msg"]  = ""
+        st.session_state["editor_version"]      = 0
         with st.spinner("Converting slides to images (this takes ~15s for large files)…"):
             _generated = _make_thumbnails(_raw_bytes)
         st.session_state["editor_thumbs"] = _generated
@@ -2238,43 +2240,28 @@ with _tab_editor:
         # ── Pending changes — Apply / Discard ─────────────────────────────────
         if st.session_state.get("editor_pending_code"):
             st.markdown(
-                "<div style='background:#0A1832;border:1px solid #0055AA;"
-                "border-left:4px solid #00CCFF;border-radius:6px;"
-                "padding:.75rem 1rem;margin:.5rem 0;font-size:.82rem;color:#D0E4FF'>"
-                "⚡ <b>Changes ready to apply.</b> Review Claude's plan above, then:"
-                "</div>",
+                "<div style='background:#0A2040;border:2px solid #00CCFF;"
+                "border-radius:8px;padding:1rem 1.25rem;margin:.75rem 0'>"
+                "<div style='color:#00CCFF;font-weight:700;font-size:.85rem;"
+                "margin-bottom:.4rem'>⚡ Changes ready — review Claude's plan above</div>"
+                "<div style='color:#8899BB;font-size:.78rem'>"
+                "Click <b style='color:#D0E4FF'>✅ Apply changes</b> to execute, "
+                "or <b style='color:#D0E4FF'>✕ Discard</b> to cancel."
+                "</div></div>",
                 unsafe_allow_html=True,
             )
-            _apply_col, _discard_col = st.columns([2, 1])
+
+            # Code preview so user can inspect what will run
+            with st.expander("🔍 View code Claude will execute", expanded=False):
+                st.code(st.session_state["editor_pending_code"], language="python")
+
+            _apply_col, _discard_col = st.columns([3, 1])
             with _apply_col:
-                if st.button("✅ Apply changes", key="editor_apply_btn",
+                if st.button("✅ Apply changes to PPTX", key="editor_apply_btn",
                              type="primary", use_container_width=True):
-                    from pptx import Presentation as _EdPrs
-                    import io as _ed_io
-                    _prs_apply = _EdPrs(_ed_io.BytesIO(st.session_state["editor_pptx_bytes"]))
-                    try:
-                        exec(st.session_state["editor_pending_code"],
-                             {"prs": _prs_apply, "__builtins__": __builtins__})
-                        _out_buf = _ed_io.BytesIO()
-                        _prs_apply.save(_out_buf)
-                        st.session_state["editor_pptx_bytes"] = _out_buf.getvalue()
-                        st.session_state["editor_chat"].append({
-                            "role": "assistant",
-                            "content": "✅ Changes applied. Slides updated."
-                        })
-                        with st.spinner("Regenerating previews…"):
-                            st.session_state["editor_thumbs"] = _make_thumbnails(
-                                st.session_state["editor_pptx_bytes"]
-                            )
-                    except Exception as _ap_err:
-                        st.session_state["editor_chat"].append({
-                            "role": "assistant",
-                            "content": f"⚠️ Execution error: `{_ap_err}`. The file was not modified."
-                        })
-                    finally:
-                        st.session_state["editor_pending_code"] = ""
-                        st.session_state["editor_pending_msg"]  = ""
-                    st.rerun()
+                    _do_apply = True
+                else:
+                    _do_apply = False
             with _discard_col:
                 if st.button("✕ Discard", key="editor_discard_btn",
                              use_container_width=True):
@@ -2285,13 +2272,120 @@ with _tab_editor:
                     })
                     st.rerun()
 
+            if _do_apply:
+                import traceback as _tb
+                from pptx import Presentation as _EdPrs
+                import io as _ed_io
+                _prs_apply = _EdPrs(_ed_io.BytesIO(st.session_state["editor_pptx_bytes"]))
+                _exec_ok = False
+                try:
+                    _exec_globals = {
+                        "prs": _prs_apply,
+                        "__builtins__": __builtins__,
+                    }
+                    exec(st.session_state["editor_pending_code"], _exec_globals)
+                    _exec_ok = True
+                except Exception as _ap_err:
+                    _tb_str = _tb.format_exc()
+                    st.session_state["editor_chat"].append({
+                        "role": "assistant",
+                        "content": (
+                            f"⚠️ **Execution error — file not modified.**\n\n"
+                            f"```\n{_tb_str[:1200]}\n```\n\n"
+                            "Try asking Claude to fix the code, or rephrase your request."
+                        )
+                    })
+
+                if _exec_ok:
+                    _out_buf = _ed_io.BytesIO()
+                    _prs_apply.save(_out_buf)
+                    _new_bytes = _out_buf.getvalue()
+
+                    # Verify the save produced a different file
+                    _old_bytes = st.session_state["editor_pptx_bytes"]
+                    if _new_bytes == _old_bytes:
+                        st.session_state["editor_chat"].append({
+                            "role": "assistant",
+                            "content": (
+                                "⚠️ Code ran without errors but the file is identical to before. "
+                                "The changes may have targeted shapes that don't exist or "
+                                "made no net difference. Ask Claude to investigate."
+                            )
+                        })
+                    else:
+                        st.session_state["editor_pptx_bytes"] = _new_bytes
+                        st.session_state["editor_version"] = (
+                            st.session_state.get("editor_version", 0) + 1
+                        )
+                        _sz_old = len(_old_bytes) // 1024
+                        _sz_new = len(_new_bytes) // 1024
+                        st.session_state["editor_chat"].append({
+                            "role": "assistant",
+                            "content": (
+                                f"✅ **Changes applied.** "
+                                f"File size: {_sz_old} KB → {_sz_new} KB. "
+                                "Download the updated file below, or ask for more changes."
+                            )
+                        })
+                        with st.spinner("Regenerating previews…"):
+                            st.session_state["editor_thumbs"] = _make_thumbnails(_new_bytes)
+
+                st.session_state["editor_pending_code"] = ""
+                st.session_state["editor_pending_msg"]  = ""
+                st.rerun()
+
         # ── Chat input ────────────────────────────────────────────────────────
         _ed_input = st.chat_input(
             "Describe the changes to make…", key="editor_chat_input"
         )
 
         if _ed_input and _ed_input.strip():
-            # Clear any pending changes before a new request
+            _ed_input_lower = _ed_input.strip().lower()
+            _apply_words = {"apply", "yes", "ok", "okay", "go", "do it",
+                            "make the changes", "confirm", "execute", "run it",
+                            "looks good", "proceed", "make changes"}
+            _is_apply_intent = (
+                _ed_input_lower in _apply_words
+                or any(_ed_input_lower.startswith(w) for w in ("apply", "yes ", "ok "))
+            )
+
+            # If user typed an apply-intent and there's pending code, apply it
+            if _is_apply_intent and st.session_state.get("editor_pending_code"):
+                st.session_state["editor_chat"].append(
+                    {"role": "user", "content": _ed_input.strip()}
+                )
+                from pptx import Presentation as _EdPrs2
+                import io as _ed_io2
+                _prs2 = _EdPrs2(_ed_io2.BytesIO(st.session_state["editor_pptx_bytes"]))
+                try:
+                    exec(st.session_state["editor_pending_code"],
+                         {"prs": _prs2, "__builtins__": __builtins__})
+                    _out2 = _ed_io2.BytesIO()
+                    _prs2.save(_out2)
+                    st.session_state["editor_pptx_bytes"] = _out2.getvalue()
+                    st.session_state["editor_version"] = (
+                        st.session_state.get("editor_version", 0) + 1
+                    )
+                    st.session_state["editor_chat"].append({
+                        "role": "assistant",
+                        "content": "✅ Changes applied. Download the updated file below."
+                    })
+                    with st.spinner("Regenerating previews…"):
+                        st.session_state["editor_thumbs"] = _make_thumbnails(
+                            st.session_state["editor_pptx_bytes"]
+                        )
+                except Exception as _ap2_err:
+                    st.session_state["editor_chat"].append({
+                        "role": "assistant",
+                        "content": f"⚠️ Execution error: `{_ap2_err}`. File not modified."
+                    })
+                finally:
+                    st.session_state["editor_pending_code"] = ""
+                    st.session_state["editor_pending_msg"]  = ""
+                st.rerun()
+
+            # Otherwise treat as a new edit request
+            # Clear any stale pending code
             st.session_state["editor_pending_code"] = ""
             st.session_state["editor_pending_msg"]  = ""
             st.session_state["editor_chat"].append(
@@ -2355,10 +2449,19 @@ Do NOT produce a message-only response when you have enough information to write
                 }
             }]
 
-            # Build multi-turn message history
+            # Build message history — prior turns use text-only content
+            # (can't send image blocks in historical turns, only the latest)
             _ed_msgs = []
             for _pm in st.session_state["editor_chat"][:-1]:
-                _ed_msgs.append({"role": _pm["role"], "content": _pm["content"]})
+                _role = _pm["role"]
+                _content = _pm["content"]
+                # Ensure content is always a plain string for prior turns
+                if isinstance(_content, list):
+                    _content = " ".join(
+                        b.get("text", "") for b in _content if isinstance(b, dict)
+                    )
+                _ed_msgs.append({"role": _role, "content": str(_content)})
+            # Current turn gets the full vision content
             _ed_msgs.append({"role": "user", "content": _vision_content})
 
             with st.spinner("Claude is analysing your slides…"):
@@ -2411,15 +2514,21 @@ Do NOT produce a message-only response when you have enough information to write
                     import traceback; st.code(traceback.format_exc())
 
         # ── Download + clear ──────────────────────────────────────────────────
+        _ed_version = st.session_state.get("editor_version", 0)
         _dl_col, _clr_col = st.columns([2, 1])
         with _dl_col:
+            # Key includes version so button is recreated with fresh data after each Apply
+            _dl_label = (
+                f"⬇️ Download edited PPTX  (v{_ed_version} — {_ed_version} change{'s' if _ed_version != 1 else ''} applied)"
+                if _ed_version > 0 else "⬇️ Download PPTX"
+            )
             st.download_button(
-                "⬇️ Download edited PPTX",
+                _dl_label,
                 data=st.session_state["editor_pptx_bytes"],
                 file_name=f"edited_{st.session_state.get('editor_pptx_name','presentation.pptx')}",
                 mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
                 use_container_width=True,
-                key="editor_download_btn",
+                key=f"editor_download_btn_{_ed_version}",
             )
         with _clr_col:
             if st.session_state["editor_chat"]:
