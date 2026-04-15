@@ -2011,81 +2011,96 @@ with _tab_editor:
         except Exception as _so_err:
             print(f"[thumbnails] soffice unavailable: {_so_err}", file=_sys.stderr)
 
-        # ── Pure-Python fallback: Pillow renderer ─────────────────────────
+        # ── Enhanced Pillow renderer — real fonts, group recursion, embedded images ──
         try:
             from pptx import Presentation as _P
-            from pptx.enum.shapes import MSO_SHAPE_TYPE as _MSO
-            from PIL import Image as _Img, ImageDraw as _Draw
+            from PIL import Image as _Img, ImageDraw as _Draw, ImageFont as _IFont
+
+            _FR = "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"
+            _FB = "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"
 
             prs = _P(_io.BytesIO(pptx_bytes))
-            sw, sh = prs.slide_width, prs.slide_height
-            TW, TH = 1200, int(1200 * sh / sw)
+            _sw, _sh = prs.slide_width, prs.slide_height
+            _TW, _TH = 960, int(960 * _sh / _sw)
 
-            def _epx(emu, total_emu, total_px):
-                return max(0, min(total_px, int((emu or 0) / total_emu * total_px)))
+            def _ex(e): return max(0, min(_TW, int((e or 0) / _sw * _TW)))
+            def _ey(e): return max(0, min(_TH, int((e or 0) / _sh * _TH)))
 
-            def _safe_rgb(color_obj):
+            def _srgb(co, df=(200,200,200)):
+                try: c=co.rgb; return (c.red,c.green,c.blue)
+                except: return df
+
+            def _fnt(pt, bold=False):
+                px = max(8, int((pt or 11) * _TW / (_sw / 914400) / 96))
+                try: return _IFont.truetype(_FB if bold else _FR, px)
+                except: return _IFont.load_default()
+
+            def _rsh(canvas, dc, shape, ox=0, oy=0):
                 try:
-                    c = color_obj.rgb
-                    return (c.red, c.green, c.blue)
-                except Exception:
-                    return None
-
-            thumbs = []
-            for slide in prs.slides:
-                img = _Img.new("RGB", (TW, TH), (248, 248, 250))
-                draw = _Draw.Draw(img)
-
-                for shape in slide.shapes:
-                    try:
-                        x1 = _epx(shape.left,  sw, TW)
-                        y1 = _epx(shape.top,   sh, TH)
-                        x2 = _epx((shape.left or 0) + (shape.width or 0),  sw, TW)
-                        y2 = _epx((shape.top  or 0) + (shape.height or 0), sh, TH)
-                        if x2 <= x1 or y2 <= y1:
-                            continue
-
-                        # Shape fill
+                    x1=_ex(shape.left)+ox; y1=_ey(shape.top)+oy
+                    x2=_ex((shape.left or 0)+(shape.width or 0))+ox
+                    y2=_ey((shape.top or 0)+(shape.height or 0))+oy
+                    if x2<=x1 or y2<=y1: return
+                    st=getattr(shape,"shape_type",None)
+                    if st==6:
                         try:
-                            rgb = _safe_rgb(shape.fill.fore_color)
-                            if rgb:
-                                draw.rectangle([x1, y1, x2, y2], fill=rgb)
-                        except Exception:
-                            pass
-
-                        # Text
-                        if shape.has_text_frame:
-                            txt = shape.text_frame.text.strip().replace("\n", " ")
-                            if txt:
+                            for sub in shape.shapes: _rsh(canvas,dc,sub,x1,y1)
+                        except: pass
+                        return
+                    try:
+                        if shape.fill.type is not None:
+                            dc.rectangle([x1,y1,x2,y2],fill=_srgb(shape.fill.fore_color))
+                    except: pass
+                    if st==13:
+                        try:
+                            p=_Img.open(_io.BytesIO(shape.image.blob)).convert("RGB")
+                            p=p.resize((max(1,x2-x1),max(1,y2-y1)),_Img.LANCZOS)
+                            canvas.paste(p,(x1,y1)); return
+                        except:
+                            dc.rectangle([x1,y1,x2,y2],fill=(228,230,235),outline=(175,180,190))
+                            dc.line([x1,y1,x2,y2],fill=(195,200,210))
+                            dc.line([x1,y2,x2,y1],fill=(195,200,210))
+                    if shape.has_text_frame:
+                        yc=y1+3
+                        for para in shape.text_frame.paragraphs:
+                            if yc>y2: break
+                            xc=x1+3; mh=0
+                            runs=para.runs
+                            if not runs and para.text.strip():
+                                fnt=_fnt(11)
+                                bb=dc.textbbox((xc,yc),para.text.strip()[:120],font=fnt)
+                                dc.text((xc,yc),para.text.strip()[:120],fill=(30,30,30),font=fnt)
+                                mh=bb[3]-bb[1]
+                            for run in runs:
+                                if not run.text: continue
+                                try: pt=run.font.size.pt if run.font.size else 11
+                                except: pt=11
+                                bold=bool(run.font.bold)
+                                try: col=_srgb(run.font.color,(30,30,30))
+                                except: col=(30,30,30)
+                                fnt=_fnt(pt,bold)
                                 try:
-                                    tc = _safe_rgb(
-                                        shape.text_frame.paragraphs[0].runs[0].font.color
-                                    ) or (30, 30, 30)
-                                except Exception:
-                                    tc = (30, 30, 30)
-                                draw.text((x1 + 2, y1 + 2), txt[:80], fill=tc)
+                                    bb=dc.textbbox((xc,yc),run.text,font=fnt)
+                                    dc.text((xc,yc),run.text,fill=col,font=fnt)
+                                    xc=bb[2]+1; mh=max(mh,bb[3]-bb[1])
+                                except: pass
+                            yc+=max(mh,11)+2
+                except: pass
 
-                        # Picture — cross-hatch placeholder
-                        elif getattr(shape, "shape_type", None) == 13:
-                            draw.rectangle([x1, y1, x2, y2],
-                                           outline=(160, 160, 160), width=1)
-                            draw.line([x1, y1, x2, y2], fill=(190, 190, 190))
-                            draw.line([x1, y2, x2, y1], fill=(190, 190, 190))
-
-                    except Exception:
-                        continue
-
-                draw.rectangle([0, 0, TW - 1, TH - 1], outline=(180, 180, 180))
-
-                buf = _io.BytesIO()
-                img.save(buf, format="JPEG", quality=80)
+            thumbs=[]
+            for slide in prs.slides:
+                canvas=_Img.new("RGB",(_TW,_TH),(255,255,255))
+                dc=_Draw.Draw(canvas)
+                for shape in slide.shapes: _rsh(canvas,dc,shape)
+                dc.rectangle([0,0,_TW-1,_TH-1],outline=(175,180,190))
+                buf=_io.BytesIO(); canvas.save(buf,format="JPEG",quality=88)
                 thumbs.append(_b64.b64encode(buf.getvalue()).decode())
 
-            print(f"[thumbnails] Pillow: {len(thumbs)} slides", file=_sys.stderr)
+            print(f"[thumbnails] Pillow enhanced: {len(thumbs)} slides", file=_sys.stderr)
             return thumbs
 
         except Exception as _pil_err:
-            print(f"[thumbnails] Pillow fallback failed: {_pil_err}", file=_sys.stderr)
+            print(f"[thumbnails] Pillow failed: {_pil_err}", file=_sys.stderr)
             return []
 
     # ── Helper: describe slides for Claude context ────────────────────────────
@@ -2184,6 +2199,8 @@ with _tab_editor:
         st.session_state["editor_pending_code"] = ""
         st.session_state["editor_pending_msg"]  = ""
         st.session_state["editor_version"]      = 0
+        st.session_state["editor_slide_idx"]    = 0
+        st.session_state["editor_slides_hidden"] = False
         with st.spinner("Converting slides to images (this takes ~15s for large files)…"):
             _generated = _make_thumbnails(_raw_bytes)
         st.session_state["editor_thumbs"] = _generated
@@ -2199,65 +2216,93 @@ with _tab_editor:
     # ── Slide viewer — dropdown + full-size preview ───────────────────────────
     _thumbs = st.session_state.get("editor_thumbs") or []
     if _thumbs:
-        st.markdown('<div class="section-label">Slides</div>', unsafe_allow_html=True)
-
         _n_slides = len(_thumbs)
 
-        # Dropdown to select slide
-        _slide_options = [f"Slide {i+1}" for i in range(_n_slides)]
-        _selected_slide_label = st.selectbox(
-            "Select slide",
-            _slide_options,
-            label_visibility="collapsed",
-            key="editor_slide_select",
-        )
-        _selected_idx = int(_selected_slide_label.split()[1]) - 1
+        # Init persistent state for this viewer
+        if "editor_slide_idx" not in st.session_state:
+            st.session_state["editor_slide_idx"] = 0
+        if "editor_slides_hidden" not in st.session_state:
+            st.session_state["editor_slides_hidden"] = False
 
-        # Navigation buttons
-        _nav_prev, _nav_label, _nav_next = st.columns([1, 4, 1])
-        with _nav_prev:
-            if st.button("◀ Prev", key="ed_slide_prev",
-                         disabled=_selected_idx == 0,
-                         use_container_width=True):
-                st.session_state["editor_slide_select"] = _slide_options[_selected_idx - 1]
-                st.rerun()
-        with _nav_label:
-            st.markdown(
-                f"<div style='text-align:center;color:#8899BB;font-size:.82rem;"
-                f"padding:.35rem 0'>{_selected_slide_label} of {_n_slides}</div>",
-                unsafe_allow_html=True,
-            )
-        with _nav_next:
-            if st.button("Next ▶", key="ed_slide_next",
-                         disabled=_selected_idx == _n_slides - 1,
-                         use_container_width=True):
-                st.session_state["editor_slide_select"] = _slide_options[_selected_idx + 1]
+        # Clamp index in case slide count changed
+        _idx = min(st.session_state["editor_slide_idx"], _n_slides - 1)
+        st.session_state["editor_slide_idx"] = _idx
+
+        # Header row: label + hide/show toggle
+        _sv_hdr, _sv_toggle = st.columns([4, 1])
+        with _sv_hdr:
+            st.markdown('<div class="section-label">Slides</div>', unsafe_allow_html=True)
+        with _sv_toggle:
+            _hide_label = "🙈 Hide slides" if not st.session_state["editor_slides_hidden"] else "👁 Show slides"
+            if st.button(_hide_label, key="ed_slides_toggle", use_container_width=True):
+                st.session_state["editor_slides_hidden"] = not st.session_state["editor_slides_hidden"]
                 st.rerun()
 
-        # Full-size slide image
-        st.image(
-            f"data:image/jpeg;base64,{_thumbs[_selected_idx]}",
-            use_container_width=True,
-        )
+        if not st.session_state["editor_slides_hidden"]:
+            # Controls row: prev | dropdown | next
+            _nav_prev, _nav_dd, _nav_next = st.columns([1, 6, 1])
 
-        # Small strip of adjacent slides for context (3 either side)
-        _strip_start = max(0, _selected_idx - 3)
-        _strip_end   = min(_n_slides, _selected_idx + 4)
-        _strip_idxs  = [i for i in range(_strip_start, _strip_end) if i != _selected_idx]
-        if _strip_idxs:
-            st.markdown(
-                "<div style='font-size:.68rem;color:#4A6A9A;margin:.5rem 0 .2rem'>"
-                "Nearby slides</div>",
-                unsafe_allow_html=True,
+            with _nav_prev:
+                if st.button("◀", key="ed_slide_prev",
+                             disabled=_idx == 0,
+                             use_container_width=True):
+                    st.session_state["editor_slide_idx"] = _idx - 1
+                    st.rerun()
+
+            with _nav_dd:
+                _slide_options = [f"Slide {i+1}" for i in range(_n_slides)]
+                _chosen = st.selectbox(
+                    "Select slide",
+                    _slide_options,
+                    index=_idx,
+                    label_visibility="collapsed",
+                    key="editor_slide_select",
+                )
+                # Selectbox drives the index (user picked from dropdown)
+                _new_idx = int(_chosen.split()[1]) - 1
+                if _new_idx != _idx:
+                    st.session_state["editor_slide_idx"] = _new_idx
+                    st.rerun()
+
+            with _nav_next:
+                if st.button("▶", key="ed_slide_next",
+                             disabled=_idx == _n_slides - 1,
+                             use_container_width=True):
+                    st.session_state["editor_slide_idx"] = _idx + 1
+                    st.rerun()
+
+            # Full-size slide image
+            st.image(
+                f"data:image/jpeg;base64,{_thumbs[_idx]}",
+                caption=f"Slide {_idx + 1} of {_n_slides}",
+                use_container_width=True,
             )
-            _strip_cols = st.columns(len(_strip_idxs))
-            for _sc, _si in zip(_strip_cols, _strip_idxs):
-                with _sc:
-                    st.image(
-                        f"data:image/jpeg;base64,{_thumbs[_si]}",
-                        caption=f"{_si+1}",
-                        use_container_width=True,
-                    )
+
+            # Nearby slide strip (up to 4 either side)
+            _strip_idxs = [
+                i for i in range(max(0, _idx - 4), min(_n_slides, _idx + 5))
+                if i != _idx
+            ]
+            if _strip_idxs:
+                st.markdown(
+                    "<div style='font-size:.68rem;color:#4A6A9A;margin:.5rem 0 .2rem'>"
+                    "Other slides</div>",
+                    unsafe_allow_html=True,
+                )
+                _strip_cols = st.columns(len(_strip_idxs))
+                for _sc, _si in zip(_strip_cols, _strip_idxs):
+                    with _sc:
+                        if st.button(
+                            f"{_si+1}",
+                            key=f"ed_strip_{_si}",
+                            use_container_width=True,
+                        ):
+                            st.session_state["editor_slide_idx"] = _si
+                            st.rerun()
+                        st.image(
+                            f"data:image/jpeg;base64,{_thumbs[_si]}",
+                            use_container_width=True,
+                        )
 
     # ── Chat + Apply ──────────────────────────────────────────────────────────
     if st.session_state.get("editor_pptx_bytes"):
