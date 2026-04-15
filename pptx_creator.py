@@ -1950,17 +1950,18 @@ with _tab_editor:
 
     # ── Session state init ────────────────────────────────────────────────────
     for _ek, _ev in [
-        ("editor_pptx_bytes", None),
-        ("editor_pptx_name",  ""),
-        ("editor_chat",       []),
-        ("editor_thumbs",     []),   # list of base64 PNG strings
+        ("editor_pptx_bytes",   None),
+        ("editor_pptx_name",    ""),
+        ("editor_chat",         []),
+        ("editor_thumbs",       []),
+        ("editor_pending_code", ""),   # code waiting for Apply confirmation
+        ("editor_pending_msg",  ""),   # message to show with pending code
     ]:
         if _ek not in st.session_state:
             st.session_state[_ek] = _ev
 
     # ── Helper: render thumbnails from PPTX bytes ────────────────────────────
     def _make_thumbnails(pptx_bytes: bytes) -> list[str]:
-        """Convert each slide to a base64-encoded JPEG thumbnail."""
         import subprocess, tempfile, base64 as _b64, os as _os
         thumbs = []
         try:
@@ -1969,31 +1970,27 @@ with _tab_editor:
                 pdf = _os.path.join(td, "src.pdf")
                 with open(src, "wb") as f:
                     f.write(pptx_bytes)
-                # Convert to PDF
-                r = subprocess.run(
+                subprocess.run(
                     ["soffice", "--headless", "--convert-to", "pdf", "--outdir", td, src],
                     capture_output=True, timeout=60
                 )
                 if not _os.path.exists(pdf):
                     return []
-                # Convert PDF pages to images
                 subprocess.run(
-                    ["pdftoppm", "-jpeg", "-r", "72", pdf,
-                     _os.path.join(td, "slide")],
+                    ["pdftoppm", "-jpeg", "-r", "72", pdf, _os.path.join(td, "slide")],
                     capture_output=True, timeout=60
                 )
-                imgs = sorted(f for f in _os.listdir(td) if f.startswith("slide") and f.endswith(".jpg"))
+                imgs = sorted(f for f in _os.listdir(td)
+                              if f.startswith("slide") and f.endswith(".jpg"))
                 for img in imgs:
                     with open(_os.path.join(td, img), "rb") as f:
                         thumbs.append(_b64.b64encode(f.read()).decode())
         except Exception as _te:
-            import sys
-            print(f"[thumbnail error] {_te}", file=sys.stderr)
+            import sys; print(f"[thumbnail error] {_te}", file=sys.stderr)
         return thumbs
 
     # ── Helper: describe slides for Claude context ────────────────────────────
     def _slide_context(pptx_bytes: bytes) -> str:
-        """Return a compact text description of every slide's shapes and text."""
         from pptx import Presentation as _P
         import io as _io
         prs = _P(_io.BytesIO(pptx_bytes))
@@ -2004,26 +2001,23 @@ with _tab_editor:
             for sh in sl.shapes:
                 pos = f"({sh.left/914400:.2f}\",{sh.top/914400:.2f}\")"
                 sz  = f"{sh.width/914400:.2f}\"×{sh.height/914400:.2f}\""
-                if sh.has_text_frame:
-                    txt = sh.text_frame.text[:80].replace("\n", " ")
-                    lines.append(f"  [{sh.name}] {pos} {sz} TEXT: {txt!r}")
-                else:
-                    lines.append(f"  [{sh.name}] {pos} {sz} type={sh.shape_type}")
+                txt = sh.text_frame.text[:80].replace("\n", " ") if sh.has_text_frame else ""
+                tag = f"TEXT: {txt!r}" if sh.has_text_frame else f"type={sh.shape_type}"
+                lines.append(f"  [{sh.name}] {pos} {sz} {tag}")
             lines.append("")
         return "\n".join(lines)
 
-    # ── Layout: upload + thumbnails top, chat bottom ──────────────────────────
-    _ed_upload_col, _ed_info_col = st.columns([1, 2], gap="large")
+    # ── Top row: upload controls ──────────────────────────────────────────────
+    _ed_left, _ed_right = st.columns([1, 2], gap="large")
 
-    with _ed_upload_col:
+    with _ed_left:
         st.markdown('<div class="section-label">Upload</div>', unsafe_allow_html=True)
         _ed_file = st.file_uploader(
             "PPTX file", type=["pptx"],
             label_visibility="hidden", key="editor_upload"
         )
         _ed_model = st.selectbox(
-            "Vision model",
-            ["claude-sonnet-4-6", "claude-opus-4-6"],
+            "Vision model", ["claude-sonnet-4-6", "claude-opus-4-6"],
             key="editor_model",
         )
         _ed_load_btn = st.button(
@@ -2032,66 +2026,84 @@ with _tab_editor:
             disabled=not _ed_file,
             key="editor_load_btn",
         )
-        if st.session_state["editor_pptx_bytes"] and not _ed_load_btn:
-            st.caption(f"Loaded: **{st.session_state['editor_pptx_name']}**  "
-                       f"({len(st.session_state['editor_pptx_bytes'])//1024} KB)")
-            if st.button("🔄 Reset", key="editor_reset", use_container_width=True):
-                for k in ["editor_pptx_bytes","editor_pptx_name",
-                          "editor_chat","editor_thumbs"]:
-                    st.session_state[k] = [] if k == "editor_chat" else None if "bytes" in k else []
-                st.session_state["editor_pptx_name"] = ""
-                st.rerun()
+        if st.session_state["editor_pptx_bytes"]:
+            st.caption(
+                f"Loaded: **{st.session_state['editor_pptx_name']}** "
+                f"({len(st.session_state['editor_pptx_bytes'])//1024} KB)"
+            )
+        if st.button("🔄 Reset", key="editor_reset", use_container_width=True,
+                     disabled=not st.session_state["editor_pptx_bytes"]):
+            for k in ["editor_pptx_bytes", "editor_pptx_name", "editor_chat",
+                      "editor_thumbs", "editor_pending_code", "editor_pending_msg"]:
+                st.session_state[k] = [] if k in ("editor_chat","editor_thumbs") else ""
+            st.session_state["editor_pptx_bytes"] = None
+            st.rerun()
 
-    with _ed_info_col:
-        st.markdown('<div class="section-label">Slides</div>', unsafe_allow_html=True)
-        _thumb_area = st.empty()
+    with _ed_right:
+        st.markdown('<div class="section-label">Status</div>', unsafe_allow_html=True)
+        if not st.session_state["editor_pptx_bytes"]:
+            st.markdown(
+                "<div class='status-card'>"
+                "<div class='status-card-label'>Getting started</div>"
+                "<div style='color:#6080A8;font-size:.82rem;line-height:1.9'>"
+                "1. Upload a .pptx file on the left<br>"
+                "2. Click <b style='color:#D0E4FF'>Load &amp; preview slides</b><br>"
+                "3. Describe changes in the chat below<br>"
+                "4. Review Claude's plan, then click <b style='color:#D0E4FF'>Apply changes</b>"
+                "</div></div>",
+                unsafe_allow_html=True,
+            )
+        else:
+            _n_slides = len(st.session_state.get("editor_thumbs") or [])
+            st.success(f"**{st.session_state['editor_pptx_name']}** — {_n_slides} slides loaded")
 
     # Load on button click
     if _ed_load_btn and _ed_file:
         _ed_file.seek(0)
-        _raw = _ed_file.read()
-        st.session_state["editor_pptx_bytes"] = _raw
-        st.session_state["editor_pptx_name"]  = _ed_file.name
-        st.session_state["editor_chat"]        = []
+        _raw_bytes = _ed_file.read()
+        st.session_state["editor_pptx_bytes"]   = _raw_bytes
+        st.session_state["editor_pptx_name"]    = _ed_file.name
+        st.session_state["editor_chat"]         = []
+        st.session_state["editor_pending_code"] = ""
+        st.session_state["editor_pending_msg"]  = ""
         with st.spinner("Generating slide previews…"):
-            st.session_state["editor_thumbs"] = _make_thumbnails(_raw)
+            st.session_state["editor_thumbs"] = _make_thumbnails(_raw_bytes)
         st.rerun()
 
-    # Render thumbnails
+    # ── Slide thumbnails — full width below the top controls ─────────────────
     _thumbs = st.session_state.get("editor_thumbs") or []
     if _thumbs:
-        with _thumb_area.container():
-            # Show in rows of 5
-            _cols_per_row = 5
-            for _row_start in range(0, len(_thumbs), _cols_per_row):
-                _row_thumbs = _thumbs[_row_start:_row_start + _cols_per_row]
-                _tcols = st.columns(len(_row_thumbs))
-                for _ci, (_tc, _tb64) in enumerate(zip(_tcols, _row_thumbs)):
-                    with _tc:
-                        st.image(
-                            f"data:image/jpeg;base64,{_tb64}",
-                            caption=f"Slide {_row_start + _ci + 1}",
-                            use_container_width=True,
-                        )
+        st.markdown('<div class="section-label">Slides</div>', unsafe_allow_html=True)
+        _cols_per_row = 5
+        for _row_start in range(0, len(_thumbs), _cols_per_row):
+            _row_t = _thumbs[_row_start:_row_start + _cols_per_row]
+            _tcols = st.columns(len(_row_t))
+            for _ci, (_tc, _tb64) in enumerate(zip(_tcols, _row_t)):
+                with _tc:
+                    st.image(
+                        f"data:image/jpeg;base64,{_tb64}",
+                        caption=f"Slide {_row_start + _ci + 1}",
+                        use_container_width=True,
+                    )
 
-    # ── Chat interface ────────────────────────────────────────────────────────
+    # ── Chat + Apply ──────────────────────────────────────────────────────────
     if st.session_state.get("editor_pptx_bytes"):
         st.markdown('<div class="section-label">Edit via chat</div>', unsafe_allow_html=True)
 
         # Chat history
-        _ed_chat_container = st.container(height=300)
-        with _ed_chat_container:
+        _ed_chat_box = st.container(height=320)
+        with _ed_chat_box:
             if not st.session_state["editor_chat"]:
                 st.markdown(
                     "<div style='color:#4A6A9A;font-size:.82rem;line-height:1.7;"
                     "background:#0A1832;border-radius:6px;padding:.75rem 1rem;"
                     "border-left:3px solid #0055AA'>"
-                    "Describe what to change. Claude can see the slides and their content.<br>"
+                    "Describe what to change. Claude can see the slides and their layout.<br>"
                     "<b style='color:#8899BB'>Examples:</b><br>"
-                    "· \"Apply the blue right-panel formatting from slides 3-10 to slides 11 onwards\"<br>"
-                    "· \"Update all 'Slide ???' references to the correct slide numbers\"<br>"
-                    "· \"Make the title font size 32pt on all content slides\"<br>"
-                    "· \"Add the page number footer to slides 11-26\""
+                    "· \"Apply the blue right-panel formatting from slides 3–10 to slides 11 onwards\"<br>"
+                    "· \"Fix all 'Slide ???' references with the correct slide numbers\"<br>"
+                    "· \"Make the title font 32pt on all content slides\"<br>"
+                    "· \"Add the page number footer to slides 11–26\""
                     "</div>",
                     unsafe_allow_html=True,
                 )
@@ -2099,44 +2111,88 @@ with _tab_editor:
                 with st.chat_message(_em["role"]):
                     st.markdown(_em["content"])
 
+        # ── Pending changes — Apply / Discard ─────────────────────────────────
+        if st.session_state.get("editor_pending_code"):
+            st.markdown(
+                "<div style='background:#0A1832;border:1px solid #0055AA;"
+                "border-left:4px solid #00CCFF;border-radius:6px;"
+                "padding:.75rem 1rem;margin:.5rem 0;font-size:.82rem;color:#D0E4FF'>"
+                "⚡ <b>Changes ready to apply.</b> Review Claude's plan above, then:"
+                "</div>",
+                unsafe_allow_html=True,
+            )
+            _apply_col, _discard_col = st.columns([2, 1])
+            with _apply_col:
+                if st.button("✅ Apply changes", key="editor_apply_btn",
+                             type="primary", use_container_width=True):
+                    from pptx import Presentation as _EdPrs
+                    import io as _ed_io
+                    _prs_apply = _EdPrs(_ed_io.BytesIO(st.session_state["editor_pptx_bytes"]))
+                    try:
+                        exec(st.session_state["editor_pending_code"],
+                             {"prs": _prs_apply, "__builtins__": __builtins__})
+                        _out_buf = _ed_io.BytesIO()
+                        _prs_apply.save(_out_buf)
+                        st.session_state["editor_pptx_bytes"] = _out_buf.getvalue()
+                        st.session_state["editor_chat"].append({
+                            "role": "assistant",
+                            "content": "✅ Changes applied. Slides updated."
+                        })
+                        with st.spinner("Regenerating previews…"):
+                            st.session_state["editor_thumbs"] = _make_thumbnails(
+                                st.session_state["editor_pptx_bytes"]
+                            )
+                    except Exception as _ap_err:
+                        st.session_state["editor_chat"].append({
+                            "role": "assistant",
+                            "content": f"⚠️ Execution error: `{_ap_err}`. The file was not modified."
+                        })
+                    finally:
+                        st.session_state["editor_pending_code"] = ""
+                        st.session_state["editor_pending_msg"]  = ""
+                    st.rerun()
+            with _discard_col:
+                if st.button("✕ Discard", key="editor_discard_btn",
+                             use_container_width=True):
+                    st.session_state["editor_pending_code"] = ""
+                    st.session_state["editor_pending_msg"]  = ""
+                    st.session_state["editor_chat"].append({
+                        "role": "assistant", "content": "Changes discarded."
+                    })
+                    st.rerun()
+
+        # ── Chat input ────────────────────────────────────────────────────────
         _ed_input = st.chat_input(
             "Describe the changes to make…", key="editor_chat_input"
         )
 
         if _ed_input and _ed_input.strip():
+            # Clear any pending changes before a new request
+            st.session_state["editor_pending_code"] = ""
+            st.session_state["editor_pending_msg"]  = ""
             st.session_state["editor_chat"].append(
                 {"role": "user", "content": _ed_input.strip()}
             )
 
-            # Build vision message with slide thumbnails (up to 10 for context)
-            _pptx_ctx = _slide_context(st.session_state["editor_pptx_bytes"])
-            _n_thumbs = st.session_state.get("editor_thumbs") or []
+            _pptx_ctx   = _slide_context(st.session_state["editor_pptx_bytes"])
+            _all_thumbs = st.session_state.get("editor_thumbs") or []
 
             _vision_content = []
-            # Include up to 10 slide images so Claude can see the formatting
-            for _vi, _vb64 in enumerate((_n_thumbs or [])[:10]):
-                _vision_content.append({
-                    "type": "text",
-                    "text": f"Slide {_vi+1}:"
-                })
+            for _vi, _vb64 in enumerate(_all_thumbs[:10]):
+                _vision_content.append({"type": "text", "text": f"Slide {_vi+1}:"})
                 _vision_content.append({
                     "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": "image/jpeg",
-                        "data": _vb64,
-                    }
+                    "source": {"type": "base64", "media_type": "image/jpeg", "data": _vb64},
                 })
-            if len(_n_thumbs) > 10:
+            if len(_all_thumbs) > 10:
                 _vision_content.append({
                     "type": "text",
-                    "text": f"(Slides 11-{len(_n_thumbs)} not shown — see shape data below)"
+                    "text": f"(Slides 11–{len(_all_thumbs)} not shown as images — see shape data below)"
                 })
-
             _vision_content.append({
                 "type": "text",
                 "text": (
-                    f"\n\nFull slide structure (all {len(_n_thumbs)} slides):\n"
+                    f"\n\nFull slide structure (all {len(_all_thumbs)} slides):\n"
                     f"{_pptx_ctx}\n\n"
                     f"User request: {_ed_input.strip()}"
                 )
@@ -2144,114 +2200,93 @@ with _tab_editor:
 
             _ed_system = """You are a PowerPoint editing assistant for SEGA America.
 
-You will receive slide thumbnail images and full shape/position data for every slide in a PPTX.
-Analyse the slides, understand the formatting, and call the `edit_presentation` tool with your response.
+You receive slide images and shape data. Analyse the formatting, then call `edit_presentation`.
 
-The `code` field must:
-- Operate on `prs`, a pre-existing python-pptx Presentation object (do NOT call open() or save())
-- Import everything it needs inline (from pptx.util import Inches, Pt, etc.)
-- Be complete, standalone, and runnable via exec()
-- Handle exceptions with try/except so one bad shape doesn't abort the rest
-- Preserve all existing content — only change what is requested
+The `code` field MUST:
+- Operate on `prs` — a pre-existing python-pptx Presentation (do NOT open or save files)
+- Import everything inline (from pptx.util import Inches, Pt, Emu, etc.)
+- Be complete and runnable via exec()
+- Wrap per-slide work in try/except so one bad shape doesn't abort the rest
 
-If you need clarification first, set code to "" and ask in message."""
+The `message` field should clearly explain:
+- What formatting differences you found
+- Exactly what the code will do to fix them
+- Any slides being skipped and why
+
+If you genuinely cannot determine the right fix, set code="" and ask a specific question.
+Do NOT produce a message-only response when you have enough information to write code."""
 
             _ed_tools = [{
                 "name": "edit_presentation",
-                "description": "Apply edits to the PowerPoint and explain what was done.",
+                "description": "Propose edits to the PowerPoint.",
                 "input_schema": {
                     "type": "object",
                     "properties": {
-                        "message": {
-                            "type": "string",
-                            "description": "Conversational explanation of what you did or what you need to know."
-                        },
-                        "code": {
-                            "type": "string",
-                            "description": "Python code using python-pptx that modifies `prs`. Empty string if no code needed."
-                        }
+                        "message": {"type": "string",
+                                    "description": "Explain what you found and what the code will do."},
+                        "code":    {"type": "string",
+                                    "description": "python-pptx code modifying `prs`. Empty string if asking a question."}
                     },
                     "required": ["message", "code"]
                 }
             }]
 
-            _ed_messages = []
+            # Build multi-turn message history
+            _ed_msgs = []
             for _pm in st.session_state["editor_chat"][:-1]:
-                _ed_messages.append({"role": _pm["role"], "content": _pm["content"]})
-            _ed_messages.append({"role": "user", "content": _vision_content})
+                _ed_msgs.append({"role": _pm["role"], "content": _pm["content"]})
+            _ed_msgs.append({"role": "user", "content": _vision_content})
 
             with st.spinner("Claude is analysing your slides…"):
                 try:
                     _ed_client = _make_anthropic_client()
-                    _ed_resp = _ed_client.messages.create(
+                    _ed_resp   = _ed_client.messages.create(
                         model=_ed_model,
                         max_tokens=4000,
                         system=_ed_system,
                         tools=_ed_tools,
                         tool_choice={"type": "any"},
-                        messages=_ed_messages,
+                        messages=_ed_msgs,
                     )
 
-                    # Extract tool_use result
                     _ed_message = ""
                     _ed_code    = ""
                     for _blk in _ed_resp.content:
-                        if getattr(_blk, "type", "") == "tool_use" and _blk.name == "edit_presentation":
+                        if getattr(_blk, "type", "") == "tool_use" \
+                                and _blk.name == "edit_presentation":
                             _ed_message = _blk.input.get("message", "")
                             _ed_code    = (_blk.input.get("code") or "").strip()
                             break
-                    # Fallback: if no tool_use block, try parsing raw text as JSON
+
+                    # Fallback: raw text
                     if not _ed_message and not _ed_code:
                         _ed_raw = "".join(
                             b.text for b in _ed_resp.content
                             if hasattr(b, "type") and b.type == "text"
                         ).strip()
-                        # Strip code fences
-                        for _fence in ("```json", "```"):
-                            if _ed_raw.startswith(_fence):
-                                _ed_raw = _ed_raw[len(_fence):]
-                        _ed_raw = _ed_raw.rsplit("```", 1)[0].strip()
-                        try:
-                            _fb = json.loads(_ed_raw)
-                            _ed_message = _fb.get("message", _ed_raw[:200])
-                            _ed_code    = (_fb.get("code") or "").strip()
-                        except Exception:
-                            _ed_message = _ed_raw[:500]
-                            _ed_code    = ""
+                        _ed_message = _ed_raw[:800]
 
+                    # Store message in chat history
+                    _chat_reply = _ed_message or "Analysis complete."
                     if _ed_code:
-                        from pptx import Presentation as _EdPrs
-                        import io as _ed_io
-                        prs = _EdPrs(_ed_io.BytesIO(st.session_state["editor_pptx_bytes"]))
-                        try:
-                            exec(_ed_code, {"prs": prs, "__builtins__": __builtins__})
-                            _out = _ed_io.BytesIO()
-                            prs.save(_out)
-                            st.session_state["editor_pptx_bytes"] = _out.getvalue()
-                            with st.spinner("Regenerating previews…"):
-                                st.session_state["editor_thumbs"] = _make_thumbnails(
-                                    st.session_state["editor_pptx_bytes"]
-                                )
-                            _reply = _ed_message or "Changes applied."
-                        except Exception as _exec_err:
-                            _reply = (
-                                f"{_ed_message}\n\n"
-                                f"⚠️ Code execution error: `{_exec_err}`\n"
-                                "The PPTX was not modified. Try rephrasing your request."
-                            )
-                    else:
-                        _reply = _ed_message or "No changes made."
+                        _chat_reply += "\n\n**Click ✅ Apply changes below to execute.**"
 
                     st.session_state["editor_chat"].append(
-                        {"role": "assistant", "content": _reply}
+                        {"role": "assistant", "content": _chat_reply}
                     )
+
+                    # Store pending code separately (not in chat history)
+                    if _ed_code:
+                        st.session_state["editor_pending_code"] = _ed_code
+                        st.session_state["editor_pending_msg"]  = _ed_message
+
                     st.rerun()
 
                 except Exception as _ed_err:
                     st.error(f"Editor error: {_ed_err}")
                     import traceback; st.code(traceback.format_exc())
 
-        # Download + clear chat buttons
+        # ── Download + clear ──────────────────────────────────────────────────
         _dl_col, _clr_col = st.columns([2, 1])
         with _dl_col:
             st.download_button(
@@ -2266,21 +2301,10 @@ If you need clarification first, set code to "" and ask in message."""
             if st.session_state["editor_chat"]:
                 if st.button("🗑 Clear chat", key="editor_clear_chat",
                              use_container_width=True):
-                    st.session_state["editor_chat"] = []
+                    st.session_state["editor_chat"]         = []
+                    st.session_state["editor_pending_code"] = ""
+                    st.session_state["editor_pending_msg"]  = ""
                     st.rerun()
-
-    elif not st.session_state.get("editor_pptx_bytes"):
-        st.markdown(
-            "<div class='status-card'>"
-            "<div class='status-card-label'>Getting started</div>"
-            "<div style='color:#6080A8;font-size:.82rem;line-height:1.9'>"
-            "1. Upload a .pptx file using the panel on the left<br>"
-            "2. Click <b style='color:#D0E4FF'>Load &amp; preview slides</b> to generate thumbnails<br>"
-            "3. Describe your changes in the chat — Claude will see the slides and apply edits<br>"
-            "4. Review the updated thumbnails, then download"
-            "</div></div>",
-            unsafe_allow_html=True,
-        )
 
 
 with _tab_pdf:
