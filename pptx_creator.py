@@ -2218,28 +2218,26 @@ with _tab_editor:
     if _thumbs:
         _n_slides = len(_thumbs)
 
-        # Init persistent state for this viewer
+        # Single source of truth for current slide index
         if "editor_slide_idx" not in st.session_state:
             st.session_state["editor_slide_idx"] = 0
         if "editor_slides_hidden" not in st.session_state:
             st.session_state["editor_slides_hidden"] = False
 
-        # Clamp index in case slide count changed
-        _idx = min(st.session_state["editor_slide_idx"], _n_slides - 1)
-        st.session_state["editor_slide_idx"] = _idx
+        _idx = max(0, min(st.session_state["editor_slide_idx"], _n_slides - 1))
 
         # Header row: label + hide/show toggle
         _sv_hdr, _sv_toggle = st.columns([4, 1])
         with _sv_hdr:
             st.markdown('<div class="section-label">Slides</div>', unsafe_allow_html=True)
         with _sv_toggle:
-            _hide_label = "🙈 Hide slides" if not st.session_state["editor_slides_hidden"] else "👁 Show slides"
+            _hide_label = "🙈 Hide" if not st.session_state["editor_slides_hidden"] else "👁 Show"
             if st.button(_hide_label, key="ed_slides_toggle", use_container_width=True):
                 st.session_state["editor_slides_hidden"] = not st.session_state["editor_slides_hidden"]
                 st.rerun()
 
         if not st.session_state["editor_slides_hidden"]:
-            # Controls row: prev | dropdown | next
+            # Controls row: prev | selectbox | next
             _nav_prev, _nav_dd, _nav_next = st.columns([1, 6, 1])
 
             with _nav_prev:
@@ -2250,19 +2248,20 @@ with _tab_editor:
                     st.rerun()
 
             with _nav_dd:
-                _slide_options = [f"Slide {i+1}" for i in range(_n_slides)]
-                _chosen = st.selectbox(
+                # Use on_change to update idx when user picks from dropdown.
+                # Index drives the displayed value; we do NOT write back to this key.
+                def _on_slide_select():
+                    chosen = st.session_state["_ed_slide_dd"]
+                    st.session_state["editor_slide_idx"] = int(chosen.split()[1]) - 1
+
+                st.selectbox(
                     "Select slide",
-                    _slide_options,
+                    [f"Slide {i+1}" for i in range(_n_slides)],
                     index=_idx,
                     label_visibility="collapsed",
-                    key="editor_slide_select",
+                    key="_ed_slide_dd",
+                    on_change=_on_slide_select,
                 )
-                # Selectbox drives the index (user picked from dropdown)
-                _new_idx = int(_chosen.split()[1]) - 1
-                if _new_idx != _idx:
-                    st.session_state["editor_slide_idx"] = _new_idx
-                    st.rerun()
 
             with _nav_next:
                 if st.button("▶", key="ed_slide_next",
@@ -2278,7 +2277,7 @@ with _tab_editor:
                 use_container_width=True,
             )
 
-            # Nearby slide strip (up to 4 either side)
+            # Nearby slide strip — clicking jumps to that slide
             _strip_idxs = [
                 i for i in range(max(0, _idx - 4), min(_n_slides, _idx + 5))
                 if i != _idx
@@ -2286,23 +2285,23 @@ with _tab_editor:
             if _strip_idxs:
                 st.markdown(
                     "<div style='font-size:.68rem;color:#4A6A9A;margin:.5rem 0 .2rem'>"
-                    "Other slides</div>",
+                    "Other slides (click to jump)</div>",
                     unsafe_allow_html=True,
                 )
                 _strip_cols = st.columns(len(_strip_idxs))
                 for _sc, _si in zip(_strip_cols, _strip_idxs):
                     with _sc:
+                        st.image(
+                            f"data:image/jpeg;base64,{_thumbs[_si]}",
+                            use_container_width=True,
+                        )
                         if st.button(
-                            f"{_si+1}",
+                            f"Go to {_si+1}",
                             key=f"ed_strip_{_si}",
                             use_container_width=True,
                         ):
                             st.session_state["editor_slide_idx"] = _si
                             st.rerun()
-                        st.image(
-                            f"data:image/jpeg;base64,{_thumbs[_si]}",
-                            use_container_width=True,
-                        )
 
     # ── Chat + Apply ──────────────────────────────────────────────────────────
     if st.session_state.get("editor_pptx_bytes"):
