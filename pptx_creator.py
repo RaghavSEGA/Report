@@ -1962,7 +1962,8 @@ with _tab_editor:
 
     # ── Helper: render thumbnails from PPTX bytes ────────────────────────────
     def _make_thumbnails(pptx_bytes: bytes) -> list[str]:
-        import subprocess, tempfile, base64 as _b64, os as _os
+        """Convert each slide to a base64-encoded JPEG. Returns [] on failure."""
+        import subprocess, tempfile, base64 as _b64, os as _os, sys as _sys
         thumbs = []
         try:
             with tempfile.TemporaryDirectory() as td:
@@ -1970,21 +1971,49 @@ with _tab_editor:
                 pdf = _os.path.join(td, "src.pdf")
                 with open(src, "wb") as f:
                     f.write(pptx_bytes)
-                subprocess.run(
-                    ["soffice", "--headless", "--convert-to", "pdf", "--outdir", td, src],
-                    capture_output=True, timeout=60
+
+                # Isolated UserInstallation prevents soffice profile-lock conflicts
+                # when multiple Streamlit sessions run concurrently.
+                user_install = _os.path.join(td, "lo_profile")
+                _os.makedirs(user_install, exist_ok=True)
+
+                r1 = subprocess.run(
+                    [
+                        "soffice",
+                        f"-env:UserInstallation=file://{user_install}",
+                        "--headless", "--norestore",
+                        "--convert-to", "pdf", "--outdir", td, src,
+                    ],
+                    capture_output=True, timeout=120
                 )
+                print(f"[thumbnails] soffice rc={r1.returncode} "
+                      f"stdout={r1.stdout.decode()[:100]} "
+                      f"stderr={r1.stderr.decode()[:100]}", file=_sys.stderr)
+
                 if not _os.path.exists(pdf):
-                    return []
-                subprocess.run(
-                    ["pdftoppm", "-jpeg", "-r", "72", pdf, _os.path.join(td, "slide")],
-                    capture_output=True, timeout=60
+                    # soffice may have written a differently-named PDF
+                    pdfs = [f for f in _os.listdir(td) if f.endswith(".pdf")]
+                    if pdfs:
+                        pdf = _os.path.join(td, pdfs[0])
+                    else:
+                        print(f"[thumbnails] No PDF found. Files: {_os.listdir(td)}", file=_sys.stderr)
+                        return []
+
+                r2 = subprocess.run(
+                    ["pdftoppm", "-jpeg", "-r", "80", pdf, _os.path.join(td, "slide")],
+                    capture_output=True, timeout=90
                 )
-                imgs = sorted(f for f in _os.listdir(td)
-                              if f.startswith("slide") and f.endswith(".jpg"))
+                print(f"[thumbnails] pdftoppm rc={r2.returncode}", file=_sys.stderr)
+
+                imgs = sorted(
+                    f for f in _os.listdir(td)
+                    if f.startswith("slide") and f.endswith(".jpg")
+                )
                 for img in imgs:
                     with open(_os.path.join(td, img), "rb") as f:
                         thumbs.append(_b64.b64encode(f.read()).decode())
+
+                print(f"[thumbnails] generated {len(thumbs)} thumbnails", file=_sys.stderr)
         except Exception as _te:
             import sys; print(f"[thumbnail error] {_te}", file=sys.stderr)
         return thumbs
@@ -2055,7 +2084,25 @@ with _tab_editor:
             )
         else:
             _n_slides = len(st.session_state.get("editor_thumbs") or [])
-            st.success(f"**{st.session_state['editor_pptx_name']}** — {_n_slides} slides loaded")
+            if _n_slides > 0:
+                st.success(
+                    f"**{st.session_state['editor_pptx_name']}** — {_n_slides} slides loaded"
+                )
+            else:
+                # Loaded but no thumbnails — check slide count from PPTX directly
+                try:
+                    from pptx import Presentation as _ChkPrs
+                    import io as _chk_io
+                    _chk = _ChkPrs(_chk_io.BytesIO(st.session_state["editor_pptx_bytes"]))
+                    _slide_count = len(_chk.slides)
+                    st.warning(
+                        f"**{st.session_state['editor_pptx_name']}** — "
+                        f"{_slide_count} slides in file. "
+                        "Click **Load & preview slides** to generate thumbnails, "
+                        "or use the chat editor below without previews."
+                    )
+                except Exception:
+                    st.info(f"**{st.session_state['editor_pptx_name']}** — click Load to generate previews")
 
     # Load on button click
     if _ed_load_btn and _ed_file:
@@ -2066,8 +2113,16 @@ with _tab_editor:
         st.session_state["editor_chat"]         = []
         st.session_state["editor_pending_code"] = ""
         st.session_state["editor_pending_msg"]  = ""
-        with st.spinner("Generating slide previews…"):
-            st.session_state["editor_thumbs"] = _make_thumbnails(_raw_bytes)
+        with st.spinner("Converting slides to images (this takes ~15s for large files)…"):
+            _generated = _make_thumbnails(_raw_bytes)
+        st.session_state["editor_thumbs"] = _generated
+        if not _generated:
+            st.error(
+                "⚠️ Slide preview generation failed. "
+                "LibreOffice or pdftoppm may be unavailable on this host. "
+                "You can still use the chat editor — Claude will work from the "
+                "shape/text data without images."
+            )
         st.rerun()
 
     # ── Slide thumbnails — full width below the top controls ─────────────────
