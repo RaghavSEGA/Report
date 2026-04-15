@@ -1993,7 +1993,7 @@ with _tab_editor:
                     if pdfs:
                         pdf = _os.path.join(td, pdfs[0])
                         r2 = subprocess.run(
-                            [_pp, "-jpeg", "-r", "80", pdf,
+                            [_pp, "-jpeg", "-r", "150", pdf,
                              _os.path.join(td, "slide")],
                             capture_output=True, timeout=90
                         )
@@ -2019,7 +2019,7 @@ with _tab_editor:
 
             prs = _P(_io.BytesIO(pptx_bytes))
             sw, sh = prs.slide_width, prs.slide_height
-            TW, TH = 480, int(480 * sh / sw)
+            TW, TH = 1200, int(1200 * sh / sw)
 
             def _epx(emu, total_emu, total_px):
                 return max(0, min(total_px, int((emu or 0) / total_emu * total_px)))
@@ -2196,19 +2196,66 @@ with _tab_editor:
             )
         st.rerun()
 
-    # ── Slide thumbnails — full width below the top controls ─────────────────
+    # ── Slide viewer — dropdown + full-size preview ───────────────────────────
     _thumbs = st.session_state.get("editor_thumbs") or []
     if _thumbs:
         st.markdown('<div class="section-label">Slides</div>', unsafe_allow_html=True)
-        _cols_per_row = 5
-        for _row_start in range(0, len(_thumbs), _cols_per_row):
-            _row_t = _thumbs[_row_start:_row_start + _cols_per_row]
-            _tcols = st.columns(len(_row_t))
-            for _ci, (_tc, _tb64) in enumerate(zip(_tcols, _row_t)):
-                with _tc:
+
+        _n_slides = len(_thumbs)
+
+        # Dropdown to select slide
+        _slide_options = [f"Slide {i+1}" for i in range(_n_slides)]
+        _selected_slide_label = st.selectbox(
+            "Select slide",
+            _slide_options,
+            label_visibility="collapsed",
+            key="editor_slide_select",
+        )
+        _selected_idx = int(_selected_slide_label.split()[1]) - 1
+
+        # Navigation buttons
+        _nav_prev, _nav_label, _nav_next = st.columns([1, 4, 1])
+        with _nav_prev:
+            if st.button("◀ Prev", key="ed_slide_prev",
+                         disabled=_selected_idx == 0,
+                         use_container_width=True):
+                st.session_state["editor_slide_select"] = _slide_options[_selected_idx - 1]
+                st.rerun()
+        with _nav_label:
+            st.markdown(
+                f"<div style='text-align:center;color:#8899BB;font-size:.82rem;"
+                f"padding:.35rem 0'>{_selected_slide_label} of {_n_slides}</div>",
+                unsafe_allow_html=True,
+            )
+        with _nav_next:
+            if st.button("Next ▶", key="ed_slide_next",
+                         disabled=_selected_idx == _n_slides - 1,
+                         use_container_width=True):
+                st.session_state["editor_slide_select"] = _slide_options[_selected_idx + 1]
+                st.rerun()
+
+        # Full-size slide image
+        st.image(
+            f"data:image/jpeg;base64,{_thumbs[_selected_idx]}",
+            use_container_width=True,
+        )
+
+        # Small strip of adjacent slides for context (3 either side)
+        _strip_start = max(0, _selected_idx - 3)
+        _strip_end   = min(_n_slides, _selected_idx + 4)
+        _strip_idxs  = [i for i in range(_strip_start, _strip_end) if i != _selected_idx]
+        if _strip_idxs:
+            st.markdown(
+                "<div style='font-size:.68rem;color:#4A6A9A;margin:.5rem 0 .2rem'>"
+                "Nearby slides</div>",
+                unsafe_allow_html=True,
+            )
+            _strip_cols = st.columns(len(_strip_idxs))
+            for _sc, _si in zip(_strip_cols, _strip_idxs):
+                with _sc:
                     st.image(
-                        f"data:image/jpeg;base64,{_tb64}",
-                        caption=f"Slide {_row_start + _ci + 1}",
+                        f"data:image/jpeg;base64,{_thumbs[_si]}",
+                        caption=f"{_si+1}",
                         use_container_width=True,
                     )
 
