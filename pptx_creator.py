@@ -2145,32 +2145,38 @@ with _tab_editor:
             _ed_system = """You are a PowerPoint editing assistant for SEGA America.
 
 You will receive slide thumbnail images and full shape/position data for every slide in a PPTX.
-Your job is to analyse the slides, understand the formatting patterns, and produce Python code
-using python-pptx that makes the requested changes.
+Analyse the slides, understand the formatting, and call the `edit_presentation` tool with your response.
 
-RESPONSE FORMAT — return exactly one JSON object (no markdown fences):
-{
-  "message": "conversational description of what you are doing and why",
-  "code": "complete python-pptx Python code string that modifies the variable `prs` (a Presentation object)"
-}
+The `code` field must:
+- Operate on `prs`, a pre-existing python-pptx Presentation object (do NOT call open() or save())
+- Import everything it needs inline (from pptx.util import Inches, Pt, etc.)
+- Be complete, standalone, and runnable via exec()
+- Handle exceptions with try/except so one bad shape doesn't abort the rest
+- Preserve all existing content — only change what is requested
 
-The code field must:
-- Accept `prs` as a pre-existing python-pptx Presentation object (do NOT open or save files)
-- Make only the requested changes — do not restructure slides unnecessarily
-- Use python-pptx imports inside the code string (from pptx.util import ..., etc.)
-- Handle exceptions gracefully — skip shapes that cannot be modified
-- Be complete and runnable
+If you need clarification first, set code to "" and ask in message."""
 
-If you need clarification before making changes, set "code" to empty string "" and ask in "message".
-
-Rules:
-- Preserve all existing content — only modify what is explicitly requested
-- When copying formatting (colors, fonts, positions), extract exact values from the shape data provided
-- Do not guess hex colors — read them from the shape XML if needed
-- Return ONLY valid JSON"""
+            _ed_tools = [{
+                "name": "edit_presentation",
+                "description": "Apply edits to the PowerPoint and explain what was done.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "message": {
+                            "type": "string",
+                            "description": "Conversational explanation of what you did or what you need to know."
+                        },
+                        "code": {
+                            "type": "string",
+                            "description": "Python code using python-pptx that modifies `prs`. Empty string if no code needed."
+                        }
+                    },
+                    "required": ["message", "code"]
+                }
+            }]
 
             _ed_messages = []
-            for _pm in st.session_state["editor_chat"][:-1]:  # exclude the just-added user msg
+            for _pm in st.session_state["editor_chat"][:-1]:
                 _ed_messages.append({"role": _pm["role"], "content": _pm["content"]})
             _ed_messages.append({"role": "user", "content": _vision_content})
 
@@ -2181,31 +2187,47 @@ Rules:
                         model=_ed_model,
                         max_tokens=4000,
                         system=_ed_system,
+                        tools=_ed_tools,
+                        tool_choice={"type": "any"},
                         messages=_ed_messages,
                     )
-                    _ed_raw = "".join(
-                        b.text for b in _ed_resp.content
-                        if hasattr(b, "type") and b.type == "text"
-                    ).strip()
-                    if _ed_raw.startswith("```"):
-                        _ed_raw = _ed_raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
 
-                    _ed_parsed = json.loads(_ed_raw)
-                    _ed_message = _ed_parsed.get("message", "")
-                    _ed_code    = _ed_parsed.get("code", "").strip()
+                    # Extract tool_use result
+                    _ed_message = ""
+                    _ed_code    = ""
+                    for _blk in _ed_resp.content:
+                        if getattr(_blk, "type", "") == "tool_use" and _blk.name == "edit_presentation":
+                            _ed_message = _blk.input.get("message", "")
+                            _ed_code    = (_blk.input.get("code") or "").strip()
+                            break
+                    # Fallback: if no tool_use block, try parsing raw text as JSON
+                    if not _ed_message and not _ed_code:
+                        _ed_raw = "".join(
+                            b.text for b in _ed_resp.content
+                            if hasattr(b, "type") and b.type == "text"
+                        ).strip()
+                        # Strip code fences
+                        for _fence in ("```json", "```"):
+                            if _ed_raw.startswith(_fence):
+                                _ed_raw = _ed_raw[len(_fence):]
+                        _ed_raw = _ed_raw.rsplit("```", 1)[0].strip()
+                        try:
+                            _fb = json.loads(_ed_raw)
+                            _ed_message = _fb.get("message", _ed_raw[:200])
+                            _ed_code    = (_fb.get("code") or "").strip()
+                        except Exception:
+                            _ed_message = _ed_raw[:500]
+                            _ed_code    = ""
 
                     if _ed_code:
-                        # Execute the code against the current PPTX
                         from pptx import Presentation as _EdPrs
                         import io as _ed_io
                         prs = _EdPrs(_ed_io.BytesIO(st.session_state["editor_pptx_bytes"]))
                         try:
                             exec(_ed_code, {"prs": prs, "__builtins__": __builtins__})
-                            # Save modified PPTX
                             _out = _ed_io.BytesIO()
                             prs.save(_out)
                             st.session_state["editor_pptx_bytes"] = _out.getvalue()
-                            # Regenerate thumbnails
                             with st.spinner("Regenerating previews…"):
                                 st.session_state["editor_thumbs"] = _make_thumbnails(
                                     st.session_state["editor_pptx_bytes"]
@@ -2215,7 +2237,7 @@ Rules:
                             _reply = (
                                 f"{_ed_message}\n\n"
                                 f"⚠️ Code execution error: `{_exec_err}`\n"
-                                "The PPTX was not modified. Please try rephrasing your request."
+                                "The PPTX was not modified. Try rephrasing your request."
                             )
                     else:
                         _reply = _ed_message or "No changes made."
@@ -2225,14 +2247,9 @@ Rules:
                     )
                     st.rerun()
 
-                except json.JSONDecodeError:
-                    st.session_state["editor_chat"].append({
-                        "role": "assistant",
-                        "content": f"Response parse error. Raw: {_ed_raw[:300]}"
-                    })
-                    st.rerun()
                 except Exception as _ed_err:
                     st.error(f"Editor error: {_ed_err}")
+                    import traceback; st.code(traceback.format_exc())
 
         # Download + clear chat buttons
         _dl_col, _clr_col = st.columns([2, 1])
