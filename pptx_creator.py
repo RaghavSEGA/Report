@@ -589,10 +589,11 @@ Rules:
 
 _SLIDE_TYPES = ["title","section","bullets","stats","comparison","recommendation","chart","closing"]
 
-def _render_plan_modal(template_bytes_ref=None):
+def _render_plan_modal(template_bytes_ref=None, ns: str = "main"):
     """
-    Chat-first plan editor. Claude is the primary interface for modifying the
-    outline; the raw expander editor is available as a secondary option.
+    Chat-first plan editor.
+    ns — namespace prefix for all widget keys, prevents duplicate-key errors
+         when the modal is rendered in more than one tab.
     """
     sd     = st.session_state.get("plan_slide_data", {})
     slides = sd.get("slides", [])
@@ -609,7 +610,7 @@ def _render_plan_modal(template_bytes_ref=None):
             unsafe_allow_html=True,
         )
     with xcol:
-        if st.button("✕ Close", key="pm_close", use_container_width=True):
+        if st.button("✕ Close", key=f"{ns}_pm_close", use_container_width=True):
             st.session_state.pop("plan_slide_data", None)
             st.session_state.pop("plan_mode_active", None)
             st.rerun()
@@ -661,12 +662,12 @@ def _render_plan_modal(template_bytes_ref=None):
         undo_col, _ = st.columns([1, 3])
         with undo_col:
             if _history:
-                if st.button(f"↩ Undo ({len(_history)})", key="pm_undo", use_container_width=True):
+                if st.button(f"↩ Undo ({len(_history)})", key=f"{ns}_pm_undo", use_container_width=True):
                     st.session_state["plan_slide_data"]["slides"] = _history.pop()
                     st.session_state["plan_slide_history"] = _history
                     st.rerun()
 
-        chat_input = st.chat_input("Describe what to change…", key="plan_chat_input")
+        chat_input = st.chat_input("Describe what to change…", key=f"{ns}_plan_chat_input")
 
         if chat_input and chat_input.strip():
             current_slides = list(st.session_state["plan_slide_data"].get("slides", []))
@@ -744,7 +745,6 @@ Rules:
                     st.session_state["plan_chat"].append({"role": "user", "content": chat_input.strip()})
                     st.session_state["plan_chat"].append({"role": "assistant", "content": display_reply, "_raw": raw})
 
-                    # Auto-save after each chat change
                     if _active:
                         _save_project(OWNER, _active)
 
@@ -757,7 +757,7 @@ Rules:
                     st.error(f"Chat error: {e}")
 
         if st.session_state["plan_chat"]:
-            if st.button("🗑 Clear chat", key="pm_clear_chat"):
+            if st.button("🗑 Clear chat", key=f"{ns}_pm_clear_chat"):
                 st.session_state["plan_chat"] = []
                 st.rerun()
 
@@ -801,37 +801,37 @@ Rules:
                     with c1:
                         new_type = st.selectbox("Type", _SLIDE_TYPES,
                             index=_SLIDE_TYPES.index(stype) if stype in _SLIDE_TYPES else 1,
-                            key=f"pm_type_{i}")
+                            key=f"{ns}_pm_type_{i}")
                     with c2:
                         b1,b2,b3,b4 = st.columns(4)
-                        if b1.button("⬆", key=f"pu_{i}", use_container_width=True): move_up = i
-                        if b2.button("⬇", key=f"pd_{i}", use_container_width=True): move_down = i
-                        if b3.button("➕", key=f"pa_{i}", use_container_width=True): insert_after = i
-                        if b4.button("🗑", key=f"px_{i}", use_container_width=True): delete_idx = i
+                        if b1.button("⬆", key=f"{ns}_pu_{i}", use_container_width=True): move_up = i
+                        if b2.button("⬇", key=f"{ns}_pd_{i}", use_container_width=True): move_down = i
+                        if b3.button("➕", key=f"{ns}_pa_{i}", use_container_width=True): insert_after = i
+                        if b4.button("🗑", key=f"{ns}_px_{i}", use_container_width=True): delete_idx = i
 
-                    new_title = st.text_input("Title", value=slide.get("title",""), key=f"pm_ti_{i}")
-                    new_sub   = st.text_input("Subtitle/body", value=slide.get("subtitle") or slide.get("body",""), key=f"pm_su_{i}")
-                    new_notes = st.text_input("Speaker notes", value=slide.get("speaker_notes",""), key=f"pm_no_{i}")
-                    new_src   = st.text_input("Source", value=slide.get("source",""), key=f"pm_sr_{i}", placeholder="Publication — https://url")
-                    new_img   = st.text_input("Image search query", value=slide.get("image_search_query",""), key=f"pm_img_{i}")
+                    new_title = st.text_input("Title", value=slide.get("title",""), key=f"{ns}_pm_ti_{i}")
+                    new_sub   = st.text_input("Subtitle/body", value=slide.get("subtitle") or slide.get("body",""), key=f"{ns}_pm_su_{i}")
+                    new_notes = st.text_input("Speaker notes", value=slide.get("speaker_notes",""), key=f"{ns}_pm_no_{i}")
+                    new_src   = st.text_input("Source", value=slide.get("source",""), key=f"{ns}_pm_sr_{i}", placeholder="Publication — https://url")
+                    new_img   = st.text_input("Image search query", value=slide.get("image_search_query",""), key=f"{ns}_pm_img_{i}")
 
                     new_slide = {**slide, "type": new_type, "title": new_title,
                                  "subtitle": new_sub, "speaker_notes": new_notes,
                                  "source": new_src, "image_search_query": new_img}
 
                     if new_type in ("bullets","recommendation"):
-                        raw_b = st.text_area("Bullets (one per line)", value="\n".join(slide.get("bullets",[])), height=130, key=f"pm_bu_{i}")
+                        raw_b = st.text_area("Bullets (one per line)", value="\n".join(slide.get("bullets",[])), height=130, key=f"{ns}_pm_bu_{i}")
                         new_slide["bullets"] = [b.strip() for b in raw_b.split("\n") if b.strip()][:6]
                     elif new_type == "stats":
-                        raw_s = st.text_area("Stats: value | label | note (4 rows)", height=100, key=f"pm_st_{i}",
+                        raw_s = st.text_area("Stats: value | label | note (4 rows)", height=100, key=f"{ns}_pm_st_{i}",
                             value="\n".join(f"{s.get('value','')} | {s.get('label','')} | {s.get('note','')}" for s in (slide.get("stats") or [{"value":"","label":"","note":""}]*4)[:4]))
                         new_slide["stats"] = [{"value":p[0],"label":p[1] if len(p)>1 else "","note":p[2] if len(p)>2 else ""} for line in raw_s.split("\n") if (p:=[x.strip() for x in line.split("|")]) and any(p)][:4]
                     elif new_type == "comparison":
                         cmp = slide.get("comparison") or {}
                         cl2,cr2 = st.columns(2)
-                        lt = cl2.text_input("Left title", cmp.get("left_title",""), key=f"pm_lt_{i}")
-                        rt = cr2.text_input("Right title", cmp.get("right_title",""), key=f"pm_rt_{i}")
-                        raw_r = st.text_area("Rows: label | left | right | delta", height=130, key=f"pm_ro_{i}",
+                        lt = cl2.text_input("Left title", cmp.get("left_title",""), key=f"{ns}_pm_lt_{i}")
+                        rt = cr2.text_input("Right title", cmp.get("right_title",""), key=f"{ns}_pm_rt_{i}")
+                        raw_r = st.text_area("Rows: label | left | right | delta", height=130, key=f"{ns}_pm_ro_{i}",
                             value="\n".join(f"{r.get('label','')} | {r.get('left','')} | {r.get('right','')} | {r.get('delta','neutral')}" for r in (cmp.get("rows") or [])))
                         new_slide["comparison"] = {"left_title":lt,"right_title":rt,"rows":[{"label":p[0],"left":p[1] if len(p)>1 else "","right":p[2] if len(p)>2 else "","delta":p[3] if len(p)>3 else "neutral"} for line in raw_r.split("\n") if (p:=[x.strip() for x in line.split("|")]) and any(p)][:8]}
 
@@ -859,7 +859,7 @@ Rules:
     st.divider()
     ex1, ex2, _ = st.columns([1, 1, 2])
     with ex1:
-        if st.button("🚀 Export to PPTX", key="pm_export", type="primary", use_container_width=True):
+        if st.button("🚀 Export to PPTX", key=f"{ns}_pm_export", type="primary", use_container_width=True):
             _tb = st.session_state.get("saved_template_bytes") or _DEFAULT_TEMPLATE_BYTES
             _tf = template_bytes_ref
             if _tf is not None:
@@ -870,7 +870,6 @@ Rules:
             with st.spinner("Building PPTX…"):
                 try:
                     pptx_out = generate_pptx(st.session_state["plan_slide_data"], template_bytes=_tb)
-                    # Post-process: images + source lines
                     pptx_out = _postprocess_pptx(pptx_out, st.session_state["plan_slide_data"].get("slides", []))
                     title = st.session_state["plan_slide_data"].get("title", "Plan")
                     fname = f"SEGA_{title.replace(' ','_')[:40]}.pptx"
@@ -889,7 +888,7 @@ Rules:
                 data=st.session_state["pptx_bytes"],
                 file_name=st.session_state.get("pptx_filename","presentation.pptx"),
                 mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-                key="pm_dl", use_container_width=True,
+                key=f"{ns}_pm_dl", use_container_width=True,
             )
 
 
@@ -1833,118 +1832,105 @@ Populate all JSON fields with real values from the conversation. Use empty strin
             key="guided_generate_btn",
         )
 
-        _g_log_area    = st.empty()
-        _g_output_area = st.empty()
-        _g_dl_area     = st.empty()
+    # ── Full-width area below columns: pipeline log + plan modal + download ───
+    # Must be outside _gc_left / _gc_right so _render_plan_modal gets full width
+    _g_log_area    = st.empty()
+    _g_plan_area   = st.container()
+    _g_dl_area     = st.empty()
 
-        # Show plan modal if already active (persists across reruns)
-        if st.session_state.get("plan_mode_active") and not _g_btn:
-            with _g_output_area.container():
-                _render_plan_modal(st.session_state.get("guided_template"))
+    # Persist plan modal across reruns
+    if st.session_state.get("plan_mode_active") and not _g_btn:
+        with _g_plan_area:
+            _render_plan_modal(st.session_state.get("guided_template"), ns="guided")
 
-        if st.session_state.get("guided_pptx_bytes") and not _g_btn:
-            _g_dl_area.download_button(
-                "⬇️ Download PPTX",
-                data=st.session_state["guided_pptx_bytes"],
-                file_name=st.session_state.get(
-                    "guided_pptx_filename", "presentation.pptx"
-                ),
-                mime=(
-                    "application/vnd.openxmlformats-officedocument"
-                    ".presentationml.presentation"
-                ),
-                use_container_width=True,
-            )
+    if st.session_state.get("guided_pptx_bytes") and not _g_btn:
+        _g_dl_area.download_button(
+            "⬇️ Download PPTX",
+            data=st.session_state["guided_pptx_bytes"],
+            file_name=st.session_state.get("guided_pptx_filename", "presentation.pptx"),
+            mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            use_container_width=True,
+        )
 
-        if _g_btn and _g_ready and _gp:
-            _g_template_bytes = _DEFAULT_TEMPLATE_BYTES  # SOA-HD Blue by default
-            if _g_template:
-                _g_template.seek(0)
-                _g_template_bytes = _g_template.read()
+    if _g_btn and _g_ready and _gp:
+        _g_template_bytes = _DEFAULT_TEMPLATE_BYTES
+        if _g_template:
+            _g_template.seek(0)
+            _g_template_bytes = _g_template.read()
 
-            # ── Sync guided params into session state for _save_project ────
-            _g_topic = _gp.get("topic", "")
-            st.session_state["proj_topic"]    = _g_topic
-            st.session_state["proj_purpose"]  = _gp.get("purpose", "")
-            st.session_state["proj_industry"] = _gp.get("industry", "")
-            st.session_state["proj_audience"] = _gp.get("audience", "")
-            st.session_state["project_doc_names"] = [f.name for f in (_g_docs or [])]
-            if _g_template_bytes:
-                st.session_state["saved_template_bytes"] = _g_template_bytes
+        _g_topic = _gp.get("topic", "")
+        st.session_state["proj_topic"]        = _g_topic
+        st.session_state["proj_purpose"]      = _gp.get("purpose", "")
+        st.session_state["proj_industry"]     = _gp.get("industry", "")
+        st.session_state["proj_audience"]     = _gp.get("audience", "")
+        st.session_state["project_doc_names"] = [f.name for f in (_g_docs or [])]
+        if _g_template_bytes:
+            st.session_state["saved_template_bytes"] = _g_template_bytes
 
-            # ── Auto-create project from topic if none active ──────────────
-            _g_active = st.session_state.get("active_project", "")
-            if not _g_active:
-                _g_auto = re.sub(r"[^a-zA-Z0-9 ]+", "", _g_topic).strip()[:40] or "Untitled"
-                _g_cand = _g_auto
-                _g_ctr  = 2
-                while project_exists(OWNER, _g_cand):
-                    _g_cand = f"{_g_auto} {_g_ctr}"
-                    _g_ctr += 1
-                create_project(OWNER, _g_cand)
-                st.session_state["active_project"] = _g_cand
-                _g_active = _g_cand
+        _g_active = st.session_state.get("active_project", "")
+        if not _g_active:
+            _g_auto = re.sub(r"[^a-zA-Z0-9 ]+", "", _g_topic).strip()[:40] or "Untitled"
+            _g_cand = _g_auto; _g_ctr = 2
+            while project_exists(OWNER, _g_cand):
+                _g_cand = f"{_g_auto} {_g_ctr}"; _g_ctr += 1
+            create_project(OWNER, _g_cand)
+            st.session_state["active_project"] = _g_cand
+            _g_active = _g_cand
 
-            _g_logs = []
+        _g_logs = []
+        for _ev in run_pipeline(
+            model=_g_model,
+            uploaded_files=_g_docs or [],
+            topic=_g_topic,
+            purpose=_gp.get("purpose", "General / Other"),
+            industry=_gp.get("industry", ""),
+            audience=_gp.get("audience", "General audience"),
+            question=_gp.get("question", ""),
+            web_search_en=_g_web,
+            slide_count=int(_gp.get("slide_count", 10)),
+            theme=_g_theme,
+            template_bytes=_g_template_bytes,
+            plan_mode=True,
+        ):
+            _et = _ev[0]
+            if _et in ("log", "spinner"):
+                if _et == "spinner":
+                    if _g_logs and _g_logs[-1][0] == "spinner":
+                        _g_logs[-1] = ("log", _g_logs[-1][1])
+                    _g_logs.append(("spinner", _ev[1]))
+                else:
+                    if _g_logs and _g_logs[-1][0] == "spinner":
+                        _g_logs[-1] = ("log", _g_logs[-1][1])
+                    _g_logs.append(("log", _ev[1]))
+                _g_log_area.markdown(_render_log(_g_logs), unsafe_allow_html=True)
+            elif _et == "sources":
+                st.session_state["research_sources"] = _ev[1]
+            elif _et == "plan_ready":
+                st.session_state["plan_slide_data"]  = _ev[1]
+                st.session_state["plan_mode_active"] = True
+                _save_project(OWNER, _g_active)
+                st.toast(f'Outline saved to "{_g_active}"', icon="📋")
+            elif _et == "pptx_bytes_out":
+                _slug = re.sub(r"[^a-zA-Z0-9]+", "_", _g_topic)[:50]
+                st.session_state["guided_pptx_bytes"]    = _ev[1]
+                st.session_state["guided_pptx_filename"] = f"Presentation_{_slug}.pptx"
+                st.session_state["pptx_bytes"] = _ev[1]
+                _save_project(OWNER, _g_active)
+                st.toast(f'Auto-saved to "{_g_active}"', icon="💾")
+            elif _et == "error":
+                st.error(_ev[1], icon="🚨")
+                break
 
-            for _ev in run_pipeline(
-                model=_g_model,
-                uploaded_files=_g_docs or [],
-                topic=_g_topic,
-                purpose=_gp.get("purpose", "General / Other"),
-                industry=_gp.get("industry", ""),
-                audience=_gp.get("audience", "General audience"),
-                question=_gp.get("question", ""),
-                web_search_en=_g_web,
-                slide_count=int(_gp.get("slide_count", 10)),
-                theme=_g_theme,
-                template_bytes=_g_template_bytes,
-                plan_mode=True,
-            ):
-                _et = _ev[0]
-                if _et in ("log", "spinner"):
-                    if _et == "spinner":
-                        if _g_logs and _g_logs[-1][0] == "spinner":
-                            _g_logs[-1] = ("log", _g_logs[-1][1])
-                        _g_logs.append(("spinner", _ev[1]))
-                    else:
-                        if _g_logs and _g_logs[-1][0] == "spinner":
-                            _g_logs[-1] = ("log", _g_logs[-1][1])
-                        _g_logs.append(("log", _ev[1]))
-                    _g_log_area.markdown(
-                        _render_log(_g_logs), unsafe_allow_html=True
-                    )
-                elif _et == "sources":
-                    st.session_state["research_sources"] = _ev[1]
-                elif _et == "plan_ready":
-                    st.session_state["plan_slide_data"]  = _ev[1]
-                    st.session_state["plan_mode_active"] = True
-                    _save_project(OWNER, _g_active)
-                    st.toast(f'Outline saved to "{_g_active}"', icon="📋")
-                elif _et == "pptx_bytes_out":
-                    _slug = re.sub(r"[^a-zA-Z0-9]+", "_", _g_topic)[:50]
-                    st.session_state["guided_pptx_bytes"]    = _ev[1]
-                    st.session_state["guided_pptx_filename"] = f"Presentation_{_slug}.pptx"
-                    st.session_state["pptx_bytes"] = _ev[1]
-                    _save_project(OWNER, _g_active)
-                    st.toast(f'Auto-saved to "{_g_active}"', icon="💾")
-                elif _et == "error":
-                    st.error(_ev[1], icon="🚨")
-                    break
+        # Render plan modal full-width after pipeline
+        if st.session_state.get("plan_mode_active"):
+            with _g_plan_area:
+                _render_plan_modal(st.session_state.get("guided_template"), ns="guided")
 
-            # Show plan modal after pipeline finishes
-            if st.session_state.get("plan_mode_active"):
-                with _g_output_area.container():
-                    _render_plan_modal(st.session_state.get("guided_template"))
-
-            # Show sources
-            _g_sources = st.session_state.get("research_sources", [])
-            if _g_sources:
-                with st.expander(
-                    f"🔗 {len(_g_sources)} verified source(s)", expanded=True
-                ):
-                    for _s in _g_sources:
-                        st.markdown(f"- [{_s['title']}]({_s['url']})")
+        _g_sources = st.session_state.get("research_sources", [])
+        if _g_sources:
+            with st.expander(f"🔗 {len(_g_sources)} verified source(s)", expanded=True):
+                for _s in _g_sources:
+                    st.markdown(f"- [{_s['title']}]({_s['url']})")
 
 
 with _tab_pdf:
@@ -2483,7 +2469,7 @@ with _tab_main:
 
         if st.session_state.get("plan_mode_active") and not run_btn:
             with output_area.container():
-                _render_plan_modal(st.session_state.get("template_upload"))
+                _render_plan_modal(st.session_state.get("template_upload"), ns="main")
         elif not run_btn and "pptx_bytes" not in st.session_state:
             output_area.markdown("""
 <div class="status-card">
@@ -2624,7 +2610,7 @@ The pipeline will:<br>
 
             if st.session_state.get("plan_mode_active"):
                 with output_area.container():
-                    _render_plan_modal(st.session_state.get("template_upload"))
+                    _render_plan_modal(st.session_state.get("template_upload"), ns="main")
 
             if st.session_state.get("pptx_bytes"):
                 with download_area.container():
