@@ -1962,61 +1962,130 @@ with _tab_editor:
 
     # ── Helper: render thumbnails from PPTX bytes ────────────────────────────
     def _make_thumbnails(pptx_bytes: bytes) -> list[str]:
-        """Convert each slide to a base64-encoded JPEG. Returns [] on failure."""
-        import subprocess, tempfile, base64 as _b64, os as _os, sys as _sys
-        thumbs = []
+        """
+        Convert each slide to a base64 JPEG thumbnail.
+        Uses a pure-Python Pillow renderer (no LibreOffice needed).
+        Falls back to soffice+pdftoppm for higher fidelity if available.
+        """
+        import base64 as _b64, io as _io, os as _os, subprocess, sys as _sys
+
+        # ── Try soffice first for high-fidelity rendering ─────────────────
         try:
-            with tempfile.TemporaryDirectory() as td:
-                src = _os.path.join(td, "src.pptx")
-                pdf = _os.path.join(td, "src.pdf")
-                with open(src, "wb") as f:
-                    f.write(pptx_bytes)
-
-                # Isolated UserInstallation prevents soffice profile-lock conflicts
-                # when multiple Streamlit sessions run concurrently.
-                user_install = _os.path.join(td, "lo_profile")
-                _os.makedirs(user_install, exist_ok=True)
-
-                r1 = subprocess.run(
-                    [
-                        "soffice",
-                        f"-env:UserInstallation=file://{user_install}",
-                        "--headless", "--norestore",
-                        "--convert-to", "pdf", "--outdir", td, src,
-                    ],
-                    capture_output=True, timeout=120
-                )
-                print(f"[thumbnails] soffice rc={r1.returncode} "
-                      f"stdout={r1.stdout.decode()[:100]} "
-                      f"stderr={r1.stderr.decode()[:100]}", file=_sys.stderr)
-
-                if not _os.path.exists(pdf):
-                    # soffice may have written a differently-named PDF
+            import tempfile, shutil
+            _so = shutil.which("soffice") or shutil.which("libreoffice")
+            _pp = shutil.which("pdftoppm")
+            if _so and _pp:
+                with tempfile.TemporaryDirectory() as td:
+                    src = _os.path.join(td, "src.pptx")
+                    lo_profile = _os.path.join(td, "lo_profile")
+                    _os.makedirs(lo_profile, exist_ok=True)
+                    with open(src, "wb") as f:
+                        f.write(pptx_bytes)
+                    r1 = subprocess.run(
+                        [_so,
+                         f"-env:UserInstallation=file://{lo_profile}",
+                         "--headless", "--norestore",
+                         "--convert-to", "pdf", "--outdir", td, src],
+                        capture_output=True, timeout=120
+                    )
                     pdfs = [f for f in _os.listdir(td) if f.endswith(".pdf")]
                     if pdfs:
                         pdf = _os.path.join(td, pdfs[0])
-                    else:
-                        print(f"[thumbnails] No PDF found. Files: {_os.listdir(td)}", file=_sys.stderr)
-                        return []
+                        r2 = subprocess.run(
+                            [_pp, "-jpeg", "-r", "80", pdf,
+                             _os.path.join(td, "slide")],
+                            capture_output=True, timeout=90
+                        )
+                        imgs = sorted(
+                            f for f in _os.listdir(td)
+                            if f.startswith("slide") and f.endswith(".jpg")
+                        )
+                        if imgs:
+                            thumbs = []
+                            for img in imgs:
+                                with open(_os.path.join(td, img), "rb") as f:
+                                    thumbs.append(_b64.b64encode(f.read()).decode())
+                            print(f"[thumbnails] soffice: {len(thumbs)} slides", file=_sys.stderr)
+                            return thumbs
+        except Exception as _so_err:
+            print(f"[thumbnails] soffice unavailable: {_so_err}", file=_sys.stderr)
 
-                r2 = subprocess.run(
-                    ["pdftoppm", "-jpeg", "-r", "80", pdf, _os.path.join(td, "slide")],
-                    capture_output=True, timeout=90
-                )
-                print(f"[thumbnails] pdftoppm rc={r2.returncode}", file=_sys.stderr)
+        # ── Pure-Python fallback: Pillow renderer ─────────────────────────
+        try:
+            from pptx import Presentation as _P
+            from pptx.enum.shapes import MSO_SHAPE_TYPE as _MSO
+            from PIL import Image as _Img, ImageDraw as _Draw
 
-                imgs = sorted(
-                    f for f in _os.listdir(td)
-                    if f.startswith("slide") and f.endswith(".jpg")
-                )
-                for img in imgs:
-                    with open(_os.path.join(td, img), "rb") as f:
-                        thumbs.append(_b64.b64encode(f.read()).decode())
+            prs = _P(_io.BytesIO(pptx_bytes))
+            sw, sh = prs.slide_width, prs.slide_height
+            TW, TH = 480, int(480 * sh / sw)
 
-                print(f"[thumbnails] generated {len(thumbs)} thumbnails", file=_sys.stderr)
-        except Exception as _te:
-            import sys; print(f"[thumbnail error] {_te}", file=sys.stderr)
-        return thumbs
+            def _epx(emu, total_emu, total_px):
+                return max(0, min(total_px, int((emu or 0) / total_emu * total_px)))
+
+            def _safe_rgb(color_obj):
+                try:
+                    c = color_obj.rgb
+                    return (c.red, c.green, c.blue)
+                except Exception:
+                    return None
+
+            thumbs = []
+            for slide in prs.slides:
+                img = _Img.new("RGB", (TW, TH), (248, 248, 250))
+                draw = _Draw.Draw(img)
+
+                for shape in slide.shapes:
+                    try:
+                        x1 = _epx(shape.left,  sw, TW)
+                        y1 = _epx(shape.top,   sh, TH)
+                        x2 = _epx((shape.left or 0) + (shape.width or 0),  sw, TW)
+                        y2 = _epx((shape.top  or 0) + (shape.height or 0), sh, TH)
+                        if x2 <= x1 or y2 <= y1:
+                            continue
+
+                        # Shape fill
+                        try:
+                            rgb = _safe_rgb(shape.fill.fore_color)
+                            if rgb:
+                                draw.rectangle([x1, y1, x2, y2], fill=rgb)
+                        except Exception:
+                            pass
+
+                        # Text
+                        if shape.has_text_frame:
+                            txt = shape.text_frame.text.strip().replace("\n", " ")
+                            if txt:
+                                try:
+                                    tc = _safe_rgb(
+                                        shape.text_frame.paragraphs[0].runs[0].font.color
+                                    ) or (30, 30, 30)
+                                except Exception:
+                                    tc = (30, 30, 30)
+                                draw.text((x1 + 2, y1 + 2), txt[:80], fill=tc)
+
+                        # Picture — cross-hatch placeholder
+                        elif getattr(shape, "shape_type", None) == 13:
+                            draw.rectangle([x1, y1, x2, y2],
+                                           outline=(160, 160, 160), width=1)
+                            draw.line([x1, y1, x2, y2], fill=(190, 190, 190))
+                            draw.line([x1, y2, x2, y1], fill=(190, 190, 190))
+
+                    except Exception:
+                        continue
+
+                draw.rectangle([0, 0, TW - 1, TH - 1], outline=(180, 180, 180))
+
+                buf = _io.BytesIO()
+                img.save(buf, format="JPEG", quality=80)
+                thumbs.append(_b64.b64encode(buf.getvalue()).decode())
+
+            print(f"[thumbnails] Pillow: {len(thumbs)} slides", file=_sys.stderr)
+            return thumbs
+
+        except Exception as _pil_err:
+            print(f"[thumbnails] Pillow fallback failed: {_pil_err}", file=_sys.stderr)
+            return []
 
     # ── Helper: describe slides for Claude context ────────────────────────────
     def _slide_context(pptx_bytes: bytes) -> str:
