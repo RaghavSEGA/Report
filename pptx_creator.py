@@ -2425,10 +2425,29 @@ with _tab_editor:
                 st.session_state["editor_pending_msg"]  = ""
                 st.rerun()
 
-        # ── Chat input ────────────────────────────────────────────────────────
-        _ed_input = st.chat_input(
-            "Describe the changes to make…", key="editor_chat_input"
-        )
+        # ── Chat input + optional reference image ────────────────────────────
+        _img_col, _input_col = st.columns([1, 3], gap="small")
+
+        with _img_col:
+            st.markdown(
+                "<div style='font-size:.72rem;color:#4A6A9A;margin-bottom:.3rem'>"
+                "Reference image (optional)</div>",
+                unsafe_allow_html=True,
+            )
+            _ref_img_file = st.file_uploader(
+                "Attach reference image",
+                type=["png", "jpg", "jpeg", "webp"],
+                label_visibility="collapsed",
+                key="editor_ref_image",
+            )
+            if _ref_img_file:
+                st.image(_ref_img_file, use_container_width=True)
+                st.caption("Claude will use this as a style reference")
+
+        with _input_col:
+            _ed_input = st.chat_input(
+                "Describe the changes to make…", key="editor_chat_input"
+            )
 
         if _ed_input and _ed_input.strip():
             _ed_input_lower = _ed_input.strip().lower()
@@ -2479,14 +2498,48 @@ with _tab_editor:
             # Clear any stale pending code
             st.session_state["editor_pending_code"] = ""
             st.session_state["editor_pending_msg"]  = ""
+
+            # Read reference image if attached
+            _ref_b64  = None
+            _ref_mime = "image/jpeg"
+            _ref_file = st.session_state.get("editor_ref_image")
+            if _ref_file:
+                import base64 as _b64ref
+                _ref_file.seek(0)
+                _ref_raw  = _ref_file.read()
+                _ref_b64  = _b64ref.b64encode(_ref_raw).decode()
+                _ext = _ref_file.name.rsplit(".", 1)[-1].lower()
+                _ref_mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg",
+                             "png": "image/png", "webp": "image/webp"}.get(_ext, "image/jpeg")
+
+            # Store user message with image note in chat history
+            _user_msg_display = _ed_input.strip()
+            if _ref_b64:
+                _user_msg_display += f"\n\n📎 *Reference image attached: {_ref_file.name}*"
             st.session_state["editor_chat"].append(
-                {"role": "user", "content": _ed_input.strip()}
+                {"role": "user", "content": _user_msg_display}
             )
 
             _pptx_ctx   = _slide_context(st.session_state["editor_pptx_bytes"])
             _all_thumbs = st.session_state.get("editor_thumbs") or []
 
             _vision_content = []
+
+            # Reference image goes first so Claude sees the target style before current slides
+            if _ref_b64:
+                _vision_content.append({
+                    "type": "text",
+                    "text": "REFERENCE IMAGE — the user wants the presentation to look more like this:"
+                })
+                _vision_content.append({
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": _ref_mime, "data": _ref_b64},
+                })
+                _vision_content.append({
+                    "type": "text",
+                    "text": "\nCurrent slides in the presentation:"
+                })
+
             for _vi, _vb64 in enumerate(_all_thumbs[:10]):
                 _vision_content.append({"type": "text", "text": f"Slide {_vi+1}:"})
                 _vision_content.append({
@@ -2511,6 +2564,11 @@ with _tab_editor:
 
 You receive slide images and shape data. Analyse the formatting, then call `edit_presentation`.
 
+If a REFERENCE IMAGE is provided, the user wants the slides to match that style. Study it carefully:
+- Note the background colors, layout structure, fonts, and any distinctive design elements
+- Identify what python-pptx properties (fill colors, positions, font sizes) would achieve that look
+- Apply those properties to the appropriate slides
+
 The `code` field MUST:
 - Operate on `prs` — a pre-existing python-pptx Presentation (do NOT open or save files)
 - Import everything inline (from pptx.util import Inches, Pt, Emu, etc.)
@@ -2518,8 +2576,8 @@ The `code` field MUST:
 - Wrap per-slide work in try/except so one bad shape doesn't abort the rest
 
 The `message` field should clearly explain:
-- What formatting differences you found
-- Exactly what the code will do to fix them
+- What you observed in the reference image (if provided)
+- What formatting changes the code will make
 - Any slides being skipped and why
 
 If you genuinely cannot determine the right fix, set code="" and ask a specific question.
