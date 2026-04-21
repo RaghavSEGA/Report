@@ -9,11 +9,24 @@ Auth: configurable domain via st.secrets["ALLOWED_DOMAIN"] or open to all.
 """
 
 import streamlit as st
-import io, time, hashlib, hmac, base64, json, re, os
+import io, time, hashlib, hmac, base64, json, re, os, tempfile
 import pypdf
 import pandas as pd
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# ── Verification tool imports ─────────────────────────────────────────────────
+try:
+    from markitdown import MarkItDown as _MarkItDown
+    _HAS_MARKITDOWN = True
+except ImportError:
+    _HAS_MARKITDOWN = False
+
+try:
+    from pptx import Presentation as _VerifyPresentation
+    _HAS_PPTX_VERIFY = True
+except ImportError:
+    _HAS_PPTX_VERIFY = False
 
 # ── Reuse rendering engine from pptxruns ─────────────────────────────────────
 import sys, importlib
@@ -33,6 +46,230 @@ from storage_pptx import (
     rename_project, delete_project, load_project, save_project,
 )
 _init_db()
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# VERIFICATION TOOL — Reference data, extraction, and AI analysis
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_VERIFY_REFERENCE_SLIDES = [
+    {
+        "deck": "BCG — Melbourne as a Global Cultural Destination",
+        "firm": "BCG", "slide_num": 4,
+        "title": "Melbourne has a compelling creative and cultural offer; the city attracted >10m visitors in 2015",
+        "what_works": [
+            "Full-sentence action title leads with the conclusion — reader knows the 'so what' before reading a word of body content.",
+            "Three distinct claim blocks each with a bold lead-in, creating scannable Z-pattern reading flow.",
+            "Data is specific and cited inline (>10m, 8% GVA, 40% by 2025) — evidence serves the headline rather than replacing it.",
+            "Deliberate contrast: strengths stated first, competitive threat introduced last — classic 'complication' structure.",
+        ],
+        "annotation": "PASS — Strong Action-First title. Proof organized to support one claim per paragraph. No orphan bullets.",
+        "pattern": "Stacked claim blocks with bold lead-ins",
+    },
+    {
+        "deck": "BCG — Melbourne as a Global Cultural Destination",
+        "firm": "BCG", "slide_num": 22,
+        "title": "Melbourne has strengths in offer and governance, underperforms in brand and marketing",
+        "what_works": [
+            "Title is a direct contrast statement — two competing facts. Audience has the full verdict before reading the matrix.",
+            "Color coding (green/amber/red) maps directly to the three-word legend — no guessing required.",
+            "Matrix structure (6 dimensions × 3 sub-factors) creates visual density without clutter.",
+            "Framework introduced earlier means this slide goes straight to assessment without re-explaining.",
+        ],
+        "annotation": "PASS — Title is a judgment, not a description. Color-coded assessment matrix is rare but highly effective.",
+        "pattern": "Contrast-statement title + color-coded assessment matrix",
+    },
+    {
+        "deck": "BCG — Melbourne as a Global Cultural Destination",
+        "firm": "BCG", "slide_num": 35,
+        "title": "Travellers more likely to recommend Melbourne after visiting — suggests marketing could boost visitation",
+        "what_works": [
+            "Long title earns its length: contains both the finding AND the business implication.",
+            "Single bar chart with a +24 callout does one job cleanly.",
+            "Pull-quote boxes serve as qualitative evidence — they complement, not replace, the quantitative bar chart.",
+            "Shaded background on pull-quotes makes them visually distinct — classic Takeaway Block execution.",
+        ],
+        "annotation": "PASS — Finding + implication in title. Pull-quote boxes = Takeaway Blocks well executed.",
+        "pattern": "Finding + implication title; pull-quote boxes as takeaway blocks",
+    },
+    {
+        "deck": "McKinsey/IACPM — Emerging GenAI Use Cases in Credit",
+        "firm": "McKinsey", "slide_num": 6,
+        "title": "Institutions are prioritizing use cases like supporting underwriting (synthesizing, drafting memo) and portfolio monitoring (early warning)",
+        "what_works": [
+            "Active observation with specific examples in parentheses — reader knows the conclusion AND the top two use cases.",
+            "Stacked bar by institution size lets each audience member find their own segment.",
+            "Development stage column shows not just *what* but *how far along* — two dimensions in one chart.",
+            "Percentage totals alongside absolute counts support both reading modes simultaneously.",
+        ],
+        "annotation": "PASS — Title names the conclusion and examples. Chart adds two dimensions (what + maturity) elegantly.",
+        "pattern": "Active observation with examples; multi-dimension bar chart",
+    },
+    {
+        "deck": "McKinsey/IACPM — Emerging GenAI Use Cases in Credit",
+        "firm": "McKinsey", "slide_num": 12,
+        "title": "Institutions prioritize productivity improvement as the most important factor when initiating or developing GenAI use cases",
+        "what_works": [
+            "Title is a full declarative sentence — the ranked #1 finding is in the headline, not buried in bullets.",
+            "Four summary callout boxes at the top give the ranked answer before the supporting data appears.",
+            "Callout boxes use consistent structure: rank statement + percentage + label.",
+            "Detailed ranking data below provides nuance — top boxes give the verdict, chart gives the breakdown.",
+        ],
+        "annotation": "PASS — Summary callout boxes above the chart function perfectly as pre-chart Takeaway Blocks.",
+        "pattern": "Ranked finding in title; pre-chart callout boxes as takeaways",
+    },
+    {
+        "deck": "McKinsey/IACPM — Emerging GenAI Use Cases in Credit",
+        "firm": "McKinsey", "slide_num": 13,
+        "title": "Leadership at majority of the institutions are positioning GenAI as a priority",
+        "what_works": [
+            "'Majority' is precise without being falsely exact — better than 'many' (vague) or '52%' (too precise for a headline).",
+            "Three-tier classification maps to three distinct descriptions — the reader can self-classify.",
+            "Consistent voice across descriptions makes comparison easy.",
+            "Bar chart breakdown by institution type appears to the right — answer first, segmentation second.",
+        ],
+        "annotation": "PASS — Classification with self-assessment language. Verdict in title.",
+        "pattern": "Three-tier classification with self-assessment descriptions",
+    },
+]
+
+_VERIFY_REFERENCE_PATTERNS_TEXT = """
+## Patterns from Best-in-Class Consulting Decks (BCG & McKinsey)
+
+### TITLE PATTERNS
+- **Contrast title**: "Melbourne has strengths in X, underperforms in Y" — verdict before body.
+- **Finding + implication**: "Travellers more likely to recommend after visiting — suggests marketing could boost visitation"
+- **Active observation with examples**: "Institutions are prioritizing use cases like underwriting and portfolio monitoring (early warning)"
+- **Ranked finding**: "Institutions prioritize productivity improvement as the most important factor"
+- **Majority qualifier**: Use 'majority' instead of 'many' (vague) or '52%' (too precise for headlines).
+
+### TAKEAWAY BLOCK PATTERNS
+- **Pre-chart callout boxes**: Summary boxes above the chart — each has rank statement + percentage + label.
+- **Pull-quote box**: Stakeholder quote in shaded box at bottom-right. Shading = Takeaway Block signal.
+- **Action Subtitle**: Second line below main title that states a sub-claim. Body charts prove the sub-claim.
+- **Three-tier classification**: Classify findings into 3 tiers with self-assessment descriptions.
+
+### BENCHMARK TABLE
+| Pattern | Weak | Strong |
+|---|---|---|
+| Contrast | "SWOT Analysis" | "Melbourne has strengths in offer and governance, underperforms in brand and marketing" |
+| Ranked finding | "Factor Prioritization" | "Institutions prioritize productivity improvement as the most important factor" |
+| Finding + implication | "Visitor Data" | "Travellers more likely to recommend Melbourne after visiting — suggests marketing could boost visitation" |
+| Active observation | "GenAI Use Case Update" | "Institutions are prioritizing use cases like underwriting (synthesizing, drafting memo) and portfolio monitoring" |
+"""
+
+_VERIFY_SYSTEM = """You are an expert presentation coach specializing in the "Action-First" communication framework used by top-tier consulting firms. Review presentations slide by slide and provide specific, actionable feedback benchmarked against real BCG and McKinsey slides.
+
+## The Action-First Framework
+
+### Core Logic: The Action-Takeaway Sandwich
+1. **Action-Title Mandate** — Title MUST be a complete sentence summarizing the conclusion.
+   - REJECT: "Q4 Revenue Analysis" | ENFORCE: "Q4 Revenue exceeded targets by 15% due to optimized checkout flows"
+2. **Takeaway Block** — Slide must END with a "Key Takeaway" or "So What?" block.
+3. **The ArtCenter "Read"** — Action-Title must be heaviest weight (Bold) and largest scale.
+
+### The Action-First Mastery Checklist
+**I. The Header**
+- Action-Title Test: Is the title a full sentence with a verb?
+- The "Flip" Check: Does the title alone tell the audience the key message?
+- No Category Labels: Does the title avoid "Overview," "Update," "Status," "Summary"?
+
+**II. The Footer**
+- Takeaway Lead-in: Does the slide end with a bolded "Key Takeaway" or "Executive Insight"?
+- WIIFY Validation: Does the takeaway name the benefit to the stakeholder?
+- Supportive Linkage: Does the takeaway reference the data in the body?
+
+**III. The Visual Hierarchy**
+- Title Dominance: Is the Action-Title at least 24pt–36pt Bold?
+- Weight Contrast: Is there a clear visual drop from title to body?
+- The Z-Pattern: Does the eye flow Action-Title → Evidence → Takeaway?
+
+""" + _VERIFY_REFERENCE_PATTERNS_TEXT + """
+
+## Your Output Format
+
+For each slide:
+1. **Slide [N]: [Current Title]** — PASS / NEEDS WORK / FAIL
+2. Brief summary of what works (reference the consulting pattern it resembles, if applicable)
+3. **Issues Found** — numbered list with checklist item cited
+4. **Revised Action-Title** — use one of the named consulting patterns
+5. **Suggested Takeaway Block** — use one of the named patterns
+
+End with **Overall Deck Score** (0–100) and top 3 highest-impact changes."""
+
+
+def _verify_extract_slides(uploaded_file) -> list[dict]:
+    """Extract slide content from an uploaded PPTX for verification."""
+    slides = []
+    if _HAS_PPTX_VERIFY:
+        with tempfile.NamedTemporaryFile(suffix=".pptx", delete=False) as tmp:
+            tmp.write(uploaded_file.getvalue()); tmp_path = tmp.name
+        try:
+            prs = _VerifyPresentation(tmp_path)
+            for i, slide in enumerate(prs.slides, 1):
+                sd = {"slide_num": i, "title": "", "body_texts": [], "font_sizes": [], "notes": ""}
+                if slide.has_notes_slide:
+                    sd["notes"] = slide.notes_slide.notes_text_frame.text.strip()
+                for shape in slide.shapes:
+                    if not shape.has_text_frame: continue
+                    tf = shape.text_frame
+                    full_text = tf.text.strip()
+                    if not full_text: continue
+                    is_title = shape.shape_type == 13 or (
+                        hasattr(shape, "placeholder_format") and
+                        shape.placeholder_format is not None and
+                        shape.placeholder_format.idx in (0, 1))
+                    for para in tf.paragraphs:
+                        for run in para.runs:
+                            if run.font.size: sd["font_sizes"].append(run.font.size.pt)
+                    if is_title: sd["title"] = full_text
+                    else: sd["body_texts"].append(full_text)
+                slides.append(sd)
+        finally:
+            os.unlink(tmp_path)
+    elif _HAS_MARKITDOWN:
+        with tempfile.NamedTemporaryFile(suffix=".pptx", delete=False) as tmp:
+            tmp.write(uploaded_file.getvalue()); tmp_path = tmp.name
+        try:
+            md = _MarkItDown(); result = md.convert(tmp_path)
+            for chunk in result.text_content.split("<!-- Slide ")[1:]:
+                num = int(chunk[:chunk.index(" ")])
+                text = chunk[chunk.index("-->")+3:].strip()
+                lines = [l.strip() for l in text.split("\n") if l.strip()]
+                slides.append({"slide_num": num, "title": lines[0] if lines else "",
+                                "body_texts": lines[1:], "font_sizes": [], "notes": ""})
+        finally:
+            os.unlink(tmp_path)
+    return slides
+
+
+def _verify_analyze(slides: list[dict], filename: str) -> str:
+    """Send extracted slides to Claude for Action-First analysis."""
+    client = _make_anthropic_client()
+    parts = []
+    for s in slides:
+        p = [f"## Slide {s['slide_num']}", f"**Title:** {s['title'] or '(no title)'}"]
+        if s["body_texts"]:
+            p.append("**Body:**")
+            p.extend(f"- {bt[:500]}" for bt in s["body_texts"])
+        if s["font_sizes"]:
+            p.append(f"**Fonts:** min={min(s['font_sizes']):.0f}pt, max={max(s['font_sizes']):.0f}pt")
+        if s["notes"]:
+            p.append(f"**Notes:** {s['notes'][:200]}")
+        parts.append("\n".join(p))
+
+    prompt = (
+        f"Review this presentation using the Action-First framework, benchmarking against BCG and McKinsey standards.\n\n"
+        f"**Filename:** {filename} | **Total Slides:** {len(slides)}\n\n---\n\n"
+        + "\n\n".join(parts)
+        + "\n\n---\n\nApply the full checklist. Quote actual slide text when citing issues. "
+        "Use the named consulting patterns when rewriting titles and takeaways."
+    )
+    msg = client.messages.create(
+        model="claude-opus-4-6", max_tokens=4096,
+        system=_VERIFY_SYSTEM,
+        messages=[{"role": "user", "content": prompt}])
+    return msg.content[0].text
+
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 _MAX_DOC_CHARS     = 60_000
@@ -1631,12 +1868,13 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-_tab_guided, _tab_main, _tab_editor, _tab_pdf, _tab_transfer = st.tabs([
+_tab_guided, _tab_main, _tab_editor, _tab_pdf, _tab_transfer, _tab_verify = st.tabs([
     "💬 Guided Build",
     "📊 Create Presentation",
     "✏️ Edit Presentation",
     "📄 PDF → Editable PPTX",
     "🔄 Template Transfer",
+    "🔍 Verify Deck",
 ])
 
 with _tab_guided:
@@ -3383,3 +3621,243 @@ The pipeline will:<br>
                         with st.expander(f"🔗 {len(_main_sources)} verified source(s)", expanded=False):
                             for _s in _main_sources:
                                 st.markdown(f"- [{_s['title']}]({_s['url']})")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB: VERIFY DECK
+# ═══════════════════════════════════════════════════════════════════════════════
+
+with _tab_verify:
+
+    # ── Inner tabs: Verify / Gallery / Cheatsheet ─────────────────────────────
+    _vt1, _vt2, _vt3 = st.tabs(["🔍 Check a Deck", "📚 Reference Gallery", "💡 Pattern Cheatsheet"])
+
+    # ════════════════════════════════════════════════════════════════════════════
+    # VT1 — UPLOAD & ANALYZE
+    # ════════════════════════════════════════════════════════════════════════════
+    with _vt1:
+        st.markdown(
+            "<div style='font-size:.85rem;color:#8899BB;margin-bottom:1rem'>"
+            "Upload a PPTX and Claude will score every slide against the "
+            "<b style='color:#D0E4FF'>Action-First framework</b> — benchmarked against "
+            "real BCG and McKinsey decks."
+            "</div>", unsafe_allow_html=True)
+
+        if not _HAS_PPTX_VERIFY and not _HAS_MARKITDOWN:
+            st.error("Run: `pip install python-pptx markitdown`")
+        else:
+            _vup = st.file_uploader(
+                "Drop a .pptx file to verify",
+                type=["pptx"], label_visibility="collapsed", key="verify_upload")
+
+            if _vup:
+                st.success(f"📁 **{_vup.name}** ({_vup.size // 1024} KB)")
+
+                if st.button("🔍 Analyze with Action-First Framework",
+                             use_container_width=True, key="verify_run_btn", type="primary"):
+                    try:
+                        with st.spinner("Extracting slide content…"):
+                            _vslides = _verify_extract_slides(_vup)
+                        if not _vslides:
+                            st.warning("No slides detected — the file may be empty or unreadable.")
+                        else:
+                            st.info(f"Found **{len(_vslides)} slides**. Analyzing with Claude…")
+                            _vresult = _verify_analyze(_vslides, _vup.name)
+                            st.session_state["verify_result"]   = _vresult
+                            st.session_state["verify_filename"] = _vup.name
+                            st.rerun()
+                    except Exception as _ve:
+                        st.error(f"Analysis failed: {_ve}")
+
+        if st.session_state.get("verify_result"):
+            st.divider()
+            st.subheader(f"📝 Analysis: {st.session_state.get('verify_filename', '')}")
+
+            _vr1, _vr2 = st.tabs(["📊 Full Report", "📄 Raw Text"])
+            with _vr1:
+                st.markdown(st.session_state["verify_result"])
+            with _vr2:
+                st.code(st.session_state["verify_result"], language=None)
+                st.download_button(
+                    "⬇️ Download Report (.txt)",
+                    data=st.session_state["verify_result"],
+                    file_name=f"action_first_review_{st.session_state.get('verify_filename','deck')}.txt",
+                    mime="text/plain", use_container_width=True)
+
+            if st.button("🔄 Analyze another file", use_container_width=True, key="verify_reset"):
+                st.session_state.pop("verify_result", None)
+                st.session_state.pop("verify_filename", None)
+                st.rerun()
+
+        elif not st.session_state.get("verify_upload") if False else (
+                not st.session_state.get("verify_result") and not locals().get("_vup")):
+            st.markdown("""
+            <div style='text-align:center;padding:3rem 1rem;color:#4A6A9A'>
+              <div style='font-size:3rem;margin-bottom:1rem'>📂</div>
+              <div style='font-size:1rem;font-weight:600;color:#8899BB'>Upload a PPTX to get started</div>
+              <div style='font-size:.82rem;margin-top:.5rem'>
+                Slides checked against Action-First framework and benchmarked<br>
+                against BCG &amp; McKinsey reference examples from the gallery.
+              </div>
+            </div>""", unsafe_allow_html=True)
+
+    # ════════════════════════════════════════════════════════════════════════════
+    # VT2 — REFERENCE GALLERY
+    # ════════════════════════════════════════════════════════════════════════════
+    with _vt2:
+        st.markdown(
+            "<div style='font-size:.85rem;color:#8899BB;margin-bottom:1rem'>"
+            "Annotated slides from <b style='color:#D0E4FF'>BCG — Melbourne as a Global Cultural Destination</b> "
+            "and <b style='color:#D0E4FF'>McKinsey/IACPM — Emerging GenAI Use Cases in Credit</b>. "
+            "These same patterns are embedded in Claude's analysis prompt."
+            "</div>", unsafe_allow_html=True)
+
+        # Filter buttons
+        _vf_all, _vf_bcg, _vf_mck, _ = st.columns([1, 1, 1, 5])
+        for _vbtn, _vfirm in [(_vf_all, "All"), (_vf_bcg, "BCG"), (_vf_mck, "McKinsey")]:
+            _vactive = st.session_state.get("vgallery_filter", "All") == _vfirm
+            if _vbtn.button(
+                f"{'✓ ' if _vactive else ''}{_vfirm}",
+                key=f"vgf_{_vfirm}", use_container_width=True
+            ):
+                st.session_state["vgallery_filter"] = _vfirm
+                st.rerun()
+
+        st.markdown("")
+        _vfilter = st.session_state.get("vgallery_filter", "All")
+        _vfiltered = [s for s in _VERIFY_REFERENCE_SLIDES
+                      if _vfilter == "All" or s["firm"] == _vfilter]
+
+        for _vi in range(0, len(_vfiltered), 2):
+            _vcols = st.columns(2, gap="medium")
+            for _vj, _vcol in enumerate(_vcols):
+                if _vi + _vj >= len(_vfiltered): break
+                _vs = _vfiltered[_vi + _vj]
+                _vchip = (
+                    "<span style='background:#064e3b;color:#6ee7b7;padding:1px 7px;"
+                    "border-radius:5px;font-size:.68rem;font-weight:700;margin-right:.4rem'>BCG</span>"
+                    if _vs["firm"] == "BCG" else
+                    "<span style='background:#1e3a5f;color:#93c5fd;padding:1px 7px;"
+                    "border-radius:5px;font-size:.68rem;font-weight:700;margin-right:.4rem'>McKinsey</span>"
+                )
+                _vpts = "".join(
+                    f"<div style='display:flex;gap:.5rem;margin-bottom:.35rem;font-size:.8rem;"
+                    f"color:#cbd5e1;line-height:1.45'>"
+                    f"<span style='flex-shrink:0;color:#22c55e'>✓</span><span>{_vp}</span></div>"
+                    for _vp in _vs["what_works"])
+                _vcol.markdown(f"""
+                <div style='background:#0A1832;border:1px solid #0D2860;border-radius:12px;
+                     padding:1.25rem 1.5rem;margin-bottom:.75rem;height:100%'>
+                  <div style='font-size:.68rem;color:#4A6A9A;text-transform:uppercase;
+                       letter-spacing:.05em;margin-bottom:.3rem'>
+                    {_vchip}Slide {_vs['slide_num']}
+                  </div>
+                  <div style='font-size:.9rem;font-weight:700;color:#D0E4FF;
+                       margin-bottom:.6rem;line-height:1.4'>"{_vs['title']}"</div>
+                  <span style='display:inline-block;background:#064e3b;color:#6ee7b7;
+                       padding:2px 10px;border-radius:99px;font-size:.68rem;
+                       font-weight:700;margin-bottom:.6rem'>✓ PASS</span>
+                  {_vpts}
+                  <div style='font-size:.78rem;color:#8899BB;border-left:3px solid #0055AA;
+                       padding-left:.6rem;margin-top:.6rem'>{_vs['annotation']}</div>
+                  <div style='font-size:.73rem;color:#818cf8;font-style:italic;
+                       margin-top:.5rem'>Pattern: {_vs['pattern']}</div>
+                </div>""", unsafe_allow_html=True)
+
+        st.markdown("---")
+        st.caption(f"Showing {len(_vfiltered)} of {len(_VERIFY_REFERENCE_SLIDES)} reference slides.")
+
+    # ════════════════════════════════════════════════════════════════════════════
+    # VT3 — PATTERN CHEATSHEET
+    # ════════════════════════════════════════════════════════════════════════════
+    with _vt3:
+        st.markdown(
+            "<div style='font-size:.85rem;color:#8899BB;margin-bottom:1rem'>"
+            "Quick reference for the consulting patterns Claude uses when rewriting "
+            "your titles and takeaways."
+            "</div>", unsafe_allow_html=True)
+
+        st.markdown("### 🏷️ Title Patterns")
+
+        _vtitle_patterns = [
+            {
+                "name": "Contrast title", "source": "BCG Slide 22",
+                "desc": "State two competing facts separated by a comma. Verdict before body.",
+                "bad": "SWOT Analysis",
+                "good": "Melbourne has strengths in offer and governance, underperforms in brand and marketing",
+            },
+            {
+                "name": "Finding + implication", "source": "BCG Slide 35",
+                "desc": "Data point THEN business implication — separated by a dash.",
+                "bad": "Visitor Recommendation Data",
+                "good": "Travellers more likely to recommend Melbourne after visiting — suggests marketing could boost visitation",
+            },
+            {
+                "name": "Active observation with examples", "source": "McKinsey Slide 6",
+                "desc": "Observation verb + specific examples in parentheses. Conclusion AND specifics in one line.",
+                "bad": "GenAI Use Case Update",
+                "good": "Institutions are prioritizing use cases like underwriting (synthesizing, drafting memo) and portfolio monitoring (early warning)",
+            },
+            {
+                "name": "Ranked finding", "source": "McKinsey Slide 12",
+                "desc": "The #1 result belongs in the headline. Don't bury the ranking in bullets.",
+                "bad": "Factor Prioritization Overview",
+                "good": "Institutions prioritize productivity improvement as the most important factor when initiating GenAI use cases",
+            },
+            {
+                "name": "Majority qualifier", "source": "McKinsey Slide 13",
+                "desc": "'Majority' is more credible than 'many' and less awkward than '52%' in a headline.",
+                "bad": "Leadership Support for GenAI",
+                "good": "Leadership at majority of the institutions are positioning GenAI as a priority",
+            },
+        ]
+
+        for _vp in _vtitle_patterns:
+            with st.expander(f"**{_vp['name']}** — *{_vp['source']}*"):
+                st.markdown(f"**What it does:** {_vp['desc']}")
+                _vbc, _vgc = st.columns(2)
+                _vbc.markdown(
+                    f"<div style='background:#7f1d1d;padding:.7rem;border-radius:8px;"
+                    f"font-size:.82rem;color:#fca5a5'>❌ <b>Weak:</b> {_vp['bad']}</div>",
+                    unsafe_allow_html=True)
+                _vgc.markdown(
+                    f"<div style='background:#064e3b;padding:.7rem;border-radius:8px;"
+                    f"font-size:.82rem;color:#6ee7b7'>✓ <b>Strong:</b> {_vp['good']}</div>",
+                    unsafe_allow_html=True)
+
+        st.markdown("### 📦 Takeaway Block Patterns")
+
+        _vtakeaway_patterns = [
+            {
+                "name": "Pre-chart callout boxes", "source": "McKinsey Slide 12",
+                "desc": "Summary boxes ABOVE the chart. Each: rank statement + percentage + label. Verdict before data.",
+                "example": "47% ranked productivity #1 | 44% ranked business needs #2 | 25% ranked regulatory #3 | 50% ranked ROI last",
+            },
+            {
+                "name": "Pull-quote box", "source": "BCG Slide 35",
+                "desc": "Stakeholder quote in shaded box at bottom-right. The shading IS the Takeaway Block signal.",
+                "example": "'Melbourne lacks a clear value proposition… the proposition should be holistic' — Thought Leader",
+            },
+            {
+                "name": "Action Subtitle", "source": "BCG Slide 9",
+                "desc": "Second line below the main title that states a sub-claim. Body charts prove the sub-claim.",
+                "example": "Title: 'Creative industries increasingly important to the economy' | Sub: 'Workers generate slightly more GVA than the average Victorian worker'",
+            },
+            {
+                "name": "Three-tier classification", "source": "McKinsey Slide 13",
+                "desc": "Classify findings into 3 tiers with self-assessment descriptions so readers can place themselves.",
+                "example": "Priority (52%) — 'Senior leadership promotes GenAI as a priority through investments' | Interested (39%) | Not a priority (9%)",
+            },
+        ]
+
+        for _vtp in _vtakeaway_patterns:
+            with st.expander(f"**{_vtp['name']}** — *{_vtp['source']}*"):
+                st.markdown(f"**What it does:** {_vtp['desc']}")
+                st.markdown(
+                    f"<div style='background:#0A1832;border-left:3px solid #0055AA;padding:.7rem;"
+                    f"border-radius:0 8px 8px 0;font-size:.8rem;color:#8899BB;margin-top:.5rem'>"
+                    f"<b>Example:</b> {_vtp['example']}</div>",
+                    unsafe_allow_html=True)
+
+        st.markdown("---")
+        st.caption("All patterns above are injected into Claude's analysis prompt. "
+                   "When your slide resembles one of these patterns, Claude will name it.")
