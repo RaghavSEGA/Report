@@ -15,6 +15,5 @@ pdf2image
 pymupdf
 psycopg2-binary>=2.9.9
 Pillow>=10.0.0
-soffice
 markitdown[pptx]>=0.0.1a2
  
