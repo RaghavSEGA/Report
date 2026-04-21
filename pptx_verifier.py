@@ -579,10 +579,11 @@ if st.session_state.show_history:
                     st.session_state.show_history      = False; st.rerun()
 
 # Main tabs
-t_verify, t_gallery, t_patterns = st.tabs([
+t_verify, t_gallery, t_patterns, t_create = st.tabs([
     "🔍 Verify a Deck",
     "📚 Reference Gallery",
     "💡 Pattern Cheatsheet",
+    "🎮 Create PPTX",
 ])
 
 
@@ -786,6 +787,537 @@ with t_patterns:
     st.markdown("---")
     st.caption("All patterns above are injected into Claude's analysis prompt. "
                "When your slide resembles one of these patterns, Claude will name it.")
+
+# Footer
+st.markdown("---")
+st.caption("Slide Verifier · Action-First Framework · Benchmarked against BCG & McKinsey · Internal use only")
+
+# ════════════════════════════════════════════════════════════════
+# TAB 4 — CREATE PPTX
+# Imports the creator engine from pptx_creator.py + pptxruns.py
+# which must live in the same directory as pptx_verifier.py.
+# Auth is already handled above — OWNER is the signed-in email.
+# ════════════════════════════════════════════════════════════════
+with t_create:
+    _creator_ok = False
+    try:
+        import sys as _sys, os as _os
+        _here = _os.path.dirname(_os.path.abspath(__file__))
+        if _here not in _sys.path:
+            _sys.path.insert(0, _here)
+
+        from pptx_creator import (
+            run_pipeline        as _run_pipeline,
+            _render_plan_modal  as _render_plan_modal,
+            _render_log         as _render_log,
+            _load_project       as _load_project,
+            _save_project       as _save_project,
+            _clear_project      as _clear_project,
+            _DEFAULT_TEMPLATE_BYTES,
+            PURPOSE_PRESETS,
+            THEME_PRESETS,
+        )
+        from storage_pptx import (
+            get_projects, project_exists, create_project,
+            rename_project, delete_project,
+        )
+        _creator_ok = True
+    except ImportError:
+        pass
+
+    if not _creator_ok:
+        st.markdown("""
+        <div style='text-align:center;padding:3rem 1rem;color:#475569'>
+          <div style='font-size:3rem;margin-bottom:1rem'>🔧</div>
+          <div style='font-size:1.1rem;font-weight:600;color:#94a3b8'>Creator not available</div>
+          <div style='font-size:.85rem;margin-top:.5rem'>
+            Place <code>pptx_creator.py</code>, <code>pptxruns.py</code>, and
+            <code>storage_pptx.py</code> in the same directory as this file,
+            then restart the app.
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        import re as _re
+        OWNER = st.session_state.auth_email
+
+        st.markdown("""
+        <style>
+        .cr-section{font-size:.68rem;font-weight:700;letter-spacing:.1em;
+            text-transform:uppercase;color:#00CCFF;margin:.9rem 0 .3rem}
+        .cr-step-done{font-size:.78rem;color:#22DD88;padding:.12rem 0}
+        .cr-step-pend{font-size:.78rem;color:#6080A8;padding:.12rem 0}
+        .cr-status{background:#0A1832;border:1px solid #0D2860;border-top:2px solid #0055AA;
+            border-radius:8px;padding:1.25rem 1.5rem;margin-top:.5rem}
+        .cr-status-lbl{font-size:.65rem;font-weight:700;letter-spacing:.12em;
+            text-transform:uppercase;color:#00CCFF;margin-bottom:.5rem}
+        </style>
+        """, unsafe_allow_html=True)
+
+        # ── Project management ──────────────────────────────────────────────────
+        _projects   = get_projects(OWNER)
+        _proj_names = [p["name"] for p in _projects]
+        _active     = st.session_state.get("active_project", "")
+
+        with st.expander("📁 Project", expanded=not bool(_active)):
+            _pcol1, _pcol2 = st.columns([3, 1])
+            with _pcol1:
+                _opts    = ["— select —"] + _proj_names
+                _cur_idx = (_opts.index(_active) if _active in _opts else 0)
+                _sel     = st.selectbox("Project", _opts, index=_cur_idx,
+                                        label_visibility="hidden", key="cr_proj_sel")
+                if _sel != "— select —" and _sel != _active:
+                    _load_project(OWNER, _sel)
+                    st.rerun()
+
+            with _pcol2:
+                _new_proj = st.text_input("New name", placeholder="e.g. Q3 Deck",
+                                          label_visibility="hidden", key="cr_new_proj")
+                if st.button("＋ Create", key="cr_create_proj", use_container_width=True):
+                    if _new_proj.strip():
+                        if project_exists(OWNER, _new_proj.strip()):
+                            st.error("Name already exists.")
+                        else:
+                            create_project(OWNER, _new_proj.strip())
+                            _clear_project()
+                            st.session_state["active_project"] = _new_proj.strip()
+                            st.rerun()
+
+            if _active:
+                _pa, _pb, _pc = st.columns([3, 2, 1])
+                with _pa:
+                    if st.button("💾 Save", key="cr_save", use_container_width=True):
+                        _save_project(OWNER, _active)
+                        st.toast(f'Saved "{_active}"', icon="✅")
+                with _pb:
+                    if st.button("🔄 Reset output", key="cr_reset", use_container_width=True):
+                        for _k in ["pptx_bytes","pptx_filename","plan_slide_data",
+                                   "plan_mode_active","plan_chat","plan_slide_history","pipeline_steps"]:
+                            st.session_state.pop(_k, None)
+                        st.rerun()
+                with _pc:
+                    if st.button("🗑", key="cr_del", help="Delete", use_container_width=True):
+                        st.session_state["cr_confirm_del"] = True
+
+                if st.session_state.get("cr_confirm_del"):
+                    st.warning(f'Delete "{_active}"?')
+                    _dy, _dn = st.columns(2)
+                    if _dy.button("Yes, delete", key="cr_del_yes"):
+                        delete_project(OWNER, _active)
+                        _clear_project()
+                        st.session_state.pop("cr_confirm_del", None)
+                        st.rerun()
+                    if _dn.button("Cancel", key="cr_del_no"):
+                        st.session_state.pop("cr_confirm_del", None)
+                        st.rerun()
+
+        if not _active:
+            st.markdown("""
+            <div style='text-align:center;padding:2rem 1rem'>
+              <div style='font-size:2rem;margin-bottom:.5rem'>🎮</div>
+              <div style='font-size:1rem;font-weight:600;color:#94a3b8'>
+                Select or create a project above to get started
+              </div>
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            st.markdown(f"<div style='font-size:.75rem;color:#4A6A9A;margin-bottom:.75rem'>"
+                        f"Project: <b style='color:#D0E4FF'>{_active}</b></div>",
+                        unsafe_allow_html=True)
+
+            # ── Options ─────────────────────────────────────────────────────────
+            with st.expander("⚙️ Options", expanded=False):
+                _cr_oc1, _cr_oc2, _cr_oc3 = st.columns(3)
+                with _cr_oc1:
+                    _cr_model = st.selectbox("Model",
+                        ["claude-sonnet-4-6","claude-opus-4-6","claude-haiku-4-5-20251001"],
+                        key="cr_model")
+                    _cr_web = st.checkbox("Web research",
+                                          value=st.session_state.get("proj_web_research", True),
+                                          key="cr_web")
+                    st.session_state["proj_web_research"] = _cr_web
+                with _cr_oc2:
+                    _cr_slides = st.slider("Target slides", 6, 25, 12, key="cr_slides")
+                    _cr_theme_name = st.selectbox("Theme", list(THEME_PRESETS.keys()), key="cr_theme")
+                    _cr_theme = THEME_PRESETS[_cr_theme_name]
+                with _cr_oc3:
+                    _cr_template = st.file_uploader("Custom .pptx template",
+                                                    type=["pptx"], key="cr_template")
+                    _cr_pipeline = st.session_state.get("pipeline_steps",{})
+                    for _k, _lbl in {"upload":"Docs","extract":"Extract",
+                                     "research":"Research","analyze":"Analyze","generate":"Generate"}.items():
+                        _d = _cr_pipeline.get(_k, False)
+                        st.markdown(f'<div class="{"cr-step-done" if _d else "cr-step-pend"}">'
+                                    f'{"✓" if _d else "○"} {_lbl}</div>', unsafe_allow_html=True)
+
+            def _get_tpl():
+                if _cr_template:
+                    _cr_template.seek(0)
+                    return _cr_template.read()
+                return st.session_state.get("saved_template_bytes") or _DEFAULT_TEMPLATE_BYTES
+
+            # ── Inner tabs ───────────────────────────────────────────────────────
+            _cr_t1, _cr_t2, _cr_t3, _cr_t4 = st.tabs([
+                "💬 Guided Build",
+                "📊 Create Presentation",
+                "✏️ Edit Outline",
+                "📄 PDF → PPTX",
+            ])
+
+            # ══ GUIDED BUILD ═══════════════════════════════════════════════════
+            with _cr_t1:
+                if "guided_messages" not in st.session_state:
+                    st.session_state["guided_messages"] = []
+                if "guided_ready" not in st.session_state:
+                    st.session_state["guided_ready"] = False
+                if "guided_params" not in st.session_state:
+                    st.session_state["guided_params"] = {}
+
+                _gl, _gr = st.columns([1, 1], gap="large")
+                with _gl:
+                    _gchat = st.container(height=340)
+                    with _gchat:
+                        if not st.session_state["guided_messages"]:
+                            st.caption("👋 Tell me about the presentation you need.")
+                        for _m in st.session_state["guided_messages"]:
+                            with st.chat_message(_m["role"]):
+                                st.markdown(_m["content"])
+
+                    _gi = st.chat_input("Tell me about your presentation…", key="cr_guided_input")
+                    if _gi:
+                        st.session_state["guided_messages"].append({"role":"user","content":_gi})
+                        _gsys = """You are a presentation planning assistant.
+Rules: professional, direct, concise. No filler. Ask 1-2 questions at a time.
+Collect: topic, purpose, audience, slide count (default 10), focus areas.
+Once you have topic+purpose+audience, output the plan then the signal line.
+
+Format:
+**Topic:** [value]
+**Purpose:** [value]
+**Audience:** [value]
+**Slides:** [value]
+**Focus:** [core goal]
+
+READY_TO_GENERATE: {"topic":"...","purpose":"...","industry":"...","audience":"...","question":"...","slide_count":10}
+
+Populate all fields from the conversation. Empty string for anything not discussed. No markdown fences."""
+                        try:
+                            from pptxruns import _make_anthropic_client as _mac
+                            _grc = _mac().messages.create(
+                                model="claude-sonnet-4-6", max_tokens=600,
+                                system=_gsys,
+                                messages=[{"role":m["role"],"content":m["content"]}
+                                          for m in st.session_state["guided_messages"]],
+                            )
+                            _rep = _grc.content[0].text if _grc.content else "Try again."
+                        except Exception as _ge2:
+                            _rep = f"(Error: {_ge2})"
+
+                        _clean = _rep
+                        if "READY_TO_GENERATE:" in _rep:
+                            try:
+                                _jl = _rep.split("READY_TO_GENERATE:")[1].strip().split("\n")[0]
+                                _pp = json.loads(_jl)
+                                st.session_state.update(guided_params=_pp, guided_ready=True)
+                                _clean = _rep.split("READY_TO_GENERATE:")[0].strip() or (
+                                    f"**Topic:** {_pp.get('topic','')}\n"
+                                    f"**Purpose:** {_pp.get('purpose','')}\n"
+                                    f"**Audience:** {_pp.get('audience','')}\n"
+                                    f"**Slides:** {_pp.get('slide_count',10)}\n\n"
+                                    "Click **Generate** on the right when ready.")
+                            except Exception:
+                                st.session_state["guided_ready"] = False
+
+                        st.session_state["guided_messages"].append({"role":"assistant","content":_clean})
+                        st.rerun()
+
+                    if st.button("🔄 Start over", key="cr_guided_reset", use_container_width=True):
+                        for _kk in ["guided_messages","guided_ready","guided_params",
+                                    "guided_pptx_bytes","guided_pptx_filename"]:
+                            st.session_state.pop(_kk, None)
+                        st.rerun()
+
+                with _gr:
+                    _gp   = st.session_state.get("guided_params",{})
+                    _grdy = st.session_state.get("guided_ready", False)
+                    if _grdy and _gp:
+                        st.success(f"**{_gp.get('topic','Topic')}**  \n"
+                                   f"{_gp.get('purpose','')} · {_gp.get('audience','')} · "
+                                   f"{_gp.get('slide_count',10)} slides")
+                    else:
+                        st.markdown('<div class="cr-status"><div class="cr-status-lbl">Waiting for plan</div>'
+                                    '<div style="color:#6080A8;font-size:.82rem;line-height:1.9">'
+                                    'Chat on the left. Once Claude has enough info the Generate button unlocks.'
+                                    '</div></div>', unsafe_allow_html=True)
+
+                    _gbtn = st.button("⚡ Generate presentation", use_container_width=True,
+                                      type="primary", disabled=not _grdy, key="cr_guided_gen")
+
+                _g_log  = st.empty()
+                _g_plan = st.container()
+                _g_dl   = st.empty()
+
+                if st.session_state.get("plan_mode_active") and not _gbtn:
+                    with _g_plan:
+                        _render_plan_modal(_get_tpl(), ns="cr_guided")
+
+                if st.session_state.get("guided_pptx_bytes") and not _gbtn:
+                    _g_dl.download_button("⬇️ Download PPTX",
+                        data=st.session_state["guided_pptx_bytes"],
+                        file_name=st.session_state.get("guided_pptx_filename","presentation.pptx"),
+                        mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                        use_container_width=True)
+
+                if _gbtn and _grdy and _gp:
+                    _gt = _get_tpl()
+                    _gtopic = _gp.get("topic","")
+                    st.session_state.update(proj_topic=_gtopic,
+                        proj_purpose=_gp.get("purpose",""),
+                        proj_industry=_gp.get("industry",""),
+                        proj_audience=_gp.get("audience",""))
+                    _glogs = []
+                    for _ev in _run_pipeline(
+                        model=_cr_model, uploaded_files=[],
+                        topic=_gtopic, purpose=_gp.get("purpose","General / Other"),
+                        industry=_gp.get("industry",""), audience=_gp.get("audience","General audience"),
+                        question=_gp.get("question",""), web_search_en=_cr_web,
+                        slide_count=int(_gp.get("slide_count",10)),
+                        theme=_cr_theme, template_bytes=_gt, plan_mode=True,
+                    ):
+                        _et = _ev[0]
+                        if _et in ("log","spinner"):
+                            if _et=="spinner":
+                                if _glogs and _glogs[-1][0]=="spinner": _glogs[-1]=("log",_glogs[-1][1])
+                                _glogs.append(("spinner",_ev[1]))
+                            else:
+                                if _glogs and _glogs[-1][0]=="spinner": _glogs[-1]=("log",_glogs[-1][1])
+                                _glogs.append(("log",_ev[1]))
+                            _g_log.markdown(_render_log(_glogs), unsafe_allow_html=True)
+                        elif _et=="sources": st.session_state["research_sources"]=_ev[1]
+                        elif _et=="plan_ready":
+                            st.session_state["plan_slide_data"]=_ev[1]
+                            st.session_state["plan_mode_active"]=True
+                            _save_project(OWNER,_active)
+                        elif _et=="pptx_bytes_out":
+                            _slg=_re.sub(r"[^a-zA-Z0-9]+","_",_gtopic)[:50]
+                            st.session_state["guided_pptx_bytes"]=_ev[1]
+                            st.session_state["guided_pptx_filename"]=f"Presentation_{_slg}.pptx"
+                            st.session_state["pptx_bytes"]=_ev[1]
+                            _save_project(OWNER,_active)
+                        elif _et=="error": st.error(_ev[1],icon="🚨"); break
+
+                    if st.session_state.get("plan_mode_active"):
+                        with _g_plan:
+                            _render_plan_modal(_get_tpl(), ns="cr_guided")
+
+            # ══ CREATE PRESENTATION ════════════════════════════════════════════
+            with _cr_t2:
+                _fc1, _fc2 = st.columns([1,1], gap="large")
+                with _fc1:
+                    st.markdown('<div class="cr-section">Topic & documents</div>', unsafe_allow_html=True)
+                    _topic    = st.text_input("Topic / title",
+                        value=st.session_state.get("proj_topic",""),
+                        placeholder="e.g. Q3 Market Analysis, Product Launch…", key="cr_topic")
+                    _purpose  = st.selectbox("Purpose", list(PURPOSE_PRESETS.keys()), key="cr_purpose")
+                    _industry = st.text_input("Industry / context (optional)",
+                        value=st.session_state.get("proj_industry",""),
+                        placeholder="e.g. Healthcare, Gaming…", key="cr_industry")
+                    _audience = st.text_input("Audience",
+                        value=st.session_state.get("proj_audience",""),
+                        placeholder="e.g. Executive team, Board…", key="cr_audience")
+                    _question = st.text_area("Business question / goal (optional)",
+                        placeholder="What question should this deck answer?",
+                        height=72, key="cr_question")
+                    _uploads  = st.file_uploader("Supporting documents",
+                        type=["pdf","docx","txt","csv","xlsx"],
+                        accept_multiple_files=True, key="cr_uploads")
+
+                with _fc2:
+                    st.markdown('<div class="cr-section">Output</div>', unsafe_allow_html=True)
+                    _out_area = st.empty()
+                    _dl_area  = st.empty()
+
+                    if st.session_state.get("plan_mode_active") and not st.session_state.get("cr_run_clicked"):
+                        with _out_area.container():
+                            _render_plan_modal(_get_tpl(), ns="cr_main")
+                    if st.session_state.get("pptx_bytes") and not st.session_state.get("cr_run_clicked"):
+                        _dl_area.download_button("⬇️ Download previous PPTX",
+                            data=st.session_state["pptx_bytes"],
+                            file_name=st.session_state.get("pptx_filename","presentation.pptx"),
+                            mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                            use_container_width=True)
+
+                _run_btn = st.button("⚡ Generate presentation", use_container_width=True,
+                                     type="primary", key="cr_run_btn")
+                st.session_state["cr_run_clicked"] = _run_btn
+
+                if _run_btn:
+                    if not _topic.strip():
+                        st.error("Please enter a topic.")
+                    else:
+                        st.session_state.update(
+                            proj_topic=_topic, proj_purpose=_purpose,
+                            proj_industry=_industry, proj_audience=_audience,
+                            project_doc_names=[f.name for f in (_uploads or [])])
+                        _tpl2 = _get_tpl()
+                        _pipe = {"upload":bool(_uploads),"extract":False,
+                                 "research":False,"analyze":False,"generate":False}
+                        st.session_state["pipeline_steps"] = _pipe
+                        _logs2 = []
+                        with _out_area.container():
+                            _la2 = st.empty()
+                            try:
+                                for _ev2 in _run_pipeline(
+                                    model=_cr_model, uploaded_files=_uploads or [],
+                                    topic=_topic, purpose=_purpose,
+                                    industry=_industry, audience=_audience,
+                                    question=_question, web_search_en=_cr_web,
+                                    slide_count=_cr_slides, theme=_cr_theme,
+                                    template_bytes=_tpl2, plan_mode=True,
+                                ):
+                                    _et2 = _ev2[0]
+                                    if _et2 in ("log","spinner"):
+                                        if _et2=="spinner":
+                                            if _logs2 and _logs2[-1][0]=="spinner":
+                                                _logs2[-1]=("log",_logs2[-1][1])
+                                            _logs2.append(("spinner",_ev2[1]))
+                                        else:
+                                            if _logs2 and _logs2[-1][0]=="spinner":
+                                                _logs2[-1]=("log",_logs2[-1][1])
+                                            _logs2.append(("log",_ev2[1]))
+                                        _la2.markdown(_render_log(_logs2),unsafe_allow_html=True)
+                                    elif _et2=="step_done":
+                                        _pipe[_ev2[1]]=True
+                                        st.session_state["pipeline_steps"]=_pipe
+                                    elif _et2=="sources":
+                                        st.session_state["research_sources"]=_ev2[1]
+                                    elif _et2=="plan_ready":
+                                        st.session_state["plan_slide_data"]=_ev2[1]
+                                        st.session_state["plan_mode_active"]=True
+                                        _save_project(OWNER,_active)
+                                        st.toast(f'Outline saved to "{_active}"',icon="📋")
+                                    elif _et2=="pptx_bytes_out":
+                                        _slg2=_re.sub(r"[^a-zA-Z0-9]+","_",_topic)[:50]
+                                        st.session_state["pptx_bytes"]=_ev2[1]
+                                        st.session_state["pptx_filename"]=f"Presentation_{_slg2}.pptx"
+                                        _save_project(OWNER,_active)
+                                        st.toast(f'Saved "{_active}"',icon="💾")
+                                    elif _et2=="error":
+                                        st.error(_ev2[1],icon="🚨"); break
+                            except Exception as _ex2:
+                                st.error(f"Error: {_ex2}")
+
+                        if st.session_state.get("plan_mode_active"):
+                            with _out_area.container():
+                                _render_plan_modal(_get_tpl(), ns="cr_main")
+                        if st.session_state.get("pptx_bytes"):
+                            st.success("Presentation ready!")
+                            _dl_area.download_button("⬇️ Download PPTX",
+                                data=st.session_state["pptx_bytes"],
+                                file_name=st.session_state.get("pptx_filename","presentation.pptx"),
+                                mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                                use_container_width=True)
+                            _src2=st.session_state.get("research_sources",[])
+                            if _src2:
+                                with st.expander(f"🔗 {len(_src2)} source(s)"):
+                                    for _s2 in _src2:
+                                        st.markdown(f"- [{_s2['title']}]({_s2['url']})")
+
+            # ══ EDIT OUTLINE ══════════════════════════════════════════════════
+            with _cr_t3:
+                if st.session_state.get("plan_slide_data"):
+                    _render_plan_modal(_get_tpl(), ns="cr_edit")
+                elif st.session_state.get("pptx_bytes"):
+                    st.info("Outline not available — the PPTX was generated without an editable outline. "
+                            "Generate a new presentation to access outline editing.")
+                    st.download_button("⬇️ Download current PPTX",
+                        data=st.session_state["pptx_bytes"],
+                        file_name=st.session_state.get("pptx_filename","presentation.pptx"),
+                        mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                        use_container_width=True)
+                else:
+                    st.info("Generate a presentation first — then come back here to edit the outline.")
+
+            # ══ PDF → PPTX ════════════════════════════════════════════════════
+            with _cr_t4:
+                st.caption("Upload any PDF of slides — even rasterised exports from NotebookLM, "
+                           "Canva, etc. Claude reads each page with vision and reconstructs it "
+                           "as fully editable PowerPoint shapes.")
+
+                try:
+                    from pdf_to_pptx import pdf_to_editable_pptx as _p2p
+                    _HAS_P2P = True
+                except ImportError:
+                    _HAS_P2P = False
+
+                _pd1, _pd2 = st.columns([1,1], gap="large")
+                with _pd1:
+                    _pup = st.file_uploader("Upload PDF", type=["pdf"],
+                                            label_visibility="hidden", key="cr_pdf_up")
+                    if _pup:
+                        try:
+                            import pypdf as _pp4
+                            _np4 = len(_pp4.PdfReader(io.BytesIO(_pup.read())).pages)
+                            _pup.seek(0)
+                            st.caption(f"📄 {_np4} page{'s' if _np4!=1 else ''} detected")
+                        except Exception:
+                            pass
+                    _pmd = st.selectbox("Vision model",
+                        ["claude-opus-4-5","claude-sonnet-4-5"], key="cr_pdf_model",
+                        help="Opus = more accurate; Sonnet = faster.")
+                    _pdpi = st.select_slider("Quality",
+                        options=[96,120,150,200], value=150, key="cr_pdf_dpi")
+                    _pbtn = st.button("⚡ Convert to editable PPTX", use_container_width=True,
+                                     type="primary", key="cr_pdf_btn", disabled=not bool(_pup))
+
+                with _pd2:
+                    _pout = st.empty()
+                    if st.session_state.get("cr_pdf_out") and not _pbtn:
+                        _pout.download_button("⬇️ Download editable PPTX",
+                            data=st.session_state["cr_pdf_out"],
+                            file_name=st.session_state.get("cr_pdf_fname","converted.pptx"),
+                            mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                            use_container_width=True)
+
+                if _pbtn and _pup:
+                    if not _HAS_P2P:
+                        st.error("pdf_to_pptx.py not found — place it in the same directory.")
+                    else:
+                        _akey = st.secrets.get("ANTHROPIC_API_KEY","")
+                        if not _akey:
+                            st.error("ANTHROPIC_API_KEY not set.")
+                        else:
+                            _pup.seek(0); _praw = _pup.read()
+                            _pprog = _pout.progress(0,"Starting…")
+                            _plog2 = st.empty(); _pll = []
+                            def _plg(m):
+                                _pll.append(m)
+                                _plog2.markdown(
+                                    "<div style='background:#0f172a;border-radius:6px;"
+                                    "padding:.6rem 1rem;font-size:.78rem;color:#94a3b8;"
+                                    "font-family:monospace;max-height:200px;overflow-y:auto'>"
+                                    +"".join(f"<div>{l}</div>" for l in _pll[-15:])+"</div>",
+                                    unsafe_allow_html=True)
+                            try:
+                                import pypdf as _pp5
+                                _npg2=len(_pp5.PdfReader(io.BytesIO(_praw)).pages)
+                                _plg(f"📄 {_npg2} page(s) · sending to {_pmd}…")
+                                _pout2,_perrs=_p2p(_praw,api_key=_akey,model=_pmd,dpi=_pdpi,
+                                    progress_cb=lambda f:_pprog.progress(min(f,0.99),
+                                        text=f"Page {max(1,round(f*_npg2))} of {_npg2}…"))
+                                _pfn=(_pup.name.rsplit(".",1)[0] if "." in _pup.name else _pup.name)+"_editable.pptx"
+                                st.session_state["cr_pdf_out"]=_pout2
+                                st.session_state["cr_pdf_fname"]=_pfn
+                                for _pe in (_perrs or []): _plg(f"⚠️ {_pe}")
+                                _pprog.progress(1.0,text="Done!")
+                                _plg(f"🎉 Complete — {len(_pout2)//1024} KB")
+                                _pout.download_button("⬇️ Download editable PPTX",
+                                    data=_pout2, file_name=_pfn,
+                                    mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                                    use_container_width=True)
+                                st.rerun()
+                            except Exception as _pe2:
+                                st.error(f"Conversion failed: {_pe2}")
 
 # Footer
 st.markdown("---")
