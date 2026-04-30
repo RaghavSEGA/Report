@@ -326,10 +326,13 @@ def extract_slide_content(uploaded_file):
                     tf = shape.text_frame
                     full_text = tf.text.strip()
                     if not full_text: continue
-                    is_title = shape.shape_type == 13 or (
-                        hasattr(shape, "placeholder_format") and
-                        shape.placeholder_format is not None and
-                        shape.placeholder_format.idx in (0, 1))
+                    try:
+                        is_title = (
+                            shape.shape_type == 13
+                            or (shape.is_placeholder and shape.placeholder_format.idx in (0, 1))
+                        )
+                    except Exception:
+                        is_title = False
                     for para in tf.paragraphs:
                         for run in para.runs:
                             if run.font.size: sd["font_sizes"].append(run.font.size.pt)
